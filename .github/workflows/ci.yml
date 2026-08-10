@@ -90,7 +90,11 @@ jobs:
 
   containers:
     needs: [backend, frontend, worker]
-    runs-on: ubuntu-latest
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+      - vidioai-build
 
     env:
       HOST_AGENT_TOKEN: ${{ secrets.HOST_AGENT_TOKEN }}
