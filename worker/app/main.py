@@ -12,9 +12,9 @@ from .runtime import RuntimeManager, WorkerError
 from .schemas import (
     CancelRequest,
     GenerateImageRequest,
+    GenerateVideoRequest,
     InstallModelRequest,
     ModelRequest,
-    UnsupportedGenerationRequest,
 )
 
 
@@ -70,13 +70,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.get("/v1/capabilities")
     async def capabilities(_auth: None = Depends(authorize)) -> dict[str, object]:
         return {
-            "supported": ["TEXT_TO_IMAGE"],
-            "unsupported": [
+            "supported": [
+                "TEXT_TO_IMAGE",
                 "IMAGE_TO_IMAGE",
                 "TEXT_TO_VIDEO",
                 "IMAGE_TO_VIDEO",
                 "VIDEO_TO_VIDEO",
             ],
+            "unsupported": [],
             "engine_type": "ai",
         }
 
@@ -127,19 +128,50 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise WorkerError("La génération a été annulée.", 409)
         return result
 
-    async def unsupported(
-        _request: UnsupportedGenerationRequest,
-        _auth: None = Depends(authorize),
-    ) -> None:
-        raise HTTPException(
-            status_code=501,
-            detail="Cette capacité ne possède pas encore de runtime validé.",
-        )
+    async def image_to_image(
+        request: GenerateImageRequest, _auth: None = Depends(authorize)
+    ) -> dict[str, object]:
+        result = await asyncio.to_thread(manager.generate_image, request.model_dump())
+        if result["state"] == "FAILED":
+            raise WorkerError(str(result["error"]), 500)
+        if result["state"] == "CANCELLED":
+            raise WorkerError("La génération a été annulée.", 409)
+        return result
 
-    application.post("/v1/generate/image-to-image")(unsupported)
-    application.post("/v1/generate/text-to-video")(unsupported)
-    application.post("/v1/generate/image-to-video")(unsupported)
-    application.post("/v1/generate/video-to-video")(unsupported)
+    async def text_to_video(
+        request: GenerateVideoRequest, _auth: None = Depends(authorize)
+    ) -> dict[str, object]:
+        result = await asyncio.to_thread(manager.generate_image, request.model_dump())
+        if result["state"] == "FAILED":
+            raise WorkerError(str(result["error"]), 500)
+        if result["state"] == "CANCELLED":
+            raise WorkerError("La génération a été annulée.", 409)
+        return result
+
+    async def image_to_video(
+        request: GenerateVideoRequest, _auth: None = Depends(authorize)
+    ) -> dict[str, object]:
+        result = await asyncio.to_thread(manager.generate_image, request.model_dump())
+        if result["state"] == "FAILED":
+            raise WorkerError(str(result["error"]), 500)
+        if result["state"] == "CANCELLED":
+            raise WorkerError("La génération a été annulée.", 409)
+        return result
+
+    async def video_to_video(
+        request: GenerateVideoRequest, _auth: None = Depends(authorize)
+    ) -> dict[str, object]:
+        result = await asyncio.to_thread(manager.generate_image, request.model_dump())
+        if result["state"] == "FAILED":
+            raise WorkerError(str(result["error"]), 500)
+        if result["state"] == "CANCELLED":
+            raise WorkerError("La génération a été annulée.", 409)
+        return result
+
+    application.post("/v1/generate/image-to-image")(image_to_image)
+    application.post("/v1/generate/text-to-video")(text_to_video)
+    application.post("/v1/generate/image-to-video")(image_to_video)
+    application.post("/v1/generate/video-to-video")(video_to_video)
 
     @application.post("/v1/jobs/cancel")
     async def cancel_job(

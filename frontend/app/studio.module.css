@@ -261,6 +261,13 @@
 .videoSourcePreview img,
 .videoSourcePreview video { width: 100%; height: 100%; object-fit: cover; }
 .videoSourcePreview button { position: absolute; top: 10px; right: 10px; display: grid; place-items: center; width: 34px; height: 34px; color: #fff; border: 1px solid rgba(255,255,255,.18); border-radius: 8px; background: rgba(3, 8, 17, .76); }
+.imageStack { display: grid; gap: 12px; }
+.imageStackCard { display: grid; gap: 10px; padding: 12px; border: 1px solid rgba(151,166,192,.16); border-radius: 12px; background: rgba(8, 16, 31, .82); }
+.imageStackCard img { width: 100%; height: 170px; object-fit: cover; border-radius: 9px; }
+.imageStackNumber { display: inline-flex; width: fit-content; padding: 5px 9px; color: #cbb7ff; border-radius: 999px; background: rgba(124, 69, 232, .16); font-size: 11px; font-weight: 700; }
+.imageStackActions { display: flex; gap: 8px; }
+.imageStackActions button { display: grid; place-items: center; min-width: 34px; min-height: 34px; color: #f7f8fc; border: 1px solid rgba(255,255,255,.16); border-radius: 8px; background: rgba(3,8,17,.74); }
+.imageStackActions button:disabled { cursor: not-allowed; opacity: .45; }
 .videoSettingsRow { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
 .audioSetting { display: flex; align-items: center; justify-content: space-between; gap: 20px; min-height: 68px; margin: -4px 0 18px; padding: 12px 2px; }
 .audioSetting > span { display: grid; gap: 4px; }

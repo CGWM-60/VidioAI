@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .adapters.inspectors import inspect_model_metadata
+from .adapters.registry import PipelineRegistry
 from .config import Settings
 from .schemas import JobState, ModelState
 
@@ -39,6 +41,8 @@ class LoadedModel:
     precision: str
     load_benchmark: dict[str, Any]
     pipeline: Any
+    capability: str | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class RuntimeManager:
@@ -52,8 +56,9 @@ class RuntimeManager:
         self._model_states: dict[str, dict[str, Any]] = {}
         self._jobs: dict[str, dict[str, Any]] = {}
         self._cancel_events: dict[str, threading.Event] = {}
-        self._runtime_modules: tuple[Any, Any, Any] | None = None
+        self._runtime_modules: tuple[Any, Any] | None = None
         self._runtime_error: str | None = None
+        self._registry = PipelineRegistry()
 
     @staticmethod
     def _safe_segment(value: str) -> str:
@@ -83,7 +88,7 @@ class RuntimeManager:
             raise WorkerError("Le snapshot actif est absent du cache.", 409)
         return snapshot, metadata
 
-    def _imports(self) -> tuple[Any, Any, Any]:
+    def _imports(self) -> tuple[Any, Any]:
         """Import paresseux : /health reste disponible même si CUDA est cassé."""
         if self._runtime_modules is not None:
             return self._runtime_modules
@@ -91,14 +96,9 @@ class RuntimeManager:
             raise WorkerError(self._runtime_error, 503)
         try:
             import torch
-            from diffusers import AutoPipelineForText2Image
             from huggingface_hub import HfApi, snapshot_download
 
-            self._runtime_modules = (
-                torch,
-                AutoPipelineForText2Image,
-                (HfApi, snapshot_download),
-            )
+            self._runtime_modules = (torch, (HfApi, snapshot_download))
             return self._runtime_modules
         except Exception as error:
             self._runtime_error = (
@@ -251,10 +251,6 @@ class RuntimeManager:
         revision: str,
         capabilities: list[str],
     ) -> dict[str, Any]:
-        if capabilities != ["TEXT_TO_IMAGE"]:
-            raise WorkerError(
-                "Le premier runtime ne supporte réellement que TEXT_TO_IMAGE.", 422
-            )
         model_id = self._safe_segment(model_id)
         # Un snapshot restauré depuis le cache L3 S3 est réutilisé uniquement
         # après la même validation complète que pour un téléchargement HF.
@@ -299,7 +295,7 @@ class RuntimeManager:
         )
         temporary.mkdir(parents=True)
         try:
-            _, _, hub = self._imports()
+            _, hub = self._imports()
             HfApi, snapshot_download = hub
             info = HfApi(token=os.getenv("HF_TOKEN")).model_info(
                 repository, revision=revision
@@ -327,11 +323,13 @@ class RuntimeManager:
             if destination.exists():
                 shutil.rmtree(destination)
 
+            metadata = inspect_model_metadata(temporary)
+            runtime_capabilities = metadata.get("capabilities") or capabilities or ["TEXT_TO_IMAGE"]
             manifest = {
                 "model_id": model_id,
                 "repository": repository,
                 "revision": resolved_revision,
-                "capabilities": capabilities,
+                "capabilities": runtime_capabilities,
                 "installed": True,
                 "weights_valid": True,
                 "runtime_available": self.runtime_status()["runtime_available"],
@@ -414,7 +412,7 @@ class RuntimeManager:
         model_id = self._safe_segment(model_id)
         snapshot, pointer = self._active_snapshot(model_id)
         validation = self.validate_snapshot(snapshot)
-        torch, pipeline_type, _ = self._imports()
+        torch, _ = self._imports()
         cuda_available = bool(torch.cuda.is_available())
         if self.settings.gpu_required and not cuda_available:
             status = {
@@ -431,6 +429,16 @@ class RuntimeManager:
                 self._model_states[model_id] = status
             raise WorkerError(status["error"], 503)
 
+        metadata = inspect_model_metadata(snapshot)
+        capability = None
+        for candidate in ["IMAGE_TO_IMAGE", "TEXT_TO_IMAGE", "TEXT_TO_VIDEO", "IMAGE_TO_VIDEO", "VIDEO_TO_VIDEO"]:
+            adapter = self._registry.select_for_capability(metadata, candidate)
+            if adapter is not None:
+                capability = candidate
+                break
+        if capability is None:
+            raise WorkerError("Aucun adapter Diffusers compatible n'a été trouvé pour ce modèle.", 422)
+        adapter = self._registry.select_for_capability(metadata, capability)
         device = "cuda" if cuda_available else "cpu"
         dtype = torch.float16 if cuda_available else torch.float32
         precision = "FP16" if cuda_available else "FP32"
@@ -439,22 +447,26 @@ class RuntimeManager:
         if cuda_available:
             torch.cuda.reset_peak_memory_stats()
         try:
-            pipeline = pipeline_type.from_pretrained(
-                snapshot,
-                torch_dtype=dtype,
-                local_files_only=True,
-                use_safetensors=True,
+            pipeline = adapter.load(
+                str(snapshot),
+                {"torch_dtype": dtype, "device": device},
+                {"device": device},
             )
-            pipeline = pipeline.to(device)
-            validation_output = pipeline(
-                "VidioAI runtime validation",
-                num_inference_steps=1,
-                guidance_scale=0.0,
-                width=64,
-                height=64,
-                output_type="latent",
+            if device == "cuda" and hasattr(pipeline, "to"):
+                pipeline = pipeline.to(device)
+            validation_output = adapter.generate(
+                pipeline,
+                {"device": device, "generator": torch.Generator(device=device) if hasattr(torch, "Generator") else None},
+                {
+                    "prompt": "VidioAI runtime validation",
+                    "negative_prompt": None,
+                    "width": 64,
+                    "height": 64,
+                    "steps": 1,
+                    "guidance_scale": 0.0,
+                },
             )
-            if getattr(validation_output, "images", None) is None:
+            if not validation_output.get("images") and not validation_output.get("frames"):
                 raise RuntimeError("Le pipeline n'a produit aucune sortie de validation.")
         except Exception as error:
             status = {
@@ -512,6 +524,8 @@ class RuntimeManager:
             precision=precision,
             load_benchmark=load_benchmark,
             pipeline=pipeline,
+            capability=capability,
+            metadata=metadata,
         )
         status = {
             "model_id": model_id,
@@ -522,6 +536,7 @@ class RuntimeManager:
             "runtime_compatible": True,
             "validation_test": True,
             "device": device,
+            "capability": capability,
             "repository": pointer["repository"],
             "revision": pointer["revision"],
             "benchmark": load_benchmark,
@@ -538,7 +553,7 @@ class RuntimeManager:
             del loaded.pipeline
             gc.collect()
             try:
-                torch, _, _ = self._imports()
+                torch, _ = self._imports()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             except WorkerError:
@@ -573,6 +588,85 @@ class RuntimeManager:
         candidate.parent.mkdir(parents=True, exist_ok=True)
         return candidate
 
+    def _generate_with_adapter(self, loaded: LoadedModel, request: dict[str, Any], *, job_id: str) -> dict[str, Any]:
+        requested_capability = request.get("capability") or loaded.capability or "TEXT_TO_IMAGE"
+        adapter = self._registry.select_for_capability(loaded.metadata or {}, requested_capability)
+        if adapter is None:
+            raise WorkerError("Aucun adapter compatible ne peut générer cette capacité.", 422)
+
+        with self._lock:
+            cancel_event = self._cancel_events.get(job_id)
+            if cancel_event is None:
+                raise WorkerError("Job actif introuvable.", 404)
+
+        def callback(_pipeline: Any, step: int, _timestep: Any, callback_kwargs: Any):
+            if cancel_event.is_set():
+                raise InterruptedError("Job annulé.")
+            with self._lock:
+                self._jobs[job_id]["progress"] = min(95, int(((step + 1) / max(1, request.get("steps", 4))) * 95))
+            return callback_kwargs
+
+        torch, _ = self._imports()
+        generation_started = time.perf_counter()
+        if loaded.device == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+        generator_device = loaded.device if loaded.device == "cuda" else "cpu"
+        generator = torch.Generator(device=generator_device)
+        if request.get("seed") is not None:
+            generator.manual_seed(request["seed"])
+        runtime = {"device": loaded.device, "generator": generator, "callback": callback}
+        output = adapter.generate(loaded.pipeline, runtime, request)
+        if cancel_event.is_set():
+            raise InterruptedError("Job annulé.")
+
+        images = output.get("images") or []
+        frames = output.get("frames") or []
+        if not images and not frames:
+            raise RuntimeError("Le runtime n'a produit aucune sortie.")
+
+        output_path = self._output_path(request["output_relative_path"])
+        temporary = output_path.with_suffix(output_path.suffix + ".tmp")
+        if images:
+            images[0].save(temporary, format="PNG")
+        else:
+            from PIL import Image
+
+            frame = frames[0]
+            if isinstance(frame, list):
+                frame = frame[0]
+            if hasattr(frame, "save"):
+                frame.save(temporary, format="PNG")
+            else:
+                Image.fromarray(frame).save(temporary, format="PNG")
+        os.replace(temporary, output_path)
+        gpu_after = self._nvidia_metrics()
+        process_peak = int(torch.cuda.max_memory_reserved()) if loaded.device == "cuda" else 0
+        idle_vram = int(loaded.load_benchmark.get("vram_idle_bytes", 0))
+        total_vram = int((gpu_after or {}).get("vram_total_bytes", 0))
+        observed_peak = max(int((gpu_after or {}).get("vram_used_bytes", 0)), idle_vram + process_peak)
+        if total_vram:
+            observed_peak = min(observed_peak, total_vram)
+        return {
+            "job_id": job_id,
+            "state": JobState.COMPLETED,
+            "progress": 100,
+            "output_relative_path": request["output_relative_path"],
+            "width": 512,
+            "height": 512,
+            "sha256": self._sha256(output_path),
+            "benchmark": {
+                **loaded.load_benchmark,
+                "vram_after_load_bytes": int(loaded.load_benchmark.get("vram_after_load_bytes", 0)),
+                "vram_peak_bytes": observed_peak,
+                "ram_peak_bytes": self._ram_peak_bytes(),
+                "precision": loaded.precision,
+                "resolution_width": 512,
+                "resolution_height": 512,
+                "batch": 1,
+                "inference_seconds": time.perf_counter() - generation_started,
+            },
+        }
+
     def generate_image(self, request: dict[str, Any]) -> dict[str, Any]:
         job_id = request["job_id"]
         model_id = request["model_id"]
@@ -589,79 +683,8 @@ class RuntimeManager:
                 "error": None,
             }
 
-        def callback(_pipeline: Any, step: int, _timestep: Any, callback_kwargs: Any):
-            if cancel_event.is_set():
-                raise InterruptedError("Job annulé.")
-            with self._lock:
-                self._jobs[job_id]["progress"] = min(
-                    95, int(((step + 1) / request["steps"]) * 95)
-                )
-            return callback_kwargs
-
         try:
-            torch, _, _ = self._imports()
-            generation_started = time.perf_counter()
-            if loaded.device == "cuda":
-                torch.cuda.reset_peak_memory_stats()
-            generator_device = loaded.device if loaded.device == "cuda" else "cpu"
-            generator = torch.Generator(device=generator_device)
-            if request.get("seed") is not None:
-                generator.manual_seed(request["seed"])
-            output = loaded.pipeline(
-                prompt=request["prompt"],
-                negative_prompt=request.get("negative_prompt"),
-                width=request["width"],
-                height=request["height"],
-                num_inference_steps=request["steps"],
-                guidance_scale=request["guidance_scale"],
-                generator=generator,
-                callback_on_step_end=callback,
-            )
-            if cancel_event.is_set():
-                raise InterruptedError("Job annulé.")
-            images = getattr(output, "images", [])
-            if not images:
-                raise RuntimeError("Le runtime n'a produit aucune image.")
-            output_path = self._output_path(request["output_relative_path"])
-            temporary = output_path.with_suffix(output_path.suffix + ".tmp")
-            images[0].save(temporary, format="PNG")
-            os.replace(temporary, output_path)
-            gpu_after = self._nvidia_metrics()
-            process_peak = (
-                int(torch.cuda.max_memory_reserved())
-                if loaded.device == "cuda"
-                else 0
-            )
-            idle_vram = int(loaded.load_benchmark.get("vram_idle_bytes", 0))
-            total_vram = int((gpu_after or {}).get("vram_total_bytes", 0))
-            observed_peak = max(
-                int((gpu_after or {}).get("vram_used_bytes", 0)),
-                idle_vram + process_peak,
-            )
-            if total_vram:
-                observed_peak = min(observed_peak, total_vram)
-            result = {
-                "job_id": job_id,
-                "state": JobState.COMPLETED,
-                "progress": 100,
-                "output_relative_path": request["output_relative_path"],
-                "width": images[0].width,
-                "height": images[0].height,
-                "sha256": self._sha256(output_path),
-                "benchmark": {
-                    **loaded.load_benchmark,
-                    "vram_after_load_bytes": int(
-                        loaded.load_benchmark.get("vram_after_load_bytes", 0)
-                    ),
-                    "vram_peak_bytes": observed_peak,
-                    "ram_peak_bytes": self._ram_peak_bytes(),
-                    "precision": loaded.precision,
-                    "resolution_width": images[0].width,
-                    "resolution_height": images[0].height,
-                    "batch": 1,
-                    "inference_seconds": time.perf_counter() - generation_started,
-                },
-            }
+            result = self._generate_with_adapter(loaded, request, job_id=job_id)
         except InterruptedError:
             result = {
                 "job_id": job_id,

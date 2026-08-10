@@ -7,6 +7,7 @@ import {
   BsArrowClockwise, BsCameraVideo, BsCheckCircle, BsClock, BsDownload,
   BsFilm, BsImage, BsInfoCircle, BsPlayCircle, BsStars, BsUpload, BsXCircle,
 } from "react-icons/bs";
+import { FaArrowsAlt } from "react-icons/fa";
 import { apiFetch, assetUrl, closeWebSocketSafely, eventsUrl } from "../lib/api";
 import styles from "../studio.module.css";
 
@@ -23,6 +24,8 @@ function GenerationsContent() {
   const fileInputRef = useRef(null);
   const [mode, setMode] = useState(sourceAssetId ? "IMAGE_TO_VIDEO" : "TEXT_TO_VIDEO");
   const [inputAsset, setInputAsset] = useState(sourceAssetId ? { id: sourceAssetId, kind: "IMAGE" } : null);
+  const [inputImages, setInputImages] = useState(sourceAssetId ? [{ asset_id: sourceAssetId, order: 0, role: "start_frame" }] : []);
+  const [inputProfile, setInputProfile] = useState({ min_input_images: 1, max_input_images: 1, supported_image_roles: [], supports_start_end_frames: false, supports_reference_images: false, supports_keyframes: false });
   const [models, setModels] = useState([]);
   const [modelId, setModelId] = useState("vidio-motion-local");
   const [prompt, setPrompt] = useState("Une voiture volante traverse une ville futuriste au coucher du soleil, mouvement de caméra cinématographique.");
@@ -90,6 +93,8 @@ function GenerationsContent() {
   function chooseMode(nextMode) {
     setMode(nextMode);
     setInputAsset(null);
+    setInputImages([]);
+    setInputProfile({ min_input_images: 1, max_input_images: 1, supported_image_roles: [], supports_start_end_frames: false, supports_reference_images: false, supports_keyframes: false });
     setGeneration(null);
     setError("");
     const requiredCapability = MODES.find((item) => item.id === nextMode).capability;
@@ -97,15 +102,39 @@ function GenerationsContent() {
     setModelId(local?.id || models.find((model) => model.capabilities.includes(requiredCapability))?.id || "");
   }
 
+  useEffect(() => {
+    if (mode !== "IMAGE_TO_VIDEO") return;
+    const selectedModel = models.find((model) => model.id === modelId);
+    const profile = selectedModel?.input_profile || { min_input_images: 1, max_input_images: 1, supported_image_roles: [], supports_start_end_frames: false, supports_reference_images: false, supports_keyframes: false };
+    setInputProfile(profile);
+    if (profile.max_input_images <= 1) {
+      setInputImages((current) => current.slice(0, 1));
+    }
+  }, [mode, modelId, models]);
+
   async function uploadFile(event) {
-    const file = event.target.files?.[0];
-    if (!file) return;
+    const files = Array.from(event.target.files || []);
+    if (!files.length) return;
     setUploading(true);
     setError("");
     try {
-      const body = new FormData();
-      body.append("file", file);
-      setInputAsset(await apiFetch("/api/assets", { method: "POST", body }));
+      const assets = [];
+      for (const file of files) {
+        const body = new FormData();
+        body.append("file", file);
+        assets.push(await apiFetch("/api/assets", { method: "POST", body }));
+      }
+      if (mode === "IMAGE_TO_VIDEO") {
+        const nextImages = [...inputImages];
+        for (const asset of assets) {
+          if (nextImages.length >= inputProfile.max_input_images) break;
+          nextImages.push({ asset_id: asset.id, order: nextImages.length, role: nextImages.length === 0 ? "start_frame" : "reference" });
+        }
+        setInputImages(nextImages);
+        setInputAsset(assets[0] || null);
+      } else {
+        setInputAsset(assets[0] || null);
+      }
     } catch (requestError) {
       setError(requestError.message);
     } finally {
@@ -121,12 +150,19 @@ function GenerationsContent() {
       return;
     }
     try {
+      const payload = {
+        mode,
+        prompt,
+        model_id: modelId,
+        input_asset_id: mode === "IMAGE_TO_VIDEO" && inputImages.length ? inputImages[0].asset_id : inputAsset?.id,
+        input_images: mode === "IMAGE_TO_VIDEO" ? inputImages : [],
+        duration_seconds: Number(duration),
+        resolution,
+        audio,
+      };
       const created = await apiFetch("/api/videos/generate", {
         method: "POST",
-        body: JSON.stringify({
-          mode, prompt, model_id: modelId, input_asset_id: inputAsset?.id,
-          duration_seconds: Number(duration), resolution, audio,
-        }),
+        body: JSON.stringify(payload),
       });
       setGeneration(created);
     } catch (requestError) {
@@ -140,6 +176,24 @@ function GenerationsContent() {
     } catch (requestError) {
       setError(requestError.message);
     }
+  }
+
+  function removeImage(index) {
+    setInputImages((current) => current.filter((_, itemIndex) => itemIndex !== index));
+  }
+
+  function moveImage(index, direction) {
+    setInputImages((current) => {
+      const next = [...current];
+      const target = index + direction;
+      if (target < 0 || target >= next.length) return current;
+      [next[index], next[target]] = [next[target], next[index]];
+      return next.map((item, itemIndex) => ({ ...item, order: itemIndex }));
+    });
+  }
+
+  function updateImageRole(index, role) {
+    setInputImages((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, role } : item));
   }
 
   const sourceIsVideo = inputAsset?.kind === "VIDEO";
@@ -166,19 +220,53 @@ function GenerationsContent() {
 
           {mode !== "TEXT_TO_VIDEO" && (
             <div className={styles.videoSourceBlock}>
-              <div className={styles.sectionTitle}><strong>{sourceIsVideo ? "Vidéo de départ" : "Image de départ"}</strong><span>Asset persistant</span></div>
-              {inputAsset ? (
-                <div className={styles.videoSourcePreview}>
-                  {sourceIsVideo ? <video src={assetUrl(inputAsset.id)} controls preload="metadata" /> : <Image unoptimized width={960} height={540} src={assetUrl(inputAsset.id)} alt="Média de départ" />}
-                  <button type="button" onClick={() => setInputAsset(null)} aria-label="Retirer le média"><BsXCircle /></button>
+              <div className={styles.sectionTitle}><strong>{sourceIsVideo ? "Vidéo de départ" : mode === "IMAGE_TO_VIDEO" ? "Images de départ" : "Image de départ"}</strong><span>{mode === "IMAGE_TO_VIDEO" ? `${inputImages.length}/${inputProfile.max_input_images}` : "Asset persistant"}</span></div>
+              {mode === "IMAGE_TO_VIDEO" ? (
+                <div className={styles.imageStack}>
+                  {inputImages.length ? inputImages.map((item, index) => (
+                    <div key={`${item.asset_id}-${index}`} className={styles.imageStackCard}>
+                      <div className={styles.imageStackNumber}>#{index + 1}</div>
+                      <Image unoptimized width={240} height={160} src={assetUrl(item.asset_id)} alt={`Image ${index + 1}`} />
+                      <div className={styles.imageStackActions}>
+                        <button type="button" onClick={() => moveImage(index, -1)} disabled={index === 0} aria-label="Déplacer vers le haut">↑</button>
+                        <button type="button" onClick={() => moveImage(index, 1)} disabled={index === inputImages.length - 1} aria-label="Déplacer vers le bas">↓</button>
+                        <button type="button" onClick={() => removeImage(index)} aria-label="Supprimer l'image"><BsXCircle /></button>
+                      </div>
+                      <label className={styles.formGroup}>
+                        <span>Rôle</span>
+                        <select value={item.role} onChange={(event) => updateImageRole(index, event.target.value)}>
+                          <option value="start_frame">Start frame</option>
+                          <option value="end_frame">End frame</option>
+                          <option value="reference">Référence</option>
+                          <option value="keyframe">Keyframe</option>
+                        </select>
+                      </label>
+                    </div>
+                  )) : null}
+                  {inputImages.length < inputProfile.max_input_images && (
+                    <button type="button" className={styles.videoUpload} onClick={() => fileInputRef.current?.click()}>
+                      <BsUpload /><strong>{uploading ? "Import en cours…" : "Ajouter une image"}</strong>
+                      <span>{inputProfile.max_input_images === 1 ? "1 image maximum" : `Jusqu'à ${inputProfile.max_input_images} images`}</span>
+                    </button>
+                  )}
+                  <input ref={fileInputRef} hidden type="file" accept={activeMode.accepts} multiple={inputProfile.max_input_images > 1} onChange={uploadFile} />
                 </div>
               ) : (
-                <button type="button" className={styles.videoUpload} onClick={() => fileInputRef.current?.click()}>
-                  <BsUpload /><strong>{uploading ? "Import en cours…" : "Glissez-déposez ou cliquez pour parcourir"}</strong>
-                  <span>{mode === "IMAGE_TO_VIDEO" ? "PNG, JPEG ou WebP · 25 Mo max" : "MP4 · 512 Mo max"}</span>
-                </button>
+                <>
+                  {inputAsset ? (
+                    <div className={styles.videoSourcePreview}>
+                      {sourceIsVideo ? <video src={assetUrl(inputAsset.id)} controls preload="metadata" /> : <Image unoptimized width={960} height={540} src={assetUrl(inputAsset.id)} alt="Média de départ" />}
+                      <button type="button" onClick={() => setInputAsset(null)} aria-label="Retirer le média"><BsXCircle /></button>
+                    </div>
+                  ) : (
+                    <button type="button" className={styles.videoUpload} onClick={() => fileInputRef.current?.click()}>
+                      <BsUpload /><strong>{uploading ? "Import en cours…" : "Glissez-déposez ou cliquez pour parcourir"}</strong>
+                      <span>{mode === "IMAGE_TO_VIDEO" ? "PNG, JPEG ou WebP · 25 Mo max" : "MP4 · 512 Mo max"}</span>
+                    </button>
+                  )}
+                  <input ref={fileInputRef} hidden type="file" accept={activeMode.accepts} onChange={uploadFile} />
+                </>
               )}
-              <input ref={fileInputRef} hidden type="file" accept={activeMode.accepts} onChange={uploadFile} />
             </div>
           )}
 

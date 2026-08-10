@@ -304,6 +304,16 @@ impl SettingsStore {
 
 /// DTO enrichi avec les informations propres à la machine courante.
 #[derive(Debug, Clone, Serialize)]
+pub struct ModelInputProfile {
+    pub min_input_images: usize,
+    pub max_input_images: usize,
+    pub supported_image_roles: Vec<String>,
+    pub supports_start_end_frames: bool,
+    pub supports_reference_images: bool,
+    pub supports_keyframes: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ModelView {
     pub id: String,
     pub name: String,
@@ -338,6 +348,7 @@ pub struct ModelView {
     pub runtime_reason: String,
     pub pipeline_class: Option<String>,
     pub runtime_capabilities: Vec<ModelCapability>,
+    pub input_profile: ModelInputProfile,
     /// Alias métier explicite demandé par le contrat catalogue.
     pub vidioai_supported: bool,
     pub source_available: bool,
@@ -501,6 +512,8 @@ pub struct Generation {
     pub negative_prompt: Option<String>,
     pub model_id: String,
     pub input_asset_id: Option<Uuid>,
+    #[serde(default)]
+    pub input_images: Vec<GenerationInputImage>,
     pub output_asset_id: Option<Uuid>,
     pub status: GenerationStatus,
     pub progress: u8,
@@ -513,6 +526,15 @@ pub struct Generation {
     pub resolution: Option<String>,
     #[serde(default)]
     pub audio: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerationInputImage {
+    pub asset_id: Uuid,
+    #[serde(default)]
+    pub order: usize,
+    #[serde(default)]
+    pub role: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -530,6 +552,8 @@ pub struct GenerateVideoRequest {
     pub prompt: String,
     pub model_id: Option<String>,
     pub input_asset_id: Option<Uuid>,
+    #[serde(default)]
+    pub input_images: Vec<GenerationInputImage>,
     pub duration_seconds: Option<u32>,
     pub resolution: Option<String>,
     #[serde(default)]
@@ -1948,6 +1972,48 @@ async fn model_view(state: &AppState, entry: &CatalogEntry) -> ModelView {
     model_view_with_machine(state, entry, &machine).await
 }
 
+fn model_input_profile(entry: &CatalogEntry) -> ModelInputProfile {
+    let haystack = format!(
+        "{} {} {} {} {} {}",
+        entry.id,
+        entry.name,
+        entry.pipeline_tag.as_deref().unwrap_or_default(),
+        entry.architecture.as_deref().unwrap_or_default(),
+        entry.repository,
+        entry.tags.join(" ")
+    )
+    .to_ascii_lowercase();
+
+    if haystack.contains("ltx") || haystack.contains("ltx-video") {
+        ModelInputProfile {
+            min_input_images: 1,
+            max_input_images: 2,
+            supported_image_roles: vec!["start_frame".into(), "end_frame".into()],
+            supports_start_end_frames: true,
+            supports_reference_images: false,
+            supports_keyframes: false,
+        }
+    } else if haystack.contains("cogvideo") || haystack.contains("cogvideox") {
+        ModelInputProfile {
+            min_input_images: 1,
+            max_input_images: 8,
+            supported_image_roles: vec!["reference".into(), "keyframe".into()],
+            supports_start_end_frames: false,
+            supports_reference_images: true,
+            supports_keyframes: true,
+        }
+    } else {
+        ModelInputProfile {
+            min_input_images: 1,
+            max_input_images: 1,
+            supported_image_roles: Vec::new(),
+            supports_start_end_frames: false,
+            supports_reference_images: false,
+            supports_keyframes: false,
+        }
+    }
+}
+
 async fn model_view_with_machine(
     state: &AppState,
     entry: &CatalogEntry,
@@ -2137,6 +2203,7 @@ async fn model_view_with_machine(
         runtime_reason: entry.runtime_reason.clone(),
         pipeline_class: entry.pipeline_class.clone(),
         runtime_capabilities: entry.runtime_capabilities.clone(),
+        input_profile: model_input_profile(entry),
         vidioai_supported: entry.runtime_supported,
         source_available: entry.source_available,
         hardware_compatible,
@@ -3279,6 +3346,7 @@ async fn generate_image(
         negative_prompt: request.negative_prompt,
         model_id,
         input_asset_id: request.input_asset_id,
+        input_images: vec![],
         output_asset_id: None,
         status: GenerationStatus::Queued,
         progress: 0,
@@ -3424,10 +3492,53 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
                 content
             }
             GenerationMode::TextToImage => engine.text_to_image(&generation.prompt).await?,
-            GenerationMode::ImageToImage => {
-                if !procedural {
-                    return Err("IMAGE_TO_IMAGE n'est pas encore validé par le worker.".into());
+            GenerationMode::ImageToImage if !procedural => {
+                let worker = state.worker.as_ref().ok_or("Worker GPU absent")?;
+                let relative = PathBuf::from("generations").join(format!("{}.png", generation.id));
+                let id = generation.input_asset_id.ok_or("Asset source absent")?;
+                let (_, path) = read_asset_manifest(&state, id)
+                    .await
+                    .map_err(|error| error.message)?;
+                let input = fs::read(path).await.map_err(|error| error.to_string())?;
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|value| value.as_nanos().to_string())
+                    .unwrap_or_else(|_| "0".to_string());
+                let input_path = state
+                    .settings
+                    .get()
+                    .await
+                    .work_dir
+                    .join(format!("{}.input-{}.bin", generation.id, timestamp));
+                std::fs::write(&input_path, &input).map_err(|error| error.to_string())?;
+                let worker_result = worker
+                    .generate_image_to_image(
+                        &job_id.to_string(),
+                        &storage_id(&generation.model_id),
+                        &generation.prompt,
+                        generation.negative_prompt.as_deref(),
+                        &relative,
+                        &input_path.to_string_lossy(),
+                    )
+                    .await?;
+                if worker_result.job_id != job_id.to_string()
+                    || worker_result.state != "COMPLETED"
+                    || worker_result.output_relative_path != relative.to_string_lossy()
+                    || worker_result.width != 1024
+                    || worker_result.height != 1024
+                    || worker_result.sha256.len() != 64
+                {
+                    return Err("Le worker a renvoyé un résultat incohérent.".into());
                 }
+                let path = state.settings.get().await.work_dir.join(&relative);
+                let content = fs::read(&path).await.map_err(|error| {
+                    format!("Sortie worker introuvable sur le volume partagé: {error}")
+                })?;
+                let _ = fs::remove_file(path).await;
+                let _ = fs::remove_file(&input_path).await;
+                content
+            }
+            GenerationMode::ImageToImage => {
                 let id = generation.input_asset_id.ok_or("Asset source absent")?;
                 let (_, path) = read_asset_manifest(&state, id)
                     .await
@@ -3556,7 +3667,8 @@ async fn generate_video(
         ));
     }
 
-    let expected = match request.mode {
+    let mode = request.mode.clone();
+    let expected = match mode {
         GenerationMode::TextToVideo => ModelCapability::TextToVideo,
         GenerationMode::ImageToVideo => ModelCapability::ImageToVideo,
         GenerationMode::VideoToVideo => ModelCapability::VideoToVideo,
@@ -3574,39 +3686,58 @@ async fn generate_video(
     if !model_view(&state, &entry).await.installed {
         return Err(ApiError::conflict("Installez le modèle avant de générer."));
     }
-    // Les dépôts HF sont prêts pour le worker GPU des étapes de production,
-    // mais ne sont jamais présentés comme exécutés par le moteur FFmpeg local.
-    if model_id != "vidio-motion-local" {
-        return Err(ApiError::conflict(
-            "Le worker livré valide uniquement TEXT_TO_IMAGE. Aucun résultat FFmpeg local ne sera attribué à ce modèle IA vidéo.",
-        ));
-    }
-
-    if request.mode != GenerationMode::TextToVideo {
-        let id = request
-            .input_asset_id
-            .ok_or_else(|| ApiError::bad_request("input_asset_id est obligatoire pour ce mode."))?;
-        let (asset, _) = read_asset_manifest(&state, id).await?;
-        let expected_kind = if request.mode == GenerationMode::ImageToVideo {
-            AssetKind::Image
+    let mut input_images = request.input_images.clone();
+    if mode != GenerationMode::TextToVideo {
+        if mode == GenerationMode::ImageToVideo {
+            if request.input_asset_id.is_some() && input_images.is_empty() {
+                input_images.push(GenerationInputImage {
+                    asset_id: request.input_asset_id.unwrap(),
+                    order: 0,
+                    role: "start_frame".into(),
+                });
+            }
+            if input_images.is_empty() {
+                return Err(ApiError::bad_request(
+                    "input_images est obligatoire pour le mode IMAGE_TO_VIDEO.",
+                ));
+            }
+            let unique_ids = input_images.iter().map(|item| item.asset_id).collect::<HashSet<_>>();
+            if unique_ids.len() != input_images.len() {
+                return Err(ApiError::bad_request("Les images d'entrée ne doivent pas être dupliquées."));
+            }
+            let mut ordered = input_images.clone();
+            ordered.sort_by_key(|item| item.order);
+            for item in &ordered {
+                let (asset, _) = read_asset_manifest(&state, item.asset_id).await?;
+                if asset.kind != AssetKind::Image {
+                    return Err(ApiError::bad_request(
+                        "Le type de l'asset source ne correspond pas au mode.",
+                    ));
+                }
+            }
+            let _ = ordered;
         } else {
-            AssetKind::Video
-        };
-        if asset.kind != expected_kind {
-            return Err(ApiError::bad_request(
-                "Le type de l'asset source ne correspond pas au mode.",
-            ));
+            let id = request.input_asset_id.ok_or_else(|| {
+                ApiError::bad_request("input_asset_id est obligatoire pour ce mode.")
+            })?;
+            let (asset, _) = read_asset_manifest(&state, id).await?;
+            if asset.kind != AssetKind::Video {
+                return Err(ApiError::bad_request(
+                    "Le type de l'asset source ne correspond pas au mode.",
+                ));
+            }
         }
     }
 
     let generation = Generation {
         id: Uuid::new_v4(),
         kind: AssetKind::Video,
-        mode: request.mode,
+        mode: mode,
         prompt: prompt.to_string(),
         negative_prompt: None,
         model_id,
         input_asset_id: request.input_asset_id,
+        input_images: input_images.clone(),
         output_asset_id: None,
         status: GenerationStatus::Queued,
         progress: 0,
@@ -3670,10 +3801,33 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
 
     let result: Result<Asset, String> = async {
         let source_path = if generation.mode == GenerationMode::TextToVideo {
-            let bytes = CanvasEngine.text_to_image(&generation.prompt).await?;
-            let path = temporary_dir.join("prompt.png");
-            fs::write(&path, bytes).await.map_err(|error| error.to_string())?;
-            path
+            let worker = state.worker.as_ref().ok_or("Worker GPU absent")?;
+            let relative = PathBuf::from("generations").join(format!("{}.png", generation.id));
+            let worker_result = worker
+                .generate_video(
+                    "/v1/generate/text-to-video",
+                    &job_id.to_string(),
+                    &storage_id(&generation.model_id),
+                    &generation.prompt,
+                    None,
+                    &relative,
+                    None,
+                )
+                .await?;
+            if worker_result.job_id != job_id.to_string()
+                || worker_result.state != "COMPLETED"
+                || worker_result.output_relative_path != relative.to_string_lossy()
+            {
+                return Err("Le worker a renvoyé un résultat incohérent.".into());
+            }
+            let path = state.settings.get().await.work_dir.join(&relative);
+            let bytes = fs::read(&path).await.map_err(|error| {
+                format!("Sortie worker introuvable sur le volume partagé: {error}")
+            })?;
+            let _ = fs::remove_file(path).await;
+            let prompt_path = temporary_dir.join("prompt.png");
+            fs::write(&prompt_path, bytes).await.map_err(|error| error.to_string())?;
+            prompt_path
         } else {
             let id = generation.input_asset_id.ok_or("Asset source absent")?;
             read_asset_manifest(&state, id).await.map_err(|error| error.message)?.1
