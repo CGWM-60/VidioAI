@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -210,7 +212,11 @@ def test_generation_endpoint_structured_errors_for_all_capabilities(
         headers={"X-VidioAI-Worker-Token": "test-token"},
     )
     assert response.status_code == 422
-    assert response.json() == {"error": "Entrée invalide"}
+    assert response.json() == {
+        "error": "Entrée invalide",
+        "code": "WORKER_ERROR",
+        "retryable": False,
+    }
 
 
 @pytest.mark.parametrize("capability", sorted(CAPABILITY_ENDPOINTS))
@@ -260,6 +266,183 @@ def test_pipeline_registry_selects_an_adapter_from_metadata(tmp_path: Path) -> N
         encoding="utf-8",
     )
     (snapshot / "config.json").write_text(json.dumps({"model_type": "ltx"}), encoding="utf-8")
+
+    metadata = inspect_model_metadata(snapshot)
+    registry = PipelineRegistry()
+    adapter = registry.select_for_capability(metadata, "IMAGE_TO_VIDEO")
+    assert adapter is not None
+    assert "IMAGE_TO_VIDEO" in adapter.capabilities()
+
+
+def test_realistic_wan_model_index_selects_adapter_for_official_model(tmp_path: Path) -> None:
+    snapshot = tmp_path / "wan-official"
+    snapshot.mkdir(parents=True)
+    (snapshot / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "WanPipeline",
+                "library_name": "diffusers",
+                "transformer": ["diffusers", "WanTransformer3DModel"],
+                "vae": ["diffusers", "AutoencoderKLWan"],
+                "scheduler": ["diffusers", "UniPCMultistepScheduler"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (snapshot / "model.safetensors").write_bytes(b"w" * 2048)
+
+    metadata = inspect_model_metadata(snapshot)
+    registry = PipelineRegistry()
+    adapter = registry.select_for_capability(metadata, "TEXT_TO_VIDEO")
+    assert adapter is not None
+    assert "TEXT_TO_VIDEO" in adapter.supported_capabilities(metadata)
+
+
+def test_realistic_wan_model_index_selects_adapter_for_quantized_derivative(tmp_path: Path) -> None:
+    snapshot = tmp_path / "wan-derivative"
+    snapshot.mkdir(parents=True)
+    (snapshot / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "WanPipeline",
+                "library_name": "diffusers",
+                "base_model": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+                "transformer": ["diffusers", "WanTransformer3DModel"],
+                "vae": ["diffusers", "AutoencoderKLWan"],
+                "scheduler": ["diffusers", "UniPCMultistepScheduler"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (snapshot / "model.safetensors").write_bytes(b"w" * 2048)
+
+    metadata = inspect_model_metadata(snapshot)
+    registry = PipelineRegistry()
+    adapter = registry.select_for_capability(metadata, "TEXT_TO_VIDEO")
+    assert adapter is not None
+
+
+def test_backend_runtime_supported_contract_implies_worker_adapter_resolution(tmp_path: Path) -> None:
+    snapshot = tmp_path / "wan-contract"
+    snapshot.mkdir(parents=True)
+    (snapshot / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "WanPipeline",
+                "library_name": "diffusers",
+                "transformer": ["diffusers", "WanTransformer3DModel"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Contrat backend: runtime_supported=true avec ce pipeline.
+    backend_view = {"runtime_supported": True, "pipeline_class": "WanPipeline"}
+
+    metadata = inspect_model_metadata(snapshot)
+    assert backend_view["runtime_supported"] is True
+    registry = PipelineRegistry()
+    assert registry.select_for_capability(metadata, "TEXT_TO_VIDEO") is not None
+
+
+def test_generic_diffusers_adapter_handles_known_pipeline_class_without_specialized_adapter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = tmp_path / "generic-diffusers"
+    snapshot.mkdir(parents=True)
+    (snapshot / "model_index.json").write_text(
+        json.dumps({"_class_name": "FluxPipeline", "library_name": "diffusers"}),
+        encoding="utf-8",
+    )
+    (snapshot / "model.safetensors").write_bytes(b"w" * 2048)
+
+    fake_diffusers = SimpleNamespace(FluxPipeline=object())
+    monkeypatch.setitem(sys.modules, "diffusers", fake_diffusers)
+
+    metadata = inspect_model_metadata(snapshot)
+    # Force le cas fallback générique : aucune capability explicite.
+    metadata["capabilities"] = []
+    registry = PipelineRegistry()
+    adapter = registry.select_for_capability(metadata, "TEXT_TO_IMAGE")
+    assert adapter is not None
+
+
+def test_unknown_diffusers_pipeline_class_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    snapshot = tmp_path / "unknown-diffusers"
+    snapshot.mkdir(parents=True)
+    (snapshot / "model_index.json").write_text(
+        json.dumps({"_class_name": "UnknownFuturePipeline", "library_name": "diffusers"}),
+        encoding="utf-8",
+    )
+    (snapshot / "model.safetensors").write_bytes(b"w" * 2048)
+
+    monkeypatch.setitem(sys.modules, "diffusers", SimpleNamespace())
+
+    metadata = inspect_model_metadata(snapshot)
+    registry = PipelineRegistry()
+    assert registry.select_for_capability(metadata, "TEXT_TO_IMAGE") is None
+
+
+@pytest.mark.parametrize(
+    "repository,base_models",
+    [
+        ("Wan-AI/Wan2.2-TI2V-5B-Diffusers", ["Wan-AI/Wan2.2-TI2V-5B-Diffusers"]),
+        ("AsadIsmail/Wan2.2-TI2V-5B-ternary", ["Wan-AI/Wan2.2-TI2V-5B-Diffusers"]),
+    ],
+)
+def test_pipeline_registry_detects_wan_adapter_for_supported_and_derived_models(
+    tmp_path: Path,
+    repository: str,
+    base_models: list[str],
+) -> None:
+    snapshot = tmp_path / repository.replace("/", "_")
+    snapshot.mkdir(parents=True)
+    (snapshot / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "WanPipeline",
+                "library_name": "diffusers",
+                "pipeline_tag": "text-to-video",
+                "tags": ["text-to-video", "image-to-video", "wan"],
+                "base_models": base_models,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (snapshot / "config.json").write_text(json.dumps({"library_name": "diffusers"}), encoding="utf-8")
+    (snapshot / "transformer").mkdir(parents=True)
+    (snapshot / "transformer" / "config.json").write_text(
+        json.dumps({"architectures": ["WanTransformer3DModel"]}),
+        encoding="utf-8",
+    )
+
+    metadata = inspect_model_metadata(snapshot)
+    registry = PipelineRegistry()
+    adapter = registry.select_for_capability(metadata, "IMAGE_TO_VIDEO")
+    assert adapter is not None
+    assert "IMAGE_TO_VIDEO" in adapter.capabilities()
+
+
+def test_pipeline_registry_detects_wan_adapter_for_fictive_derivative_from_base_model_metadata(
+    tmp_path: Path,
+) -> None:
+    snapshot = tmp_path / "wan-derivative"
+    snapshot.mkdir(parents=True)
+    (snapshot / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "WanPipeline",
+                "library_name": "diffusers",
+                "base_model": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (snapshot / "transformer").mkdir(parents=True)
+    (snapshot / "transformer" / "config.json").write_text(
+        json.dumps({"architectures": ["WanTransformer3DModel"]}),
+        encoding="utf-8",
+    )
 
     metadata = inspect_model_metadata(snapshot)
     registry = PipelineRegistry()
@@ -553,6 +736,19 @@ def _write_fake_snapshot(target: Path) -> None:
     (target / "model.safetensors").write_bytes(b"w" * 2048)
 
 
+def _write_incompatible_fake_snapshot(target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "model_index.json").write_text(
+        json.dumps({"_class_name": "CustomAudioPipeline", "library_name": "diffusers", "pipeline_tag": "audio-generation"}),
+        encoding="utf-8",
+    )
+    (target / "config.json").write_text(
+        json.dumps({"architectures": ["AudioTransformerModel"], "model_type": "audio"}),
+        encoding="utf-8",
+    )
+    (target / "model.safetensors").write_bytes(b"w" * 2048)
+
+
 def _fake_torch(*, cuda_available: bool) -> SimpleNamespace:
     return SimpleNamespace(
         cuda=SimpleNamespace(is_available=lambda: cuda_available),
@@ -573,6 +769,32 @@ def test_runtime_status_handles_runtime_import_error(tmp_path: Path, monkeypatch
     assert status["runtime_available"] is False
     assert status["cuda_available"] is False
     assert any("import error" in error for error in status["errors"])
+
+
+def test_load_model_returns_structured_error_for_incompatible_pipeline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    configuration = settings(tmp_path)
+    manager = RuntimeManager(configuration)
+
+    model_root = configuration.models_dir / "incompatible-model"
+    snapshot = model_root / "commit-sha"
+    _write_incompatible_fake_snapshot(snapshot)
+    (model_root / "active.json").write_text(
+        json.dumps(
+            {
+                "model_id": "incompatible-model",
+                "repository": "example/incompatible-model",
+                "revision": "commit-sha",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(manager, "_imports", lambda: (_fake_torch(cuda_available=False), object()))
+
+    with pytest.raises(WorkerError) as error:
+        manager.load_model("incompatible-model")
+    assert error.value.status_code == 422
+    assert "pipeline non supporté" in str(error.value)
 
 
 def test_imports_contract_is_two_values(tmp_path: Path) -> None:
@@ -813,3 +1035,246 @@ def test_install_model_private_without_token_returns_access_required_error(
         )
     assert error.value.status_code == 403
     assert "Accès Hugging Face requis" in str(error.value)
+
+
+def test_install_model_download_ok_with_xet_first_try(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+    observed = {"calls": 0}
+
+    class FakeHfApi:
+        def __init__(self, token: str | None = None) -> None:
+            del token
+
+        def model_info(self, repository: str, revision: str = "main") -> SimpleNamespace:
+            del repository, revision
+            sibling = SimpleNamespace(size=1024)
+            return SimpleNamespace(sha="commit-sha", siblings=[sibling])
+
+    def fake_snapshot_download(**kwargs) -> None:
+        observed["calls"] += 1
+        _write_fake_snapshot(Path(kwargs["local_dir"]))
+
+    monkeypatch.setattr(
+        manager,
+        "_imports",
+        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+    )
+
+    status = manager.install_model("stable-image-core", "stabilityai/sd-turbo", "main", ["TEXT_TO_IMAGE"])
+    assert status["state"] == "INSTALLED"
+    assert observed["calls"] == 1
+
+
+def test_install_model_retries_transient_xet_reconstruction_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+    observed = {"calls": 0}
+
+    class FakeHfApi:
+        def __init__(self, token: str | None = None) -> None:
+            del token
+
+        def model_info(self, repository: str, revision: str = "main") -> SimpleNamespace:
+            del repository, revision
+            sibling = SimpleNamespace(size=1024)
+            return SimpleNamespace(sha="commit-sha", siblings=[sibling])
+
+    def fake_snapshot_download(**kwargs) -> None:
+        observed["calls"] += 1
+        if observed["calls"] == 1:
+            raise RuntimeError("File reconstruction error: Background writer channel closed")
+        _write_fake_snapshot(Path(kwargs["local_dir"]))
+
+    monkeypatch.setattr(
+        manager,
+        "_imports",
+        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+    )
+
+    status = manager.install_model("stable-image-core", "stabilityai/sd-turbo", "main", ["TEXT_TO_IMAGE"])
+    assert status["state"] == "INSTALLED"
+    assert observed["calls"] >= 2
+
+
+def test_install_model_uses_fallback_without_xet_after_persistent_reconstruction_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+    observed = {"calls": 0, "disable_xet_flags": []}
+
+    class FakeHfApi:
+        def __init__(self, token: str | None = None) -> None:
+            del token
+
+        def model_info(self, repository: str, revision: str = "main") -> SimpleNamespace:
+            del repository, revision
+            sibling = SimpleNamespace(size=1024)
+            return SimpleNamespace(sha="commit-sha", siblings=[sibling])
+
+    def fake_snapshot_download(**kwargs) -> None:
+        observed["calls"] += 1
+        observed["disable_xet_flags"].append(os.getenv("HF_HUB_DISABLE_XET"))
+        if os.getenv("HF_HUB_DISABLE_XET") == "1":
+            _write_fake_snapshot(Path(kwargs["local_dir"]))
+            return
+        raise RuntimeError("Internal Writer Error: Background writer channel closed")
+
+    monkeypatch.setattr(
+        manager,
+        "_imports",
+        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+    )
+
+    status = manager.install_model("stable-image-core", "stabilityai/sd-turbo", "main", ["TEXT_TO_IMAGE"])
+    assert status["state"] == "INSTALLED"
+    assert "1" in observed["disable_xet_flags"]
+
+
+def test_install_model_returns_hf_xet_reconstruction_error_when_fallback_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+
+    class FakeHfApi:
+        def __init__(self, token: str | None = None) -> None:
+            del token
+
+        def model_info(self, repository: str, revision: str = "main") -> SimpleNamespace:
+            del repository, revision
+            sibling = SimpleNamespace(size=1024)
+            return SimpleNamespace(sha="commit-sha", siblings=[sibling])
+
+    def fake_snapshot_download(**kwargs) -> None:
+        del kwargs
+        raise RuntimeError("File reconstruction error: Background writer channel closed")
+
+    monkeypatch.setattr(
+        manager,
+        "_imports",
+        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+    )
+    monkeypatch.setenv("VIDIOAI_ENABLE_HF_XET_FALLBACK", "false")
+
+    with pytest.raises(WorkerError) as error:
+        manager.install_model("stable-image-core", "stabilityai/sd-turbo", "main", ["TEXT_TO_IMAGE"])
+    assert error.value.code == "HF_XET_RECONSTRUCTION_ERROR"
+
+
+def test_install_model_fails_with_insufficient_disk_space(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+
+    monkeypatch.setattr(manager, "_available_disk_bytes", lambda _path: 1)
+    monkeypatch.setattr(manager, "_is_writable_directory", lambda _path: True)
+    monkeypatch.setattr(manager, "_available_inodes", lambda _path: 1000)
+
+    with pytest.raises(WorkerError) as error:
+        manager._precheck_download_environment(required_bytes=10 * 1024 * 1024)
+    assert error.value.code == "INSUFFICIENT_DISK_SPACE"
+
+
+def test_install_model_fails_with_cache_not_writable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+
+    def fake_writable(path: Path) -> bool:
+        return "hub" not in str(path)
+
+    monkeypatch.setattr(manager, "_is_writable_directory", fake_writable)
+
+    with pytest.raises(WorkerError) as error:
+        manager._precheck_download_environment(required_bytes=10 * 1024 * 1024)
+    assert error.value.code == "CACHE_NOT_WRITABLE"
+
+
+def test_install_model_fails_with_scratch_not_writable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+
+    def fake_writable(path: Path) -> bool:
+        return "models" not in str(path)
+
+    monkeypatch.setattr(manager, "_is_writable_directory", fake_writable)
+
+    with pytest.raises(WorkerError) as error:
+        manager._precheck_download_environment(required_bytes=10 * 1024 * 1024)
+    assert error.value.code == "SCRATCH_NOT_WRITABLE"
+
+
+def test_partial_snapshot_is_never_marked_installed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+
+    class FakeHfApi:
+        def __init__(self, token: str | None = None) -> None:
+            del token
+
+        def model_info(self, repository: str, revision: str = "main") -> SimpleNamespace:
+            del repository, revision
+            sibling = SimpleNamespace(size=1024)
+            return SimpleNamespace(sha="commit-sha", siblings=[sibling])
+
+    def fake_snapshot_download(**kwargs) -> None:
+        target = Path(kwargs["local_dir"])
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "model_index.json").write_text(
+            json.dumps({"_class_name": "StableDiffusionPipeline"}),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(
+        manager,
+        "_imports",
+        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+    )
+
+    with pytest.raises(WorkerError):
+        manager.install_model("stable-image-core", "stabilityai/sd-turbo", "main", ["TEXT_TO_IMAGE"])
+    status = manager.model_status("stable-image-core")
+    assert status["state"] != "INSTALLED"
+
+
+def test_valid_existing_snapshot_is_preserved_when_new_download_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configuration = settings(tmp_path)
+    manager = RuntimeManager(configuration)
+
+    model_root = configuration.models_dir / "stable-image-core"
+    valid_snapshot = model_root / "commit-sha"
+    _write_fake_snapshot(valid_snapshot)
+    (model_root / "active.json").write_text(
+        json.dumps(
+            {
+                "model_id": "stable-image-core",
+                "repository": "stabilityai/sd-turbo",
+                "revision": "commit-sha",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeHfApi:
+        def __init__(self, token: str | None = None) -> None:
+            del token
+
+        def model_info(self, repository: str, revision: str = "main") -> SimpleNamespace:
+            del repository, revision
+            sibling = SimpleNamespace(size=1024)
+            return SimpleNamespace(sha="new-commit", siblings=[sibling])
+
+    def fake_snapshot_download(**kwargs) -> None:
+        del kwargs
+        raise RuntimeError("File reconstruction error: Background writer channel closed")
+
+    monkeypatch.setattr(
+        manager,
+        "_imports",
+        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+    )
+    monkeypatch.setenv("VIDIOAI_ENABLE_HF_XET_FALLBACK", "false")
+
+    with pytest.raises(WorkerError):
+        manager.install_model("stable-image-core", "stabilityai/sd-turbo", "main", ["TEXT_TO_IMAGE"])
+
+    assert valid_snapshot.is_dir()
+    pointer = json.loads((model_root / "active.json").read_text(encoding="utf-8"))
+    assert pointer["revision"] == "commit-sha"

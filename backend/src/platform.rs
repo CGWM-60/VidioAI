@@ -2673,8 +2673,17 @@ async fn run_install(state: Arc<AppState>, job: Job, entry: CatalogEntry) {
                 .await
         }
         Err(error) => {
+            let last_progress = state
+                .jobs
+                .read()
+                .await
+                .get(&job.id)
+                .map(|item| item.progress)
+                .unwrap_or(0)
+                .min(99);
+            let message = format!("Installation échouée à {last_progress}% · {error}");
             state
-                .update_job(job.id, JobStatus::Failed, "failed", 100, &error)
+                .update_job(job.id, JobStatus::Failed, "failed", last_progress, &message)
                 .await
         }
     }

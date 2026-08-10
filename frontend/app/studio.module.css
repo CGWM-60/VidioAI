@@ -168,6 +168,8 @@
 .progressRing small { font-size: 30px; }
 .progressPanel h2 { margin: 30px 0 5px; }
 .progressPanel p { color: #a9b2c3; }
+.failureCode { margin-top: 4px; color: #f3c96d; font-size: 12px; }
+.installFailureActions { display: flex; gap: 10px; margin-top: 8px; }
 .tip { display: flex; align-items: center; gap: 16px; margin-top: 28px; padding: 20px; color: #a87aff; border: 1px solid rgba(128, 75, 237, .2); border-radius: 12px; }
 .tip > div { display: grid; gap: 4px; }
 .tip span { color: #a9b2c3; font-size: 13px; }

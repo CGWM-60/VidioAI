@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useParams, useSearchParams } from "next/navigation";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { BsArrowLeft, BsCheck2, BsCircle, BsInfoCircle } from "react-icons/bs";
 import { apiFetch, closeWebSocketSafely, eventsUrl } from "../../../lib/api";
@@ -16,17 +16,26 @@ const STEPS = [
   ["ready", "Prêt à l’emploi", "Démarrage du modèle"],
 ];
 
+function extractErrorCode(message) {
+  if (!message) return "";
+  const match = String(message).match(/\b([A-Z][A-Z0-9_]{2,})\b/);
+  return match ? match[1] : "";
+}
+
 /** Suit le job par WebSocket après un unique GET d'amorçage. */
 function InstallContent() {
   const { id } = useParams();
   const searchParams = useSearchParams();
+  const router = useRouter();
   const modelId = searchParams.get("model_id") || decodeURIComponent(id || "");
   const jobId = searchParams.get("job");
   const [model, setModel] = useState(null);
   const [job, setJob] = useState(null);
   const [error, setError] = useState("");
+  const [retrying, setRetrying] = useState(false);
   const hasJob = Boolean(job);
   const terminal = ["completed", "failed", "cancelled"].includes(job?.status);
+  const failureCode = extractErrorCode(job?.message || "");
 
   const loadInitialState = useCallback(async () => {
     if (!jobId) { setError("Identifiant de job absent."); return; }
@@ -62,6 +71,21 @@ function InstallContent() {
   const currentIndex = useMemo(() => Math.max(0, STEPS.findIndex(([stage]) => stage === job?.stage)), [job]);
   const complete = job?.status === "completed";
 
+  async function retryInstall() {
+    if (!model?.id) return;
+    setRetrying(true);
+    try {
+      const nextJob = await apiFetch("/api/models/install", {
+        method: "POST",
+        body: JSON.stringify({ model_id: model.id, revision: model.revision }),
+      });
+      router.push(`/models/install?model_id=${encodeURIComponent(model.id)}&job=${nextJob.id}`);
+    } catch (requestError) {
+      setError(requestError.message);
+      setRetrying(false);
+    }
+  }
+
   return (
     <div className={styles.page}>
       <header className={styles.pageHeading}><div className={styles.headingWithBack}><Link href="/models"><BsArrowLeft /></Link><div><h1>Installation automatique</h1><p>Téléchargement et installation simplifiés et automatisés.</p></div></div></header>
@@ -80,10 +104,20 @@ function InstallContent() {
           </div>
           <div className={styles.progressPanel}>
             <div className={styles.progressRing} style={{ "--progress": `${(job?.progress || 0) * 3.6}deg` }}><strong>{job?.progress || 0}<small>%</small></strong></div>
-            <h2>{complete ? "Installation terminée" : job?.status === "failed" ? "Installation échouée" : "Installation en cours…"}</h2>
+            <h2>{complete ? "Installation terminée" : job?.status === "failed" ? `Installation échouée à ${job?.progress || 0}%` : "Installation en cours…"}</h2>
             <p>{job?.message || "Préparation du worker…"}</p>
+            {job?.status === "failed" && failureCode && (
+              <p className={styles.failureCode}>Code: {failureCode}</p>
+            )}
             {complete && <Link className={styles.primaryButton} href={`/models/detail?model_id=${encodeURIComponent(modelId)}`}>Ouvrir le modèle</Link>}
-            {job?.status === "failed" && <Link className={styles.secondaryButton} href="/models">Retour au catalogue</Link>}
+            {job?.status === "failed" && (
+              <div className={styles.installFailureActions}>
+                <button className={styles.primaryButton} disabled={retrying} onClick={retryInstall}>
+                  {retrying ? "Relance…" : "Réessayer"}
+                </button>
+                <Link className={styles.secondaryButton} href="/models">Retour au catalogue</Link>
+              </div>
+            )}
           </div>
         </div>
         <div className={styles.tip}><BsInfoCircle /><div><strong>Astuce</strong><span>Le WebSocket vous notifie dès que le modèle est prêt à l’emploi.</span></div></div>

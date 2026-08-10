@@ -9,6 +9,10 @@ class RuntimeAdapter(ABC):
     def capabilities(self) -> list[str]:
         raise NotImplementedError
 
+    def supported_capabilities(self, metadata: dict[str, Any]) -> list[str]:
+        del metadata
+        return self.capabilities()
+
     @abstractmethod
     def supports_model(self, metadata: dict[str, Any]) -> bool:
         raise NotImplementedError

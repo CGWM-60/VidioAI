@@ -1261,6 +1261,11 @@ fn infer_runtime_capabilities(
     if advertised.contains(&ModelCapability::TextToVideo) || class_name.contains("text2video") {
         values.insert(ModelCapability::TextToVideo);
     }
+
+    if class_name.contains("wanpipeline") || class_name.contains("wantransformer3dmodel") {
+        values.insert(ModelCapability::TextToVideo);
+        values.insert(ModelCapability::ImageToVideo);
+    }
     if advertised.contains(&ModelCapability::ImageToVideo)
         || class_name.contains("image2video")
         || class_name.contains("img2vid")
@@ -1308,6 +1313,7 @@ fn infer_runtime_capabilities(
 
     if values.contains(&ModelCapability::ImageToVideo)
         || advertised.contains(&ModelCapability::MultiImageToVideo)
+        || class_name.contains("wan")
     {
         values.insert(ModelCapability::MultiImageToVideo);
     }
@@ -1730,6 +1736,51 @@ mod tests {
                 .contains(&ModelCapability::MultiImageToVideo)
         );
         assert!(model.runtime_reason.contains("runtime dynamique"));
+    }
+
+    #[test]
+    fn wan_diffusers_pipeline_is_runtime_supported_from_model_index_class() {
+        let raw: HfRawModel = serde_json::from_value(json!({
+            "id": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+            "library_name": "diffusers",
+            "sha": "abc",
+            "siblings": [
+                {"rfilename": "model_index.json"},
+                {"rfilename": "transformer/diffusion_pytorch_model.safetensors", "size": 42}
+            ],
+            "config": {"_model_index": {"_class_name": "WanPipeline"}}
+        }))
+        .unwrap();
+        let model = normalize_model(raw);
+        assert!(model.runtime_supported);
+        assert!(
+            model
+                .runtime_capabilities
+                .contains(&ModelCapability::TextToVideo)
+        );
+    }
+
+    #[test]
+    fn wan_derivative_quantized_stays_runtime_supported_when_pipeline_matches() {
+        let raw: HfRawModel = serde_json::from_value(json!({
+            "id": "AsadIsmail/Wan2.2-TI2V-5B-ternary",
+            "library_name": "diffusers",
+            "sha": "abc",
+            "tags": ["wan", "text-to-video", "image-to-video"],
+            "siblings": [
+                {"rfilename": "model_index.json"},
+                {"rfilename": "transformer/diffusion_pytorch_model.safetensors", "size": 42}
+            ],
+            "config": {"_model_index": {"_class_name": "WanPipeline"}}
+        }))
+        .unwrap();
+        let model = normalize_model(raw);
+        assert!(model.runtime_supported);
+        assert!(
+            model
+                .runtime_capabilities
+                .contains(&ModelCapability::TextToVideo)
+        );
     }
 
     #[test]

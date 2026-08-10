@@ -25,9 +25,18 @@ from .schemas import JobState, ModelState
 class WorkerError(RuntimeError):
     """Erreur métier exposable au backend sans traceback ni secret."""
 
-    def __init__(self, message: str, status_code: int = 409) -> None:
+    def __init__(
+        self,
+        message: str,
+        status_code: int = 409,
+        *,
+        code: str = "WORKER_ERROR",
+        retryable: bool = False,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.code = code
+        self.retryable = retryable
 
 
 @dataclass(slots=True)
@@ -225,6 +234,165 @@ class RuntimeManager:
         message = str(error).lower()
         return any(fragment in message for fragment in ["gated", "private", "authentication", "forbidden", "access"])
 
+    @staticmethod
+    def _looks_like_hf_not_found(error: Exception) -> bool:
+        message = str(error).lower()
+        return "404" in message and (
+            "repository" in message or "repo" in message or "not found" in message
+        )
+
+    @staticmethod
+    def _looks_like_hf_revision_not_found(error: Exception) -> bool:
+        message = str(error).lower()
+        return "revision" in message and "not found" in message
+
+    @staticmethod
+    def _looks_like_timeout(error: Exception) -> bool:
+        name = type(error).__name__.lower()
+        message = str(error).lower()
+        return "timeout" in name or "timed out" in message
+
+    @staticmethod
+    def _looks_like_xet_reconstruction_error(error: Exception) -> bool:
+        message = str(error).lower()
+        return (
+            "background writer channel closed" in message
+            or "file reconstruction error" in message
+            or "internal writer error" in message
+            or "hf-xet" in message
+            or "xet" in message and "reconstruct" in message
+        )
+
+    @staticmethod
+    def _is_writable_directory(path: Path) -> bool:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / f".vidioai-write-{uuid.uuid4()}"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return True
+        except OSError:
+            return False
+
+    @staticmethod
+    def _available_disk_bytes(path: Path) -> int:
+        stats = os.statvfs(path)
+        return int(stats.f_frsize) * int(stats.f_bavail)
+
+    @staticmethod
+    def _available_inodes(path: Path) -> int:
+        stats = os.statvfs(path)
+        return int(stats.f_favail)
+
+    def _precheck_download_environment(self, required_bytes: int) -> None:
+        models_dir = self.settings.models_dir
+        cache_dir = Path(os.getenv("HF_HUB_CACHE") or os.getenv("HUGGINGFACE_HUB_CACHE") or (self.settings.hf_home / "hub"))
+        xet_dir = Path(os.getenv("HF_XET_CACHE") or (self.settings.hf_home / "xet"))
+        tmp_dir = Path(os.getenv("TMPDIR") or self.settings.work_dir)
+
+        for path, code, message in [
+            (models_dir, "SCRATCH_NOT_WRITABLE", "Le dossier Scratch des modèles n'est pas inscriptible."),
+            (cache_dir, "CACHE_NOT_WRITABLE", "Le cache Hugging Face n'est pas inscriptible."),
+            (xet_dir, "CACHE_NOT_WRITABLE", "Le cache HF-XET n'est pas inscriptible."),
+            (tmp_dir, "SCRATCH_NOT_WRITABLE", "Le dossier temporaire du worker n'est pas inscriptible."),
+        ]:
+            if not self._is_writable_directory(path):
+                raise WorkerError(message, 422, code=code)
+
+        disk_required = max(required_bytes, self.settings.minimum_weights_bytes)
+        for path, code in [
+            (models_dir, "INSUFFICIENT_DISK_SPACE"),
+            (cache_dir, "INSUFFICIENT_DISK_SPACE"),
+            (tmp_dir, "INSUFFICIENT_DISK_SPACE"),
+        ]:
+            if self._available_disk_bytes(path) < disk_required:
+                raise WorkerError(
+                    f"Espace disque insuffisant sur {path}.",
+                    422,
+                    code=code,
+                    retryable=False,
+                )
+
+        for path in (models_dir, cache_dir, tmp_dir):
+            if self._available_inodes(path) < 64:
+                raise WorkerError(
+                    f"Inodes insuffisants sur {path}.",
+                    422,
+                    code="INSUFFICIENT_INODES",
+                    retryable=False,
+                )
+
+    @staticmethod
+    def _estimate_required_download_bytes(model_info: Any) -> int:
+        total = 0
+        siblings = getattr(model_info, "siblings", []) or []
+        for sibling in siblings:
+            size = getattr(sibling, "size", None)
+            if isinstance(size, int) and size > 0:
+                total += size
+        if total <= 0:
+            return 2 * 1024 * 1024 * 1024
+        # marge pour fichiers temporaires/cache/reconstruction
+        return int(total * 2.2)
+
+    @staticmethod
+    def _clear_partial_directory(path: Path) -> None:
+        for child in path.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
+
+    @staticmethod
+    def _snapshot_download_with_env(
+        snapshot_download: Any,
+        *,
+        repo_id: str,
+        revision: str,
+        local_dir: Path,
+        cache_dir: Path,
+        token: str | None,
+        disable_xet: bool,
+        sequential_reconstruct: bool,
+    ) -> None:
+        previous_disable = os.getenv("HF_HUB_DISABLE_XET")
+        previous_seq = os.getenv("HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY")
+        try:
+            if disable_xet:
+                os.environ["HF_HUB_DISABLE_XET"] = "1"
+            else:
+                os.environ.pop("HF_HUB_DISABLE_XET", None)
+
+            if sequential_reconstruct:
+                os.environ["HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY"] = "1"
+            else:
+                os.environ.pop("HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY", None)
+
+            snapshot_download(
+                repo_id=repo_id,
+                revision=revision,
+                local_dir=local_dir,
+                cache_dir=cache_dir,
+                token=token,
+                ignore_patterns=[
+                    "*.ckpt",
+                    "*.onnx",
+                    "*.msgpack",
+                    "*.h5",
+                    "*.tflite",
+                ],
+            )
+        finally:
+            if previous_disable is None:
+                os.environ.pop("HF_HUB_DISABLE_XET", None)
+            else:
+                os.environ["HF_HUB_DISABLE_XET"] = previous_disable
+
+            if previous_seq is None:
+                os.environ.pop("HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY", None)
+            else:
+                os.environ["HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY"] = previous_seq
+
     def runtime_status(self) -> dict[str, Any]:
         configuration_errors = self.settings.configuration_errors()
         try:
@@ -421,22 +589,67 @@ class RuntimeManager:
                 repository, revision=revision
             )
             resolved_revision = self._safe_segment(info.sha)
-            snapshot_download(
-                repo_id=repository,
-                revision=resolved_revision,
-                local_dir=temporary,
-                # Tous les blobs Hub, y compris les fichiers temporaires et le
-                # cache de reprise, résident sur le Scratch dédié en production.
-                cache_dir=self.settings.hf_home,
-                token=hf_token,
-                ignore_patterns=[
-                    "*.ckpt",
-                    "*.onnx",
-                    "*.msgpack",
-                    "*.h5",
-                    "*.tflite",
-                ],
-            )
+
+            required_bytes = self._estimate_required_download_bytes(info)
+            self._precheck_download_environment(required_bytes)
+
+            xet_retries = max(1, int(os.getenv("VIDIOAI_HF_XET_RETRIES", "2")))
+            allow_no_xet_fallback = os.getenv("VIDIOAI_ENABLE_HF_XET_FALLBACK", "true").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+
+            last_xet_error: Exception | None = None
+            for attempt in range(1, xet_retries + 1):
+                try:
+                    self._snapshot_download_with_env(
+                        snapshot_download,
+                        repo_id=repository,
+                        revision=resolved_revision,
+                        local_dir=temporary,
+                        cache_dir=self.settings.hf_home,
+                        token=hf_token,
+                        disable_xet=False,
+                        sequential_reconstruct=attempt > 1,
+                    )
+                    last_xet_error = None
+                    break
+                except Exception as error:
+                    if not self._looks_like_xet_reconstruction_error(error):
+                        raise
+                    last_xet_error = error
+                    self._clear_partial_directory(temporary)
+
+            if last_xet_error is not None:
+                if allow_no_xet_fallback:
+                    try:
+                        self._snapshot_download_with_env(
+                            snapshot_download,
+                            repo_id=repository,
+                            revision=resolved_revision,
+                            local_dir=temporary,
+                            cache_dir=self.settings.hf_home,
+                            token=hf_token,
+                            disable_xet=True,
+                            sequential_reconstruct=False,
+                        )
+                    except Exception as fallback_error:
+                        raise WorkerError(
+                            f"HF_XET_RECONSTRUCTION_ERROR: reconstruction HF-XET échouée, fallback sans XET impossible ({type(fallback_error).__name__}).",
+                            502,
+                            code="HF_XET_RECONSTRUCTION_ERROR",
+                            retryable=True,
+                        ) from fallback_error
+                else:
+                    raise WorkerError(
+                        "HF_XET_RECONSTRUCTION_ERROR: reconstruction HF-XET échouée après retries.",
+                        502,
+                        code="HF_XET_RECONSTRUCTION_ERROR",
+                        retryable=True,
+                    ) from last_xet_error
+
             validation = self.validate_snapshot(temporary)
             destination = self._model_root(model_id) / resolved_revision
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -480,6 +693,8 @@ class RuntimeManager:
                 self._model_states[model_id] = {
                     "model_id": model_id,
                     "state": ModelState.FAILED,
+                    "error_code": error.code,
+                    "retryable": error.retryable,
                     "error": str(error),
                 }
             raise
@@ -493,17 +708,47 @@ class RuntimeManager:
                     self._model_states[model_id] = {
                         "model_id": model_id,
                         "state": ModelState.FAILED,
+                        "error_code": "HF_ACCESS_DENIED",
+                        "retryable": False,
                         "error": message,
                     }
-                raise WorkerError(message, 403) from error
-            message = f"Installation impossible: {type(error).__name__}: {error}"
+                raise WorkerError(message, 403, code="HF_ACCESS_DENIED") from error
+
+            if self._looks_like_hf_not_found(error):
+                message = "Repository Hugging Face introuvable."
+                code = "HF_MODEL_NOT_FOUND"
+                status = 404
+                retryable = False
+            elif self._looks_like_hf_revision_not_found(error):
+                message = "Révision Hugging Face introuvable pour ce repository."
+                code = "HF_REVISION_NOT_FOUND"
+                status = 404
+                retryable = False
+            elif self._looks_like_timeout(error):
+                message = "Délai dépassé pendant le téléchargement Hugging Face."
+                code = "HF_DOWNLOAD_TIMEOUT"
+                status = 504
+                retryable = True
+            elif self._looks_like_xet_reconstruction_error(error):
+                message = "Erreur de reconstruction HF-XET pendant le téléchargement."
+                code = "HF_XET_RECONSTRUCTION_ERROR"
+                status = 502
+                retryable = True
+            else:
+                message = f"Installation impossible: {type(error).__name__}: {error}"
+                code = "HF_DOWNLOAD_ERROR"
+                status = 502
+                retryable = False
+
             with self._lock:
                 self._model_states[model_id] = {
                     "model_id": model_id,
                     "state": ModelState.FAILED,
+                    "error_code": code,
+                    "retryable": retryable,
                     "error": message,
                 }
-            raise WorkerError(message, 502) from error
+            raise WorkerError(message, status, code=code, retryable=retryable) from error
         finally:
             if temporary.exists():
                 shutil.rmtree(temporary, ignore_errors=True)
@@ -569,7 +814,11 @@ class RuntimeManager:
                 capability = candidate
                 break
         if capability is None:
-            raise WorkerError("Aucun adapter Diffusers compatible n'a été trouvé pour ce modèle.", 422)
+            raise WorkerError(
+                "pipeline non supporté: aucun adapter Diffusers compatible n'a été trouvé pour ce modèle.",
+                422,
+                code="PIPELINE_UNSUPPORTED",
+            )
         adapter = self._registry.select_for_capability(metadata, capability)
         device = "cuda" if cuda_available else "cpu"
         dtype = torch.float16 if cuda_available else torch.float32
@@ -582,7 +831,7 @@ class RuntimeManager:
             pipeline = adapter.load(
                 str(snapshot),
                 {"torch_dtype": dtype, "device": device},
-                {"device": device},
+                {"device": device, "class_name": metadata.get("class_name")},
             )
             if device == "cuda" and hasattr(pipeline, "to"):
                 pipeline = pipeline.to(device)

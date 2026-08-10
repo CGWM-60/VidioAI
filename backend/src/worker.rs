@@ -120,6 +120,15 @@ struct InstallModelRequest<'a> {
 }
 
 #[derive(Debug, Deserialize)]
+struct WorkerErrorPayload {
+    error: String,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    retryable: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct GenerateResponse {
     pub job_id: String,
     pub state: String,
@@ -167,7 +176,18 @@ impl WorkerClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(format!("worker HTTP {status}: {body}"));
+            if let Ok(payload) = serde_json::from_str::<WorkerErrorPayload>(&body) {
+                let prefix = payload.code.unwrap_or_else(|| "WORKER_ERROR".to_owned());
+                let retry = payload
+                    .retryable
+                    .map(|value| if value { "retryable" } else { "non-retryable" })
+                    .unwrap_or("unknown");
+                return Err(format!(
+                    "{prefix}: {} (worker HTTP {status}, {retry})",
+                    payload.error
+                ));
+            }
+            return Err(format!("WORKER_HTTP_ERROR: worker HTTP {status}: {body}"));
         }
         response.json().await.map_err(|error| error.to_string())
     }

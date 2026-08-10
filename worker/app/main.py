@@ -47,7 +47,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         return JSONResponse(
             status_code=error.status_code,
-            content={"error": str(error)},
+            content={
+                "error": str(error),
+                "code": error.code,
+                "retryable": error.retryable,
+            },
         )
 
     @application.get("/health")

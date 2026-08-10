@@ -7,6 +7,7 @@ from .image_to_image import ImageToImageAdapter
 from .text_to_video import TextToVideoAdapter
 from .image_to_video import ImageToVideoAdapter
 from .video_to_video import VideoToVideoAdapter
+from .generic_diffusers import GenericDiffusersAdapter
 
 
 class PipelineRegistry:
@@ -17,6 +18,8 @@ class PipelineRegistry:
             TextToVideoAdapter(),
             ImageToVideoAdapter(),
             VideoToVideoAdapter(),
+            # Fallback en dernier: les adapters spécialisés restent prioritaires.
+            GenericDiffusersAdapter(),
         ]
 
     def capabilities(self) -> list[str]:
@@ -24,7 +27,7 @@ class PipelineRegistry:
 
     def select_for_capability(self, metadata: dict[str, Any], capability: str):
         for adapter in self._adapters:
-            if capability in adapter.capabilities() and adapter.supports_model(metadata):
+            if capability in adapter.supported_capabilities(metadata) and adapter.supports_model(metadata):
                 return adapter
         return None
 

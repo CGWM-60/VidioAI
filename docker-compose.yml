@@ -128,11 +128,8 @@ services:
 
     healthcheck:
       test:
-        - CMD
-        - wget
-        - --spider
-        - --quiet
-        - http://127.0.0.1/api/health
+        - CMD-SHELL
+        - wget --spider --quiet http://127.0.0.1/api/health && wget --spider --quiet http://127.0.0.1/
       interval: 15s
       timeout: 5s
       retries: 8

@@ -90,6 +90,31 @@ verify_stack_healthy() {
   return "${failed}"
 }
 
+check_proxy_route() {
+  local path=${1:?path requis}
+  local expected_status=${2:-200}
+  local url="http://127.0.0.1:${VIDIOAI_HTTP_PORT:-8080}${path}"
+  local status
+
+  # Chemin nominal: requête HTTP réussie (inclut les environnements de tests
+  # mockés qui ne renvoient pas forcément un code numérique via -w).
+  if curl -fsS "${url}" >/dev/null; then
+    return 0
+  fi
+
+  status=$(curl -sS -o /dev/null -w '%{http_code}' "${url}" || echo "000")
+  if [[ "${status}" == "${expected_status}" ]]; then
+    return 0
+  fi
+
+  echo "Vérification proxy en échec sur ${path}: HTTP ${status} (attendu ${expected_status})." >&2
+  if [[ "${status}" == "502" ]]; then
+    echo "Nginx renvoie 502: collecte automatique des logs proxy/backend/frontend." >&2
+    compose logs --tail=200 proxy backend frontend >&2 || true
+  fi
+  return 1
+}
+
 auto_rollback() {
   if [[ "${VIDIOAI_DISABLE_AUTO_ROLLBACK:-false}" == "true" ]]; then
     echo "Rollback automatique désactivé (VIDIOAI_DISABLE_AUTO_ROLLBACK=true)." >&2
@@ -161,5 +186,10 @@ verify_stack_healthy
 if [[ "${VIDIOAI_SKIP_SMOKE_TEST:-false}" != "true" ]]; then
   "${PROJECT_DIR}/deploy/scripts/smoke-test.sh" "http://127.0.0.1:${VIDIOAI_HTTP_PORT:-8080}"
 fi
+
+check_proxy_route "/api/health" "200"
+check_proxy_route "/" "200"
+check_proxy_route "/models" "200"
+
 printf '%s\n' "${VERSION}" > .current-version
 echo "Déploiement ${VERSION} validé."
