@@ -27,7 +27,10 @@ const GIB: u64 = 1024 * 1024 * 1024;
 // Toute évolution du contrat normalisé invalide le cache disque précédent. Cela
 // évite notamment qu'un ancien booléen `runtime_supported` masque la raison
 // détaillée calculée par la nouvelle matrice de pipelines.
-const CACHE_SCHEMA_VERSION: u32 = 4;
+// Toute modification d'un champ calculé (comme `runtime_reason`) doit invalider
+// les anciennes entrées, sinon l'interface continuerait à afficher un diagnostic
+// obsolète après la mise à jour du binaire.
+const CACHE_SCHEMA_VERSION: u32 = 5;
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -51,6 +54,31 @@ pub enum ModelCapability {
     TextToSpeech,
     SpeechToText,
     CapabilityUnknown,
+}
+
+impl ModelCapability {
+    /// Retourne exactement le libellé public utilisé par l'API JSON.
+    ///
+    /// Il ne faut pas dériver ce texte avec `Debug`: `TextToVideo` deviendrait
+    /// alors `TEXTTOVIDEO`, tandis que le contrat Serde expose
+    /// `TEXT_TO_VIDEO`. Centraliser ce mapping garde donc les explications
+    /// humaines cohérentes avec les valeurs réellement consommées par le
+    /// frontend.
+    fn api_name(&self) -> &'static str {
+        match self {
+            Self::Chat => "CHAT",
+            Self::Vision => "VISION",
+            Self::TextToImage => "TEXT_TO_IMAGE",
+            Self::ImageToImage => "IMAGE_TO_IMAGE",
+            Self::TextToVideo => "TEXT_TO_VIDEO",
+            Self::ImageToVideo => "IMAGE_TO_VIDEO",
+            Self::VideoToVideo => "VIDEO_TO_VIDEO",
+            Self::Audio => "AUDIO",
+            Self::TextToSpeech => "TEXT_TO_SPEECH",
+            Self::SpeechToText => "SPEECH_TO_TEXT",
+            Self::CapabilityUnknown => "CAPABILITY_UNKNOWN",
+        }
+    }
 }
 
 /// Famille d'interface. Les capacités détaillées restent la source d'autorité.
@@ -1115,7 +1143,7 @@ fn runtime_match(
     if library == "diffusers" {
         let requested = capabilities
             .iter()
-            .map(|capability| format!("{capability:?}").to_ascii_uppercase())
+            .map(ModelCapability::api_name)
             .collect::<Vec<_>>()
             .join(", ");
         return (

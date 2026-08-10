@@ -10,11 +10,21 @@ import {
 import { apiFetch, assetUrl, closeWebSocketSafely, eventsUrl } from "../lib/api";
 import styles from "../studio.module.css";
 
+// Les capacités sont des identifiants d'API, pas des phrases. Ce mapping évite
+// les transformations naïves comme `TEXT → TO → IMAGE` et garde les messages
+// français lisibles sans modifier la valeur envoyée au backend.
+const CAPABILITY_LABELS = {
+  TEXT_TO_IMAGE: "Texte → Image",
+  IMAGE_TO_IMAGE: "Image → Image",
+};
+
 export default function ImagesPage() {
   const fileInput = useRef(null);
   const [mode, setMode] = useState("TEXT_TO_IMAGE");
   const [models, setModels] = useState([]);
-  const [profile, setProfile] = useState("LOCAL");
+  // UNKNOWN est volontairement conservateur : tant que le backend n'a pas
+  // confirmé le profil LOCAL, aucun moteur procédural ne peut être proposé.
+  const [profile, setProfile] = useState("UNKNOWN");
   const [modelId, setModelId] = useState("");
   const [prompt, setPrompt] = useState("Une voiture volante traverse une ville futuriste au coucher du soleil, ambiance cinématographique.");
   const [negativePrompt, setNegativePrompt] = useState("");
@@ -26,22 +36,31 @@ export default function ImagesPage() {
   const [error, setError] = useState("");
 
   // Seuls les modèles image réellement installés et compatibles apparaissent.
+  //
+  // Le catalogue et la readiness sont volontairement chargés séparément : un
+  // Host Agent momentanément indisponible ne doit pas effacer les modèles déjà
+  // connus. En revanche, une panne du catalogue empêche réellement de choisir
+  // un moteur et reste donc présentée à l'utilisateur.
   useEffect(() => {
-    Promise.all([
-      apiFetch("/api/models?category=IMAGE&installed=true&compatible=true&limit=60&sort=compatibility"),
-      apiFetch("/api/ready"),
-    ]).then(([catalog, readiness]) => {
-      const available = (catalog.items || catalog).filter((model) => model.kind === "IMAGE" && model.installed && model.compatible);
-      setProfile(readiness.profile || "LOCAL");
-      setModels(available);
-    }).catch((requestError) => setError(requestError.message));
+    apiFetch("/api/models?category=IMAGE&installed=true&compatible=true&limit=60&sort=compatibility")
+      .then((catalog) => {
+        const available = (catalog.items || catalog).filter((model) => model.kind === "IMAGE" && model.installed && model.compatible);
+        setModels(available);
+      })
+      .catch((requestError) => setError(requestError.message));
+
+    apiFetch("/api/ready")
+      .then((readiness) => setProfile(readiness.profile || "UNKNOWN"))
+      // L'état UNKNOWN est plus sûr que LOCAL : si la readiness de production
+      // tombe, l'interface ne réactive pas accidentellement un moteur factice.
+      .catch(() => setProfile("UNKNOWN"));
   }, []);
 
   // En production GPU, les moteurs procéduraux ne sont jamais proposés comme
   // substitut silencieux. La capacité doit être déclarée par la matrice runtime.
   const availableModels = useMemo(() => models.filter((model) =>
     model.runtime_capabilities?.includes(mode)
-      && (profile !== "GPU_PRODUCTION" || model.engine_type === "ai")
+      && (profile === "LOCAL" || model.engine_type === "ai")
   ), [mode, models, profile]);
   const selectedModelId = availableModels.some((model) => model.id === modelId)
     ? modelId
@@ -95,7 +114,7 @@ export default function ImagesPage() {
     <div className={styles.page}>
       <header className={styles.pageHeading}>
         <div><h1><BsStars /> Génération d’image</h1><p>Créez des images à partir d’un texte ou transformez une image existante.</p></div>
-        <div className={styles.creditBadge}><span>Runtime</span><strong>{profile === "GPU_PRODUCTION" ? "CUDA Worker privé" : "Local & privé"}</strong></div>
+        <div className={styles.creditBadge}><span>Runtime</span><strong>{profile === "GPU_PRODUCTION" ? "CUDA Worker privé" : profile === "LOCAL" ? "Local & privé" : "Vérification en cours"}</strong></div>
       </header>
       {error && <div className={styles.errorBanner} role="alert">{error}</div>}
 
@@ -121,7 +140,7 @@ export default function ImagesPage() {
           <label className={styles.formGroup}><span>Prompt <small>{prompt.length} / 1000</small></span><textarea maxLength={1000} rows={5} value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
           <label className={styles.formGroup}><span>Prompt négatif <small>(optionnel)</small></span><textarea maxLength={1000} rows={2} value={negativePrompt} onChange={(event) => setNegativePrompt(event.target.value)} placeholder="flou, texte, watermark…" /></label>
           <label className={styles.formGroup}><span>Modèle</span><select value={selectedModelId} onChange={(event) => setModelId(event.target.value)}>{availableModels.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.engine}</option>)}</select></label>
-          {!availableModels.length && <div className={styles.warningBanner}>Aucun modèle {mode.replaceAll("_", " → ")} installé et READY. Le pipeline n’est pas remplacé par une génération factice.</div>}
+          {!availableModels.length && <div className={styles.warningBanner}>Aucun modèle {CAPABILITY_LABELS[mode] || mode} installé et READY. Le pipeline n’est pas remplacé par une génération factice.</div>}
 
           <div className={styles.presetGrid}>
             <div className={styles.selectedPreset}><BsCheckCircleFill /><strong>Réaliste</strong><small>Style</small></div>
