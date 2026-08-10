@@ -116,7 +116,7 @@ struct InstallModelRequest<'a> {
     model_id: &'a str,
     repository: &'a str,
     revision: &'a str,
-    capabilities: [&'a str; 1],
+    capabilities: Vec<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -220,6 +220,7 @@ impl WorkerClient {
         model_id: &str,
         repository: &str,
         revision: &str,
+        capabilities: &[String],
     ) -> Result<WorkerModelStatus, String> {
         self.json(
             self.request(reqwest::Method::POST, "/v1/models/install")
@@ -228,7 +229,7 @@ impl WorkerClient {
                     model_id,
                     repository,
                     revision,
-                    capabilities: ["TEXT_TO_IMAGE"],
+                    capabilities: capabilities.iter().map(String::as_str).collect(),
                 }),
         )
         .await

@@ -2058,14 +2058,22 @@ fn model_input_profile(entry: &CatalogEntry) -> ModelInputProfile {
     }
 }
 
+fn worker_reports_ready(status: &crate::worker::WorkerModelStatus) -> bool {
+    status.state == "READY"
+        && status.weights_valid
+        && status.runtime_available
+        && status.runtime_compatible
+        && status.validation_test
+}
+
 async fn model_view_with_machine(
     state: &AppState,
     entry: &CatalogEntry,
     machine: &ModelMachineContext,
 ) -> ModelView {
     let installed_revision = installed_revision(state, entry).await;
-    let installed = entry.local || installed_revision.is_some();
-    let worker_status = if !entry.local && installed {
+    let downloaded = entry.local || installed_revision.is_some();
+    let worker_status = if !entry.local && downloaded {
         if let Some(worker) = &state.worker {
             worker.model_status(&entry.storage_id).await.ok()
         } else {
@@ -2074,14 +2082,15 @@ async fn model_view_with_machine(
     } else {
         None
     };
+    let installed = if entry.local {
+        true
+    } else if let Some(status) = &worker_status {
+        downloaded && status.installed && status.weights_valid && status.runtime_compatible
+    } else {
+        downloaded
+    };
     let runtime_ready = entry.local
-        || worker_status.as_ref().is_some_and(|status| {
-            status.state == "READY"
-                && status.weights_valid
-                && status.runtime_available
-                && status.runtime_compatible
-                && status.validation_test
-        });
+        || worker_status.as_ref().is_some_and(worker_reports_ready);
     let available_ram = machine.available_ram_bytes;
     let available_vram = machine.available_vram_bytes;
     // Un benchmark attaché à cette révision remplace l'estimation du Hub. Une
@@ -2134,11 +2143,20 @@ async fn model_view_with_machine(
         "READY".to_owned()
     } else if !entry.runtime_supported {
         "RUNTIME_UNAVAILABLE".to_owned()
+    } else if runtime_ready {
+        "READY".to_owned()
+    } else if worker_status
+        .as_ref()
+        .is_some_and(|status| status.state.eq_ignore_ascii_case("FAILED"))
+    {
+        "FAILED".to_owned()
     } else if installed {
         worker_status
             .as_ref()
             .map(|status| status.state.clone())
             .unwrap_or_else(|| "INSTALLED".into())
+    } else if downloaded {
+        "DOWNLOADED".to_owned()
     } else {
         "NOT_INSTALLED".into()
     };
@@ -2584,10 +2602,22 @@ async fn run_install(state: Arc<AppState>, job: Job, entry: CatalogEntry) {
                 "Téléchargement atomique du snapshot Hugging Face",
             )
             .await;
+        let install_capabilities = if entry.runtime_capabilities.is_empty() {
+            entry.capabilities
+                .iter()
+                .map(|capability| capability.api_name().to_owned())
+                .collect::<Vec<_>>()
+        } else {
+            entry.runtime_capabilities
+                .iter()
+                .map(|capability| capability.api_name().to_owned())
+                .collect::<Vec<_>>()
+        };
         let mut installation = Box::pin(worker.install(
             &entry.storage_id,
             &entry.repository,
             &entry.revision,
+            &install_capabilities,
         ));
         let installed = loop {
             tokio::select! {
@@ -2775,7 +2805,26 @@ async fn load_model_by_id(state: &AppState, id: &str) -> Result<Json<RuntimeEntr
         ));
     }
     if let Some(existing) = state.runtime.read().await.get(id).cloned() {
-        return Ok(Json(existing));
+        if !entry.local {
+            if let Some(worker) = &state.worker {
+                let status = worker
+                    .model_status(&entry.storage_id)
+                    .await
+                    .map_err(ApiError::unavailable)?;
+                if status.state == "READY"
+                    && status.validation_test
+                    && status.runtime_compatible
+                    && status.weights_valid
+                {
+                    return Ok(Json(existing));
+                }
+                state.runtime.write().await.remove(id);
+            } else {
+                state.runtime.write().await.remove(id);
+            }
+        } else {
+            return Ok(Json(existing));
+        }
     }
     if !entry.local {
         let worker = state
@@ -3090,7 +3139,11 @@ async fn upload_asset(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<Asset>), ApiError> {
-    while let Some(field) = multipart.next_field().await.map_err(ApiError::internal)? {
+    while let Some(field) = multipart.next_field().await.map_err(|error| {
+        ApiError::bad_request(format!(
+            "INVALID_MULTIPART: impossible de lire le flux multipart ({error})"
+        ))
+    })? {
         if field.name() != Some("file") {
             continue;
         }
@@ -3099,7 +3152,11 @@ async fn upload_asset(
             .content_type()
             .unwrap_or("application/octet-stream")
             .to_string();
-        let bytes = field.bytes().await.map_err(ApiError::internal)?;
+        let bytes = field.bytes().await.map_err(|error| {
+            ApiError::bad_request(format!(
+                "INVALID_MULTIPART: contenu du champ `file` illisible ({error})"
+            ))
+        })?;
         let maximum = if mime == "video/mp4" {
             MAX_VIDEO_BYTES
         } else {
@@ -3920,8 +3977,14 @@ async fn generate_video(
             "Ce modèle ne supporte pas le mode vidéo choisi.",
         ));
     }
-    if !model_view(&state, &entry).await.installed {
+    let view = model_view(&state, &entry).await;
+    if !view.installed {
         return Err(ApiError::conflict("Installez le modèle avant de générer."));
+    }
+    if model_id != "vidio-motion-local" && !view.runtime_ready {
+        return Err(ApiError::conflict(
+            "MODEL_NOT_READY: le modèle est installé mais son runtime worker n'est pas READY.",
+        ));
     }
     let mut input_images = request.input_images.clone();
     if mode != GenerationMode::TextToVideo {
@@ -4468,6 +4531,7 @@ mod tests {
         is_valid_image_capability_for_mode, is_valid_video_capability_for_mode,
         local_runtime_models, video_endpoint,
     };
+    use crate::worker::WorkerModelStatus;
 
     #[test]
     fn query_model_ids_preserve_encoded_hugging_face_slashes() {
@@ -4674,5 +4738,41 @@ mod tests {
         };
         assert!(settings.ensure_directories().await.is_err());
         let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[test]
+    fn backend_ready_is_false_when_worker_not_ready() {
+        let status = WorkerModelStatus {
+            model_id: "wan".into(),
+            state: "INSTALLED".into(),
+            repository: Some("Wan-AI/Wan2.2-TI2V-5B-Diffusers".into()),
+            revision: Some("rev".into()),
+            installed: true,
+            weights_valid: true,
+            runtime_available: true,
+            runtime_compatible: true,
+            validation_test: false,
+            error: None,
+            benchmark: None,
+        };
+        assert!(!super::worker_reports_ready(&status));
+    }
+
+    #[test]
+    fn backend_ready_is_true_only_when_worker_confirms_ready() {
+        let status = WorkerModelStatus {
+            model_id: "wan".into(),
+            state: "READY".into(),
+            repository: Some("Wan-AI/Wan2.2-TI2V-5B-Diffusers".into()),
+            revision: Some("rev".into()),
+            installed: true,
+            weights_valid: true,
+            runtime_available: true,
+            runtime_compatible: true,
+            validation_test: true,
+            error: None,
+            benchmark: None,
+        };
+        assert!(super::worker_reports_ready(&status));
     }
 }

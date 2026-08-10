@@ -107,6 +107,11 @@ class RuntimeManager:
         return self._model_root(model_id) / "active.json"
 
     @staticmethod
+    def _log_model_state(model_id: str, from_state: str, to_state: str, reason: str | None = None) -> None:
+        suffix = f" reason={reason}" if reason else ""
+        print(f"MODEL_STATE {model_id} {from_state} -> {to_state}{suffix}")
+
+    @staticmethod
     def _load_image(path: str | Path) -> Any:
         from PIL import Image
 
@@ -195,6 +200,25 @@ class RuntimeManager:
         if not snapshot.is_dir():
             raise WorkerError("Le snapshot actif est absent du cache.", 409)
         return snapshot, metadata
+
+    def _resolve_supported_capability(
+        self,
+        metadata: dict[str, Any],
+        fallback_capabilities: list[str] | None = None,
+    ) -> str | None:
+        capabilities = metadata.get("capabilities") or fallback_capabilities or []
+        normalized = {
+            str(capability).upper()
+            for capability in capabilities
+            if isinstance(capability, str) and capability.strip()
+        }
+        for candidate in self._capability_order():
+            if normalized and candidate not in normalized:
+                continue
+            adapter = self._registry.select_for_capability(metadata, candidate)
+            if adapter is not None:
+                return candidate
+        return None
 
     def _imports(self) -> tuple[Any, Any]:
         """Import paresseux : /health reste disponible même si CUDA est cassé."""
@@ -539,6 +563,7 @@ class RuntimeManager:
         capabilities: list[str],
     ) -> dict[str, Any]:
         model_id = self._safe_segment(model_id)
+        self._log_model_state(model_id, "DISCOVERED", "DOWNLOADING")
         # Un snapshot restauré depuis le cache L3 S3 est réutilisé uniquement
         # après la même validation complète que pour un téléchargement HF.
         try:
@@ -570,6 +595,10 @@ class RuntimeManager:
             self._model_states[model_id] = {
                 "model_id": model_id,
                 "state": ModelState.DOWNLOADING,
+                "downloaded": False,
+                "validated": False,
+                "loaded": False,
+                "ready": False,
                 "error": None,
             }
 
@@ -651,23 +680,38 @@ class RuntimeManager:
                     ) from last_xet_error
 
             validation = self.validate_snapshot(temporary)
+            self._log_model_state(model_id, "DOWNLOADING", "VALIDATING")
+
+            metadata = inspect_model_metadata(temporary)
+            resolved_capability = self._resolve_supported_capability(metadata, capabilities)
+            if resolved_capability is None:
+                raise WorkerError(
+                    "pipeline non supporté: aucun adapter Diffusers compatible n'a été trouvé pour ce modèle.",
+                    422,
+                    code="PIPELINE_UNSUPPORTED",
+                    retryable=False,
+                )
+
             destination = self._model_root(model_id) / resolved_revision
             destination.parent.mkdir(parents=True, exist_ok=True)
             if destination.exists():
                 shutil.rmtree(destination)
 
-            metadata = inspect_model_metadata(temporary)
-            runtime_capabilities = metadata.get("capabilities") or capabilities or ["TEXT_TO_IMAGE"]
+            runtime_capabilities = metadata.get("capabilities") or capabilities or [resolved_capability]
             manifest = {
                 "model_id": model_id,
                 "repository": repository,
                 "revision": resolved_revision,
                 "capabilities": runtime_capabilities,
+                "downloaded": True,
+                "validated": True,
                 "installed": True,
                 "weights_valid": True,
                 "runtime_available": self.runtime_status()["runtime_available"],
-                "runtime_compatible": False,
+                "runtime_compatible": True,
                 "validation_test": False,
+                "loaded": False,
+                "ready": False,
                 "state": ModelState.INSTALLED,
                 "installed_at": int(time.time()),
                 **validation,
@@ -687,12 +731,19 @@ class RuntimeManager:
             os.replace(pointer_temporary, pointer_path)
             with self._lock:
                 self._model_states[model_id] = manifest
+            self._log_model_state(model_id, "VALIDATING", "INSTALLED")
             return manifest
         except WorkerError as error:
+            self._log_model_state(model_id, "VALIDATING", "FAILED", reason=error.code)
             with self._lock:
                 self._model_states[model_id] = {
                     "model_id": model_id,
                     "state": ModelState.FAILED,
+                    "downloaded": temporary.exists(),
+                    "validated": False,
+                    "installed": False,
+                    "loaded": False,
+                    "ready": False,
                     "error_code": error.code,
                     "retryable": error.retryable,
                     "error": str(error),
@@ -744,6 +795,11 @@ class RuntimeManager:
                 self._model_states[model_id] = {
                     "model_id": model_id,
                     "state": ModelState.FAILED,
+                    "downloaded": temporary.exists(),
+                    "validated": False,
+                    "installed": False,
+                    "loaded": False,
+                    "ready": False,
                     "error_code": code,
                     "retryable": retryable,
                     "error": message,
@@ -773,20 +829,50 @@ class RuntimeManager:
             manifest_path = snapshot / "vidioai-model.json"
             if not manifest_path.is_file():
                 raise WorkerError("Le manifest VidioAI du snapshot est absent.", 409)
-            return json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            metadata = inspect_model_metadata(snapshot)
+            resolved_capability = self._resolve_supported_capability(
+                metadata, manifest.get("capabilities")
+            )
+            if resolved_capability is None:
+                return {
+                    "model_id": model_id,
+                    "state": ModelState.FAILED,
+                    "downloaded": True,
+                    "validated": False,
+                    "installed": False,
+                    "weights_valid": manifest.get("weights_valid", False),
+                    "runtime_available": self.runtime_status()["runtime_available"],
+                    "runtime_compatible": False,
+                    "validation_test": False,
+                    "loaded": False,
+                    "ready": False,
+                    "error_code": "PIPELINE_UNSUPPORTED",
+                    "error": "pipeline non supporté: aucun adapter Diffusers compatible n'a été trouvé pour ce modèle.",
+                }
+            manifest.setdefault("downloaded", True)
+            manifest.setdefault("validated", True)
+            manifest.setdefault("loaded", manifest.get("state") == ModelState.READY)
+            manifest.setdefault("ready", manifest.get("state") == ModelState.READY)
+            return manifest
         except WorkerError:
             return {
                 "model_id": model_id,
                 "state": ModelState.NOT_INSTALLED,
+                "downloaded": False,
+                "validated": False,
                 "installed": False,
                 "weights_valid": False,
                 "runtime_available": self.runtime_status()["runtime_available"],
                 "runtime_compatible": False,
                 "validation_test": False,
+                "loaded": False,
+                "ready": False,
             }
 
     def load_model(self, model_id: str) -> dict[str, Any]:
         model_id = self._safe_segment(model_id)
+        self._log_model_state(model_id, "INSTALLED", "LOADING")
         snapshot, pointer = self._active_snapshot(model_id)
         validation = self.validate_snapshot(snapshot)
         torch, _ = self._imports()
@@ -814,6 +900,7 @@ class RuntimeManager:
                 capability = candidate
                 break
         if capability is None:
+            self._log_model_state(model_id, "LOADING", "FAILED", reason="PIPELINE_UNSUPPORTED")
             raise WorkerError(
                 "pipeline non supporté: aucun adapter Diffusers compatible n'a été trouvé pour ce modèle.",
                 422,
@@ -850,14 +937,19 @@ class RuntimeManager:
             if not validation_output.get("images") and not validation_output.get("frames"):
                 raise RuntimeError("Le pipeline n'a produit aucune sortie de validation.")
         except Exception as error:
+            self._log_model_state(model_id, "LOADING", "FAILED", reason="LOAD_FAILED")
             status = {
                 "model_id": model_id,
                 "state": ModelState.FAILED,
+                "downloaded": True,
+                "validated": True,
                 "installed": True,
                 "weights_valid": True,
                 "runtime_available": True,
                 "runtime_compatible": False,
                 "validation_test": False,
+                "loaded": False,
+                "ready": False,
                 "error": f"Chargement Diffusers impossible: {type(error).__name__}: {error}",
             }
             with self._lock:
@@ -911,11 +1003,15 @@ class RuntimeManager:
         status = {
             "model_id": model_id,
             "state": ModelState.READY,
+            "downloaded": True,
+            "validated": True,
             "installed": True,
             "weights_valid": validation["weights_valid"],
             "runtime_available": True,
             "runtime_compatible": True,
             "validation_test": True,
+            "loaded": True,
+            "ready": True,
             "device": device,
             "capability": capability,
             "repository": pointer["repository"],
@@ -925,6 +1021,7 @@ class RuntimeManager:
         with self._lock:
             self._loaded[model_id] = loaded
             self._model_states[model_id] = status
+        self._log_model_state(model_id, "LOADING", "READY")
         return status
 
     def unload_model(self, model_id: str) -> dict[str, Any]:

@@ -1239,6 +1239,45 @@ def test_partial_snapshot_is_never_marked_installed(tmp_path: Path, monkeypatch:
     assert status["state"] != "INSTALLED"
 
 
+def test_install_pipeline_unsupported_never_sets_installed_or_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+
+    class FakeHfApi:
+        def __init__(self, token: str | None = None) -> None:
+            del token
+
+        def model_info(self, repository: str, revision: str = "main") -> SimpleNamespace:
+            del repository, revision
+            sibling = SimpleNamespace(size=1024)
+            return SimpleNamespace(sha="commit-sha", siblings=[sibling])
+
+    def fake_snapshot_download(**kwargs) -> None:
+        target = Path(kwargs["local_dir"])
+        _write_incompatible_fake_snapshot(target)
+
+    monkeypatch.setattr(
+        manager,
+        "_imports",
+        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+    )
+
+    with pytest.raises(WorkerError) as error:
+        manager.install_model("stable-image-core", "example/incompatible-model", "main", ["TEXT_TO_VIDEO"])
+    assert error.value.code == "PIPELINE_UNSUPPORTED"
+
+    status = manager.model_status("stable-image-core")
+    assert status["installed"] is False
+    assert status["ready"] is False
+    assert status["state"] == "FAILED"
+    assert status.get("downloaded") is True
+
+    pointer = manager.settings.models_dir / "stable-image-core" / "active.json"
+    assert not pointer.exists()
+
+
 def test_valid_existing_snapshot_is_preserved_when_new_download_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -53,7 +53,7 @@ function GenerationsContent() {
   const generationId = generation?.id;
   const generationStatus = generation?.status;
   const compatibleModels = useMemo(() => models.filter((model) => (
-    model.capabilities.includes(activeMode.capability)
+    model.runtime_capabilities?.includes(activeMode.capability)
   )), [activeMode.capability, models]);
   const effectiveInputProfile = useMemo(() => {
     if (activeMode.inputKind !== "image") {
@@ -117,8 +117,8 @@ function GenerationsContent() {
     setGeneration(null);
     setError("");
     const requiredCapability = MODES.find((item) => item.id === nextMode).capability;
-    const local = models.find((model) => model.id === "vidio-motion-local" && model.capabilities.includes(requiredCapability));
-    setModelId(local?.id || models.find((model) => model.capabilities.includes(requiredCapability))?.id || "");
+    const local = models.find((model) => model.id === "vidio-motion-local" && model.runtime_capabilities?.includes(requiredCapability));
+    setModelId(local?.id || models.find((model) => model.runtime_capabilities?.includes(requiredCapability))?.id || "");
   }
 
   async function uploadFile(event) {
@@ -283,7 +283,7 @@ function GenerationsContent() {
 
           <label className={styles.formGroup}><span>Prompt <small>{prompt.length} / 1000</small></span><textarea rows={5} maxLength={1000} value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
           <label className={styles.formGroup}><span>Modèle</span><select value={modelId} onChange={(event) => setModelId(event.target.value)}>
-            {compatibleModels.map((model) => <option key={model.id} value={model.id}>{model.name}{model.installed ? " · prêt" : " · à installer"}</option>)}
+            {compatibleModels.map((model) => <option key={model.id} value={model.id}>{model.name}{model.runtime_ready ? " · prêt" : model.installed ? " · installé" : " · à installer"}</option>)}
           </select></label>
 
           <div className={styles.videoSettingsRow}>

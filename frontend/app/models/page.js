@@ -157,7 +157,11 @@ export default function ModelsPage() {
               <div className={styles.modelCopy}>
                 <div className={styles.modelTitleLine}>
                   <h2>{model.name}</h2>
-                  {model.installed && <span className={styles.successPill}><BsCheckCircle /> Installé</span>}
+                  {model.runtime_ready
+                    ? <span className={styles.successPill}><BsCheckCircle /> Prêt</span>
+                    : model.installed
+                      ? <span className={styles.successPill}><BsCheckCircle /> Installé</span>
+                      : null}
                 </div>
                 <div className={styles.modelMetadata}><span>{model.author || "Auteur inconnu"}</span><span>{formatBytes(model.estimated_size_bytes)}</span>{Number.isFinite(model.downloads) && <span>{model.downloads.toLocaleString("fr-FR")} téléchargements</span>}{Number.isFinite(model.likes) && <span>{model.likes.toLocaleString("fr-FR")} likes</span>}</div>
                 <div className={styles.capabilityList}>
@@ -182,7 +186,7 @@ export default function ModelsPage() {
                   <button className={styles.primaryButton} title={!model.runtime_supported ? model.runtime_reason : model.gated && !model.access_authorized ? "Accès Hugging Face requis" : ""} disabled={!model.installable || busyId === model.id} onClick={() => startInstall(model)}>
                     <BsCloudDownload /> {busyId === model.id ? "Préparation…" : model.gated && !model.access_authorized ? "Accès requis" : model.runtime_supported ? "Installer" : "Runtime non compatible"}
                   </button>
-                ) : <span className={styles.readyBadge}>Prêt</span>}
+                ) : <span className={styles.readyBadge}>{model.runtime_ready ? "Prêt" : "Installé"}</span>}
                 <Link href={`/models/detail?model_id=${encodeURIComponent(model.id)}`}>Détails <BsArrowRight /></Link>
               </div>
             </article>
