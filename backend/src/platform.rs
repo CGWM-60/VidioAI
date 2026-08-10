@@ -3701,9 +3701,14 @@ async fn generate_video(
                     "input_images est obligatoire pour le mode IMAGE_TO_VIDEO.",
                 ));
             }
-            let unique_ids = input_images.iter().map(|item| item.asset_id).collect::<HashSet<_>>();
+            let unique_ids = input_images
+                .iter()
+                .map(|item| item.asset_id)
+                .collect::<HashSet<_>>();
             if unique_ids.len() != input_images.len() {
-                return Err(ApiError::bad_request("Les images d'entrée ne doivent pas être dupliquées."));
+                return Err(ApiError::bad_request(
+                    "Les images d'entrée ne doivent pas être dupliquées.",
+                ));
             }
             let mut ordered = input_images.clone();
             ordered.sort_by_key(|item| item.order);

@@ -16,6 +16,14 @@ const MODES = [
   { id: "IMAGE_TO_VIDEO", label: "Image → Vidéo", icon: BsImage, capability: "IMAGE_TO_VIDEO", accepts: "image/png,image/jpeg,image/webp" },
   { id: "VIDEO_TO_VIDEO", label: "Vidéo → Vidéo", icon: BsFilm, capability: "VIDEO_TO_VIDEO", accepts: "video/mp4" },
 ];
+const DEFAULT_INPUT_PROFILE = {
+  min_input_images: 1,
+  max_input_images: 1,
+  supported_image_roles: [],
+  supports_start_end_frames: false,
+  supports_reference_images: false,
+  supports_keyframes: false,
+};
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
 
@@ -25,7 +33,6 @@ function GenerationsContent() {
   const [mode, setMode] = useState(sourceAssetId ? "IMAGE_TO_VIDEO" : "TEXT_TO_VIDEO");
   const [inputAsset, setInputAsset] = useState(sourceAssetId ? { id: sourceAssetId, kind: "IMAGE" } : null);
   const [inputImages, setInputImages] = useState(sourceAssetId ? [{ asset_id: sourceAssetId, order: 0, role: "start_frame" }] : []);
-  const [inputProfile, setInputProfile] = useState({ min_input_images: 1, max_input_images: 1, supported_image_roles: [], supports_start_end_frames: false, supports_reference_images: false, supports_keyframes: false });
   const [models, setModels] = useState([]);
   const [modelId, setModelId] = useState("vidio-motion-local");
   const [prompt, setPrompt] = useState("Une voiture volante traverse une ville futuriste au coucher du soleil, mouvement de caméra cinématographique.");
@@ -43,6 +50,14 @@ function GenerationsContent() {
   const compatibleModels = useMemo(() => models.filter((model) => (
     model.capabilities.includes(activeMode.capability)
   )), [activeMode.capability, models]);
+  const effectiveInputProfile = useMemo(() => {
+    if (mode !== "IMAGE_TO_VIDEO") {
+      return DEFAULT_INPUT_PROFILE;
+    }
+    const selectedModel = models.find((model) => model.id === modelId);
+    return selectedModel?.input_profile || DEFAULT_INPUT_PROFILE;
+  }, [mode, modelId, models]);
+  const visibleInputImages = useMemo(() => inputImages.slice(0, effectiveInputProfile.max_input_images), [effectiveInputProfile.max_input_images, inputImages]);
 
   const refreshHistory = useCallback(async () => {
     const items = await apiFetch("/api/generations");
@@ -94,23 +109,12 @@ function GenerationsContent() {
     setMode(nextMode);
     setInputAsset(null);
     setInputImages([]);
-    setInputProfile({ min_input_images: 1, max_input_images: 1, supported_image_roles: [], supports_start_end_frames: false, supports_reference_images: false, supports_keyframes: false });
     setGeneration(null);
     setError("");
     const requiredCapability = MODES.find((item) => item.id === nextMode).capability;
     const local = models.find((model) => model.id === "vidio-motion-local" && model.capabilities.includes(requiredCapability));
     setModelId(local?.id || models.find((model) => model.capabilities.includes(requiredCapability))?.id || "");
   }
-
-  useEffect(() => {
-    if (mode !== "IMAGE_TO_VIDEO") return;
-    const selectedModel = models.find((model) => model.id === modelId);
-    const profile = selectedModel?.input_profile || { min_input_images: 1, max_input_images: 1, supported_image_roles: [], supports_start_end_frames: false, supports_reference_images: false, supports_keyframes: false };
-    setInputProfile(profile);
-    if (profile.max_input_images <= 1) {
-      setInputImages((current) => current.slice(0, 1));
-    }
-  }, [mode, modelId, models]);
 
   async function uploadFile(event) {
     const files = Array.from(event.target.files || []);
@@ -127,7 +131,7 @@ function GenerationsContent() {
       if (mode === "IMAGE_TO_VIDEO") {
         const nextImages = [...inputImages];
         for (const asset of assets) {
-          if (nextImages.length >= inputProfile.max_input_images) break;
+          if (nextImages.length >= effectiveInputProfile.max_input_images) break;
           nextImages.push({ asset_id: asset.id, order: nextImages.length, role: nextImages.length === 0 ? "start_frame" : "reference" });
         }
         setInputImages(nextImages);
@@ -154,8 +158,8 @@ function GenerationsContent() {
         mode,
         prompt,
         model_id: modelId,
-        input_asset_id: mode === "IMAGE_TO_VIDEO" && inputImages.length ? inputImages[0].asset_id : inputAsset?.id,
-        input_images: mode === "IMAGE_TO_VIDEO" ? inputImages : [],
+        input_asset_id: mode === "IMAGE_TO_VIDEO" && visibleInputImages.length ? visibleInputImages[0].asset_id : inputAsset?.id,
+        input_images: mode === "IMAGE_TO_VIDEO" ? visibleInputImages : [],
         duration_seconds: Number(duration),
         resolution,
         audio,
@@ -220,16 +224,16 @@ function GenerationsContent() {
 
           {mode !== "TEXT_TO_VIDEO" && (
             <div className={styles.videoSourceBlock}>
-              <div className={styles.sectionTitle}><strong>{sourceIsVideo ? "Vidéo de départ" : mode === "IMAGE_TO_VIDEO" ? "Images de départ" : "Image de départ"}</strong><span>{mode === "IMAGE_TO_VIDEO" ? `${inputImages.length}/${inputProfile.max_input_images}` : "Asset persistant"}</span></div>
+              <div className={styles.sectionTitle}><strong>{sourceIsVideo ? "Vidéo de départ" : mode === "IMAGE_TO_VIDEO" ? "Images de départ" : "Image de départ"}</strong><span>{mode === "IMAGE_TO_VIDEO" ? `${visibleInputImages.length}/${effectiveInputProfile.max_input_images}` : "Asset persistant"}</span></div>
               {mode === "IMAGE_TO_VIDEO" ? (
                 <div className={styles.imageStack}>
-                  {inputImages.length ? inputImages.map((item, index) => (
+                  {visibleInputImages.length ? visibleInputImages.map((item, index) => (
                     <div key={`${item.asset_id}-${index}`} className={styles.imageStackCard}>
                       <div className={styles.imageStackNumber}>#{index + 1}</div>
                       <Image unoptimized width={240} height={160} src={assetUrl(item.asset_id)} alt={`Image ${index + 1}`} />
                       <div className={styles.imageStackActions}>
                         <button type="button" onClick={() => moveImage(index, -1)} disabled={index === 0} aria-label="Déplacer vers le haut">↑</button>
-                        <button type="button" onClick={() => moveImage(index, 1)} disabled={index === inputImages.length - 1} aria-label="Déplacer vers le bas">↓</button>
+                        <button type="button" onClick={() => moveImage(index, 1)} disabled={index === visibleInputImages.length - 1} aria-label="Déplacer vers le bas">↓</button>
                         <button type="button" onClick={() => removeImage(index)} aria-label="Supprimer l'image"><BsXCircle /></button>
                       </div>
                       <label className={styles.formGroup}>
@@ -243,13 +247,13 @@ function GenerationsContent() {
                       </label>
                     </div>
                   )) : null}
-                  {inputImages.length < inputProfile.max_input_images && (
+                  {visibleInputImages.length < effectiveInputProfile.max_input_images && (
                     <button type="button" className={styles.videoUpload} onClick={() => fileInputRef.current?.click()}>
                       <BsUpload /><strong>{uploading ? "Import en cours…" : "Ajouter une image"}</strong>
-                      <span>{inputProfile.max_input_images === 1 ? "1 image maximum" : `Jusqu'à ${inputProfile.max_input_images} images`}</span>
+                      <span>{effectiveInputProfile.max_input_images === 1 ? "1 image maximum" : `Jusqu'à ${effectiveInputProfile.max_input_images} images`}</span>
                     </button>
                   )}
-                  <input ref={fileInputRef} hidden type="file" accept={activeMode.accepts} multiple={inputProfile.max_input_images > 1} onChange={uploadFile} />
+                  <input ref={fileInputRef} hidden type="file" accept={activeMode.accepts} multiple={effectiveInputProfile.max_input_images > 1} onChange={uploadFile} />
                 </div>
               ) : (
                 <>
