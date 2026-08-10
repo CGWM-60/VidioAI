@@ -94,6 +94,19 @@ if command -v docker >/dev/null 2>&1; then
     fail "docker compose config échoue pour ${COMPOSE_FILE}."
   fi
 
+  if docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" config --format json >/tmp/vidioai-compose-config.json 2>/dev/null; then
+    if ! jq -e '.services | to_entries | all(.value.image != null and .value.image != "")' /tmp/vidioai-compose-config.json >/dev/null; then
+      fail "Au moins un service n'a pas d'image explicite dans le compose configuré."
+    fi
+  elif [[ "${COMPOSE_FILE}" == *"compose.production.yml"* ]]; then
+    # Fallback minimal si --format json n'est pas supporté.
+    while IFS= read -r service; do
+      if ! awk "BEGIN{in_svc=0;ok=0} /^  ${service}:/{in_svc=1;next} in_svc && /^  [a-zA-Z0-9_-]+:/{in_svc=0} in_svc && /^[[:space:]]+image:[[:space:]]*.+/{ok=1} END{exit ok?0:1}" "${COMPOSE_FILE}"; then
+        fail "Service ${service} sans image explicite dans ${COMPOSE_FILE}."
+      fi
+    done < <(docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" config --services)
+  fi
+
   if ! docker run --rm \
       -v "${PROJECT_DIR}/deploy/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro" \
       nginx:1.27.5-alpine nginx -t >/dev/null 2>&1; then
@@ -116,12 +129,34 @@ else
 fi
 
 if [[ "${SKIP_TESTS}" != "true" ]]; then
-  (cd "${PROJECT_DIR}" && python -m pytest -q worker) || fail "Tests worker en échec."
-  (cd "${PROJECT_DIR}" && cargo test --manifest-path backend/Cargo.toml --locked) || fail "Tests backend Rust en échec."
+  (cd "${PROJECT_DIR}" && pytest worker/tests -q) || fail "Tests Python worker en échec."
+
+  if [[ -f "${PROJECT_DIR}/pyproject.toml" || -f "${PROJECT_DIR}/ruff.toml" || -f "${PROJECT_DIR}/.ruff.toml" ]]; then
+    if command -v ruff >/dev/null 2>&1; then
+      (cd "${PROJECT_DIR}" && ruff check worker) || fail "ruff check en échec."
+      (cd "${PROJECT_DIR}" && ruff format --check worker) || fail "ruff format --check en échec."
+    else
+      warn "Configuration ruff détectée mais ruff n'est pas installé."
+    fi
+  fi
+
+  (cd "${PROJECT_DIR}/backend" && cargo fmt --all -- --check) || fail "cargo fmt --check backend en échec."
+  (cd "${PROJECT_DIR}/backend" && cargo clippy --all-targets --all-features -- -D warnings) || fail "cargo clippy backend en échec."
+  (cd "${PROJECT_DIR}/backend" && cargo test --workspace) || fail "cargo test --workspace backend en échec."
+
+  (cd "${PROJECT_DIR}/host-agent" && cargo fmt --all -- --check) || fail "cargo fmt --check host-agent en échec."
+  (cd "${PROJECT_DIR}/host-agent" && cargo clippy --all-targets --all-features -- -D warnings) || fail "cargo clippy host-agent en échec."
+  (cd "${PROJECT_DIR}/host-agent" && cargo test --workspace) || fail "cargo test --workspace host-agent en échec."
+
+  if node -e "const p=require('./frontend/package.json'); process.exit(p.scripts && p.scripts.test ? 0 : 1)" 2>/dev/null; then
+    (cd "${PROJECT_DIR}" && npm --prefix frontend test) || fail "npm test frontend en échec."
+  else
+    warn "Script npm test absent dans frontend/package.json (vérification ignorée)."
+  fi
   (cd "${PROJECT_DIR}" && npm --prefix frontend run lint) || fail "Lint frontend en échec."
   (cd "${PROJECT_DIR}" && npm --prefix frontend run build) || fail "Build frontend en échec."
   (cd "${PROJECT_DIR}" && bash deploy/tests/test-s3-paths.sh) || fail "Tests deploy/tests/test-s3-paths.sh en échec."
-  (cd "${PROJECT_DIR}" && VIDIOAI_HTTP_PORT=18080 bash deploy/tests/test-compose-orchestration.sh) || fail "Test orchestration compose non-GPU en échec."
+  (cd "${PROJECT_DIR}" && VIDIOAI_COMPOSE_FILE="${PROJECT_DIR}/docker-compose.yml" VIDIOAI_HTTP_PORT=18080 bash deploy/tests/test-compose-orchestration.sh) || fail "Test orchestration compose non-GPU en échec."
 else
   warn "Tests applicatifs ignorés (VIDIOAI_PREFLIGHT_SKIP_TESTS=true)."
 fi

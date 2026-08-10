@@ -32,6 +32,63 @@ wait_ready() {
   return 1
 }
 
+mode_for_capability() {
+  local capability=${1:?capability requise}
+  case "${capability}" in
+    TEXT_TO_IMAGE)
+      echo "TEXT_TO_IMAGE"
+      ;;
+    IMAGE_TO_IMAGE|INPAINTING|OUTPAINTING|IMAGE_VARIATION|IMAGE_UPSCALE|CONTROLLED_IMAGE_GENERATION)
+      echo "IMAGE_TO_IMAGE"
+      ;;
+    TEXT_TO_VIDEO)
+      echo "TEXT_TO_VIDEO"
+      ;;
+    IMAGE_TO_VIDEO|MULTI_IMAGE_TO_VIDEO|START_END_IMAGE_TO_VIDEO|KEYFRAMES_TO_VIDEO)
+      echo "IMAGE_TO_VIDEO"
+      ;;
+    VIDEO_TO_VIDEO|VIDEO_INPAINTING|VIDEO_UPSCALE)
+      echo "VIDEO_TO_VIDEO"
+      ;;
+    *)
+      echo "Capacité non supportée: ${capability}" >&2
+      return 1
+      ;;
+  esac
+}
+
+endpoint_for_capability() {
+  local capability=${1:?capability requise}
+  case "${capability}" in
+    TEXT_TO_IMAGE|IMAGE_TO_IMAGE|INPAINTING|OUTPAINTING|IMAGE_VARIATION|IMAGE_UPSCALE|CONTROLLED_IMAGE_GENERATION)
+      echo "/api/images/generate"
+      ;;
+    TEXT_TO_VIDEO|IMAGE_TO_VIDEO|MULTI_IMAGE_TO_VIDEO|START_END_IMAGE_TO_VIDEO|KEYFRAMES_TO_VIDEO|VIDEO_TO_VIDEO|VIDEO_INPAINTING|VIDEO_UPSCALE)
+      echo "/api/videos/generate"
+      ;;
+    *)
+      echo "Capacité non supportée: ${capability}" >&2
+      return 1
+      ;;
+  esac
+}
+
+output_kind_for_capability() {
+  local capability=${1:?capability requise}
+  case "${capability}" in
+    TEXT_TO_IMAGE|IMAGE_TO_IMAGE|INPAINTING|OUTPAINTING|IMAGE_VARIATION|IMAGE_UPSCALE|CONTROLLED_IMAGE_GENERATION)
+      echo "image"
+      ;;
+    TEXT_TO_VIDEO|IMAGE_TO_VIDEO|MULTI_IMAGE_TO_VIDEO|START_END_IMAGE_TO_VIDEO|KEYFRAMES_TO_VIDEO|VIDEO_TO_VIDEO|VIDEO_INPAINTING|VIDEO_UPSCALE)
+      echo "video"
+      ;;
+    *)
+      echo "Capacité non supportée: ${capability}" >&2
+      return 1
+      ;;
+  esac
+}
+
 select_model() {
   local mode=${1:?mode requis}
   curl -fsS --get \
@@ -124,6 +181,8 @@ upload_asset() {
 make_inputs() {
   ffmpeg -hide_banner -loglevel error -f lavfi -i color=c=red:s=256x256:d=1 -frames:v 1 "${WORKDIR}/start.png"
   ffmpeg -hide_banner -loglevel error -f lavfi -i color=c=blue:s=256x256:d=1 -frames:v 1 "${WORKDIR}/end.png"
+  ffmpeg -hide_banner -loglevel error -f lavfi -i color=c=white:s=256x256:d=1 -frames:v 1 "${WORKDIR}/mask.png"
+  ffmpeg -hide_banner -loglevel error -f lavfi -i color=c=green:s=256x256:d=1 -frames:v 1 "${WORKDIR}/control.png"
   ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc=size=256x256:rate=8 -t 2 -pix_fmt yuv420p "${WORKDIR}/source.mp4"
 }
 
@@ -150,124 +209,136 @@ fi
 make_inputs
 start_asset=$(upload_asset "${WORKDIR}/start.png" "image/png")
 end_asset=$(upload_asset "${WORKDIR}/end.png" "image/png")
+mask_asset=$(upload_asset "${WORKDIR}/mask.png" "image/png")
+control_asset=$(upload_asset "${WORKDIR}/control.png" "image/png")
 video_asset=$(upload_asset "${WORKDIR}/source.mp4" "video/mp4")
 
-run_mode() {
-  local mode=${1:?mode requis}
-  local endpoint=${2:?endpoint requis}
-  local output_kind=${3:?image|video requis}
-  local input_asset_id=${4:-}
+run_capability() {
+  local capability=${1:?capabilité requise}
+  local mode endpoint output_kind
+  mode=$(mode_for_capability "${capability}")
+  endpoint=$(endpoint_for_capability "${capability}")
+  output_kind=$(output_kind_for_capability "${capability}")
 
   model_id=$(select_model "${mode}")
   if [[ -z "${model_id}" ]]; then
-    echo "[gpu-acceptance] ${mode}: aucun modèle public raisonnable disponible (signalé explicitement)."
-    SKIPPED_MODES+=("${mode}")
+    echo "[gpu-acceptance] ${capability}: aucun modèle public raisonnable disponible (mode ${mode}, signalé explicitement)."
+    SKIPPED_MODES+=("${capability}")
     return 0
   fi
 
-  echo "[gpu-acceptance] ${mode}: modèle ${model_id}"
+  echo "[gpu-acceptance] ${capability}: modèle ${model_id}"
   install_or_load_model "${model_id}" || {
-    echo "Installation/chargement impossible pour ${model_id}" >&2
+    echo "Installation/chargement impossible pour ${model_id} (${capability})" >&2
     return 1
   }
 
-  if [[ -n "${input_asset_id}" ]]; then
-    payload=$(jq -n \
-      --arg mode "${mode}" \
-      --arg model_id "${model_id}" \
-      --arg prompt "VidioAI GPU acceptance test" \
-      --arg input_asset_id "${input_asset_id}" \
-      '{
-        mode:$mode,
-        prompt:$prompt,
-        model_id:$model_id,
-        input_asset_id:$input_asset_id,
-        duration_seconds:2,
-        resolution:"720p"
-      }')
-  else
-    payload=$(jq -n \
-      --arg mode "${mode}" \
-      --arg model_id "${model_id}" \
-      --arg prompt "VidioAI GPU acceptance test" \
-      '{
-        mode:$mode,
-        prompt:$prompt,
-        model_id:$model_id,
-        duration_seconds:2,
-        resolution:"720p"
-      }')
-  fi
+  local input_asset_id=""
+  local mask_id=""
+  local control_id=""
+  local input_images_json='[]'
+
+  case "${capability}" in
+    IMAGE_TO_IMAGE|IMAGE_VARIATION|IMAGE_UPSCALE|IMAGE_TO_VIDEO)
+      input_asset_id="${start_asset}"
+      ;;
+    INPAINTING|OUTPAINTING)
+      input_asset_id="${start_asset}"
+      mask_id="${mask_asset}"
+      ;;
+    CONTROLLED_IMAGE_GENERATION)
+      input_asset_id="${start_asset}"
+      control_id="${control_asset}"
+      ;;
+    MULTI_IMAGE_TO_VIDEO)
+      input_asset_id="${start_asset}"
+      input_images_json=$(jq -n --arg start "${start_asset}" --arg end "${end_asset}" '[{asset_id:$start,order:0,role:"start_frame"},{asset_id:$end,order:1,role:"reference"}]')
+      ;;
+    START_END_IMAGE_TO_VIDEO)
+      input_asset_id="${start_asset}"
+      input_images_json=$(jq -n --arg start "${start_asset}" --arg end "${end_asset}" '[{asset_id:$start,order:0,role:"start_frame"},{asset_id:$end,order:1,role:"end_frame"}]')
+      ;;
+    KEYFRAMES_TO_VIDEO)
+      input_asset_id="${start_asset}"
+      input_images_json=$(jq -n --arg start "${start_asset}" --arg end "${end_asset}" '[{asset_id:$start,order:0,role:"keyframe"},{asset_id:$end,order:1,role:"keyframe"}]')
+      ;;
+    VIDEO_TO_VIDEO|VIDEO_INPAINTING|VIDEO_UPSCALE)
+      input_asset_id="${video_asset}"
+      ;;
+  esac
+
+  payload=$(jq -n \
+    --arg mode "${mode}" \
+    --arg capability "${capability}" \
+    --arg model_id "${model_id}" \
+    --arg prompt "VidioAI GPU acceptance test ${capability}" \
+    --arg input_asset_id "${input_asset_id}" \
+    --arg mask_asset_id "${mask_id}" \
+    --arg control_asset_id "${control_id}" \
+    --argjson input_images "${input_images_json}" \
+    '{
+      mode:$mode,
+      capability:$capability,
+      prompt:$prompt,
+      model_id:$model_id,
+      input_asset_id:(if ($input_asset_id|length) > 0 then $input_asset_id else null end),
+      mask_asset_id:(if ($mask_asset_id|length) > 0 then $mask_asset_id else null end),
+      control_asset_id:(if ($control_asset_id|length) > 0 then $control_asset_id else null end),
+      input_images:$input_images,
+      duration_seconds:2,
+      resolution:"720p"
+    }')
 
   generation_id=$(curl -fsS -X POST -H 'Content-Type: application/json' --data-binary "${payload}" "${BASE_URL}${endpoint}" | jq -er '.id')
   result=$(poll_generation "${generation_id}") || return 1
   output_asset_id=$(jq -er '.output_asset_id' <<<"${result}")
 
   if [[ "${output_kind}" == "image" ]]; then
-    out_file="${WORKDIR}/${mode}.png"
+    out_file="${WORKDIR}/${capability}.png"
     curl -fsS "${BASE_URL}/api/assets/${output_asset_id}" -o "${out_file}"
     validate_png "${out_file}" || {
-      echo "Sortie ${mode} invalide (PNG non valide)." >&2
+      echo "Sortie ${capability} invalide (PNG non valide)." >&2
       return 1
     }
   else
-    out_file="${WORKDIR}/${mode}.mp4"
+    out_file="${WORKDIR}/${capability}.mp4"
     curl -fsS "${BASE_URL}/api/assets/${output_asset_id}" -o "${out_file}"
     validate_video "${out_file}" || {
-      echo "Sortie ${mode} invalide (vidéo non lisible)." >&2
+      echo "Sortie ${capability} invalide (vidéo non lisible)." >&2
       return 1
     }
   fi
 
-  echo "[gpu-acceptance] ${mode}: OK"
+  echo "[gpu-acceptance] ${capability}: OK"
 }
 
-run_mode "TEXT_TO_IMAGE" "/api/images/generate" "image"
-run_mode "IMAGE_TO_IMAGE" "/api/images/generate" "image" "${start_asset}"
-run_mode "TEXT_TO_VIDEO" "/api/videos/generate" "video"
-run_mode "IMAGE_TO_VIDEO" "/api/videos/generate" "video" "${start_asset}"
-run_mode "VIDEO_TO_VIDEO" "/api/videos/generate" "video" "${video_asset}"
-
-# Cas multi-images I2V avec rôles explicites.
-model_i2v=$(select_model "IMAGE_TO_VIDEO")
-if [[ -z "${model_i2v}" ]]; then
-  echo "[gpu-acceptance] IMAGE_TO_VIDEO multi-images: aucun modèle public raisonnable disponible (signalé explicitement)."
-  SKIPPED_MODES+=("IMAGE_TO_VIDEO_MULTI")
-else
-  install_or_load_model "${model_i2v}"
-  payload=$(jq -n \
-    --arg mode "IMAGE_TO_VIDEO" \
-    --arg prompt "VidioAI I2V multi-image test" \
-    --arg model_id "${model_i2v}" \
-    --arg start "${start_asset}" \
-    --arg end "${end_asset}" \
-    '{
-      mode:$mode,
-      prompt:$prompt,
-      model_id:$model_id,
-      duration_seconds:2,
-      resolution:"720p",
-      input_images:[
-        {asset_id:$start,order:0,role:"start"},
-        {asset_id:$end,order:1,role:"end"}
-      ]
-    }')
-  generation_id=$(curl -fsS -X POST -H 'Content-Type: application/json' --data-binary "${payload}" "${BASE_URL}/api/videos/generate" | jq -er '.id')
-  result=$(poll_generation "${generation_id}")
-  output_asset_id=$(jq -er '.output_asset_id' <<<"${result}")
-  out_file="${WORKDIR}/IMAGE_TO_VIDEO_MULTI.mp4"
-  curl -fsS "${BASE_URL}/api/assets/${output_asset_id}" -o "${out_file}"
-  validate_video "${out_file}"
-  echo "[gpu-acceptance] IMAGE_TO_VIDEO multi-images: OK"
-fi
+for capability in \
+  TEXT_TO_IMAGE \
+  IMAGE_TO_IMAGE \
+  INPAINTING \
+  OUTPAINTING \
+  IMAGE_VARIATION \
+  IMAGE_UPSCALE \
+  CONTROLLED_IMAGE_GENERATION \
+  TEXT_TO_VIDEO \
+  IMAGE_TO_VIDEO \
+  MULTI_IMAGE_TO_VIDEO \
+  START_END_IMAGE_TO_VIDEO \
+  KEYFRAMES_TO_VIDEO \
+  VIDEO_TO_VIDEO \
+  VIDEO_INPAINTING \
+  VIDEO_UPSCALE
+do
+  run_capability "${capability}"
+done
 
 curl -fsS "${BASE_URL}/api/queue" | jq -e '.active >= 0 and .queued >= 0 and .completed >= 0' >/dev/null
 curl -fsS "${BASE_URL}/api/resources" | jq -e '.queue_total >= 0' >/dev/null
 
 if (( ${#SKIPPED_MODES[@]} > 0 )); then
-  echo "[gpu-acceptance] Modes non validés automatiquement: ${SKIPPED_MODES[*]}"
+  echo "[gpu-acceptance] Capacités non validées automatiquement: ${SKIPPED_MODES[*]}"
   if [[ "${ALLOW_MISSING_MODES}" != "true" ]]; then
-    echo "Échec bloquant: certains modes n'ont pas de modèle public raisonnable sélectionnable." >&2
+    echo "Échec bloquant: certaines capacités n'ont pas de modèle public raisonnable sélectionnable." >&2
     exit 3
   fi
 fi

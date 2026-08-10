@@ -3,16 +3,69 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app.adapters.image_to_image import ImageToImageAdapter
 from app.adapters.image_to_video import ImageToVideoAdapter
+from app.adapters.text_to_image import TextToImageAdapter
+from app.adapters.text_to_video import TextToVideoAdapter
+from app.adapters.video_to_video import VideoToVideoAdapter
 from app.adapters.registry import PipelineRegistry
 from app.adapters.inspectors import inspect_model_metadata
 from app.config import Settings
 from app.main import create_app
 from app.runtime import RuntimeManager, WorkerError
+
+
+CAPABILITY_ENDPOINTS: dict[str, str] = {
+    "TEXT_TO_IMAGE": "/v1/generate/text-to-image",
+    "IMAGE_TO_IMAGE": "/v1/generate/image-to-image",
+    "INPAINTING": "/v1/generate/inpainting",
+    "OUTPAINTING": "/v1/generate/outpainting",
+    "IMAGE_VARIATION": "/v1/generate/image-variation",
+    "IMAGE_UPSCALE": "/v1/generate/image-upscale",
+    "CONTROLLED_IMAGE_GENERATION": "/v1/generate/controlled-image-generation",
+    "TEXT_TO_VIDEO": "/v1/generate/text-to-video",
+    "IMAGE_TO_VIDEO": "/v1/generate/image-to-video",
+    "MULTI_IMAGE_TO_VIDEO": "/v1/generate/multi-image-to-video",
+    "START_END_IMAGE_TO_VIDEO": "/v1/generate/start-end-image-to-video",
+    "KEYFRAMES_TO_VIDEO": "/v1/generate/keyframes-to-video",
+    "VIDEO_TO_VIDEO": "/v1/generate/video-to-video",
+    "VIDEO_INPAINTING": "/v1/generate/video-inpainting",
+    "VIDEO_UPSCALE": "/v1/generate/video-upscale",
+}
+
+
+def _base_image_payload() -> dict[str, Any]:
+    return {
+        "job_id": "job-12345678",
+        "model_id": "stable-image-core",
+        "prompt": "image prompt valid",
+        "output_relative_path": "generations/out.png",
+        "width": 512,
+        "height": 512,
+        "steps": 4,
+        "guidance_scale": 0.0,
+    }
+
+
+def _base_video_payload() -> dict[str, Any]:
+    return {
+        "job_id": "job-87654321",
+        "model_id": "stable-video-core",
+        "prompt": "video prompt valid",
+        "output_relative_path": "generations/out.mp4",
+        "width": 512,
+        "height": 512,
+        "steps": 4,
+        "guidance_scale": 0.0,
+        "duration_seconds": 2,
+        "fps": 8,
+        "frames": 8,
+    }
 
 
 def settings(tmp_path: Path, *, profile: str = "LOCAL") -> Settings:
@@ -86,6 +139,87 @@ def test_capabilities_endpoint_lists_all_modalities(tmp_path: Path) -> None:
         "VIDEO_INPAINTING",
         "VIDEO_UPSCALE",
     }
+
+
+@pytest.mark.parametrize("capability,endpoint", sorted(CAPABILITY_ENDPOINTS.items()))
+def test_generation_endpoint_routes_capability_to_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capability: str,
+    endpoint: str,
+) -> None:
+    app = create_app(settings(tmp_path))
+    observed: list[dict[str, Any]] = []
+
+    def fake_generate_image(payload: dict[str, Any]) -> dict[str, Any]:
+        observed.append(payload)
+        return {
+            "state": "COMPLETED",
+            "job_id": payload["job_id"],
+            "output_relative_path": payload["output_relative_path"],
+        }
+
+    monkeypatch.setattr(app.state.manager, "generate_image", fake_generate_image)
+    client = TestClient(app)
+    payload = _base_video_payload() if "VIDEO" in capability else _base_image_payload()
+    response = client.post(
+        endpoint,
+        json=payload,
+        headers={"X-VidioAI-Worker-Token": "test-token"},
+    )
+    assert response.status_code == 200
+    assert observed
+    assert observed[-1]["capability"] == capability
+
+
+@pytest.mark.parametrize("capability,endpoint", sorted(CAPABILITY_ENDPOINTS.items()))
+def test_generation_endpoint_schema_validation_for_all_capabilities(
+    tmp_path: Path,
+    capability: str,
+    endpoint: str,
+) -> None:
+    client = TestClient(create_app(settings(tmp_path)))
+    payload = _base_video_payload() if "VIDEO" in capability else _base_image_payload()
+    payload["prompt"] = "no"
+    response = client.post(
+        endpoint,
+        json=payload,
+        headers={"X-VidioAI-Worker-Token": "test-token"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("capability,endpoint", sorted(CAPABILITY_ENDPOINTS.items()))
+def test_generation_endpoint_structured_errors_for_all_capabilities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capability: str,
+    endpoint: str,
+) -> None:
+    app = create_app(settings(tmp_path))
+
+    def failing_generate(_payload: dict[str, Any]) -> dict[str, Any]:
+        raise WorkerError("Entrée invalide", 422)
+
+    monkeypatch.setattr(app.state.manager, "generate_image", failing_generate)
+    client = TestClient(app)
+    payload = _base_video_payload() if "VIDEO" in capability else _base_image_payload()
+    response = client.post(
+        endpoint,
+        json=payload,
+        headers={"X-VidioAI-Worker-Token": "test-token"},
+    )
+    assert response.status_code == 422
+    assert response.json() == {"error": "Entrée invalide"}
+
+
+@pytest.mark.parametrize("capability", sorted(CAPABILITY_ENDPOINTS))
+def test_pipeline_registry_selects_adapter_for_each_capability(capability: str) -> None:
+    registry = PipelineRegistry()
+    metadata = {"capabilities": [capability], "pipeline_tag": "image-to-image"}
+    adapter = registry.select_for_capability(metadata, capability)
+    assert adapter is not None
+    assert capability in adapter.capabilities()
 
 
 def test_dynamic_metadata_detection_exposes_multiple_capabilities(tmp_path: Path) -> None:
@@ -180,6 +314,185 @@ def test_i2v_adapter_preserves_input_order_and_roles() -> None:
     payload = adapter.prepare_pipeline_inputs(request)
     assert payload["images"] == ["a", "b"]
     assert payload["roles"] == ["start_frame", "reference"]
+
+
+def test_text_to_image_adapter_filters_kwargs_by_pipeline_signature() -> None:
+    adapter = TextToImageAdapter()
+    called: dict[str, Any] = {}
+
+    class Pipeline:
+        def __call__(self, prompt=None, width=None):
+            called.update({"prompt": prompt, "width": width})
+            return SimpleNamespace(images=["ok"])
+
+    output = adapter.generate(
+        Pipeline(),
+        {"generator": object()},
+        {
+            "prompt": "hello",
+            "width": 512,
+            "height": 512,
+            "negative_prompt": "bad",
+            "steps": 6,
+            "guidance_scale": 7.0,
+        },
+    )
+    assert output["images"] == ["ok"]
+    assert called == {"prompt": "hello", "width": 512}
+
+
+def test_image_to_image_adapter_filters_kwargs_for_inpainting() -> None:
+    adapter = ImageToImageAdapter()
+    called: dict[str, Any] = {}
+
+    class Pipeline:
+        def __call__(
+            self,
+            prompt=None,
+            image=None,
+            mask_image=None,
+            num_inference_steps=None,
+            generator=None,
+        ):
+            called.update(
+                {
+                    "prompt": prompt,
+                    "image": image,
+                    "mask_image": mask_image,
+                    "num_inference_steps": num_inference_steps,
+                    "generator": generator,
+                }
+            )
+            return SimpleNamespace(images=["ok"])
+
+    output = adapter.generate(
+        Pipeline(),
+        {"generator": object()},
+        {
+            "prompt": "hello",
+            "capability": "INPAINTING",
+            "input_image": "img",
+            "mask_image": "mask",
+            "control_image": "control",
+            "strength": 0.4,
+            "steps": 9,
+            "guidance_scale": 7.0,
+        },
+    )
+    assert output["images"] == ["ok"]
+    assert called["prompt"] == "hello"
+    assert called["image"] == "img"
+    assert called["mask_image"] == "mask"
+    assert called["num_inference_steps"] == 9
+
+
+def test_image_to_image_adapter_removes_strength_for_variation() -> None:
+    adapter = ImageToImageAdapter()
+    called: dict[str, Any] = {}
+
+    class Pipeline:
+        def __call__(self, prompt=None, image=None, strength=None):
+            called.update({"prompt": prompt, "image": image, "strength": strength})
+            return SimpleNamespace(images=["ok"])
+
+    adapter.generate(
+        Pipeline(),
+        {"generator": object()},
+        {
+            "prompt": "hello",
+            "capability": "IMAGE_VARIATION",
+            "input_image": "img",
+            "strength": 0.9,
+        },
+    )
+    assert called["prompt"] == "hello"
+    assert called["image"] == "img"
+    assert called["strength"] is None
+
+
+def test_text_to_video_adapter_filters_kwargs_by_signature() -> None:
+    adapter = TextToVideoAdapter()
+    called: dict[str, Any] = {}
+
+    class Pipeline:
+        def __call__(self, prompt=None, num_frames=None, fps=None):
+            called.update({"prompt": prompt, "num_frames": num_frames, "fps": fps})
+            return SimpleNamespace(frames=["f"])
+
+    output = adapter.generate(
+        Pipeline(),
+        {"generator": object()},
+        {
+            "prompt": "hello",
+            "frames": 8,
+            "fps": 12,
+            "negative_prompt": "bad",
+            "steps": 10,
+            "guidance_scale": 5,
+        },
+    )
+    assert output["frames"] == ["f"]
+    assert called == {"prompt": "hello", "num_frames": 8, "fps": 12}
+
+
+def test_image_to_video_adapter_filters_kwargs_and_preserves_roles() -> None:
+    adapter = ImageToVideoAdapter()
+    called: dict[str, Any] = {}
+
+    class Pipeline:
+        def __call__(self, prompt=None, image=None, end_image=None, image_roles=None):
+            called.update(
+                {
+                    "prompt": prompt,
+                    "image": image,
+                    "end_image": end_image,
+                    "image_roles": image_roles,
+                }
+            )
+            return SimpleNamespace(frames=["f"])
+
+    output = adapter.generate(
+        Pipeline(),
+        {"generator": object()},
+        {
+            "prompt": "hello",
+            "input_images": [
+                {"asset_id": "start", "order": 0, "role": "start_frame"},
+                {"asset_id": "end", "order": 1, "role": "end_frame"},
+            ],
+            "steps": 4,
+        },
+    )
+    assert output["frames"] == ["f"]
+    assert called["prompt"] == "hello"
+    assert called["image"] == "start"
+    assert called["end_image"] == "end"
+    assert called["image_roles"] == ["start_frame", "end_frame"]
+
+
+def test_video_to_video_adapter_filters_kwargs_by_signature() -> None:
+    adapter = VideoToVideoAdapter()
+    called: dict[str, Any] = {}
+
+    class Pipeline:
+        def __call__(self, prompt=None, video=None, mask_image=None):
+            called.update({"prompt": prompt, "video": video, "mask_image": mask_image})
+            return SimpleNamespace(frames=["f"])
+
+    output = adapter.generate(
+        Pipeline(),
+        {"generator": object()},
+        {
+            "prompt": "hello",
+            "input_video": "vid.mp4",
+            "mask_image": "mask",
+            "frames": 16,
+            "fps": 8,
+            "strength": 0.4,
+        },
+    )
+    assert output["frames"] == ["f"]
+    assert called == {"prompt": "hello", "video": "vid.mp4", "mask_image": "mask"}
 
 
 def test_manifest_without_weights_is_rejected(tmp_path: Path) -> None:
@@ -327,7 +640,7 @@ def test_install_model_never_sends_empty_bearer_token(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
 ) -> None:
     manager = RuntimeManager(settings(tmp_path))
-    observed = {"api_token": "UNSET", "download_token": "UNSET"}
+    observed = {"api_token": "UNSET", "download_token": "UNSET", "download_headers": None}
 
     class FakeHfApi:
         def __init__(self, token: str | None = None) -> None:
@@ -338,6 +651,7 @@ def test_install_model_never_sends_empty_bearer_token(
 
     def fake_snapshot_download(**kwargs) -> None:
         observed["download_token"] = kwargs.get("token")
+        observed["download_headers"] = kwargs.get("headers")
         _write_fake_snapshot(Path(kwargs["local_dir"]))
 
     monkeypatch.setattr(
@@ -356,6 +670,7 @@ def test_install_model_never_sends_empty_bearer_token(
     assert status["state"] == "INSTALLED"
     assert observed["api_token"] is None
     assert observed["download_token"] is None
+    assert observed["download_headers"] is None or "Authorization" not in observed["download_headers"]
 
 
 def test_install_model_public_repository_works_without_token(

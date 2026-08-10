@@ -3348,6 +3348,24 @@ fn image_capability_mode_default(mode: &GenerationMode) -> Option<ModelCapabilit
     }
 }
 
+fn is_valid_image_capability_for_mode(mode: &GenerationMode, capability: &ModelCapability) -> bool {
+    match mode {
+        GenerationMode::TextToImage => *capability == ModelCapability::TextToImage,
+        GenerationMode::ImageToImage => matches!(
+            capability,
+            ModelCapability::ImageToImage
+                | ModelCapability::Inpainting
+                | ModelCapability::Outpainting
+                | ModelCapability::ImageVariation
+                | ModelCapability::ImageUpscale
+                | ModelCapability::ControlledImageGeneration
+        ),
+        GenerationMode::TextToVideo
+        | GenerationMode::ImageToVideo
+        | GenerationMode::VideoToVideo => false,
+    }
+}
+
 fn video_capability_mode_default(mode: &GenerationMode) -> Option<ModelCapability> {
     match mode {
         GenerationMode::TextToVideo => Some(ModelCapability::TextToVideo),
@@ -3368,6 +3386,26 @@ fn video_endpoint(capability: &ModelCapability) -> &'static str {
         ModelCapability::VideoInpainting => "/v1/generate/video-inpainting",
         ModelCapability::VideoUpscale => "/v1/generate/video-upscale",
         _ => "/v1/generate/video-to-video",
+    }
+}
+
+fn is_valid_video_capability_for_mode(mode: &GenerationMode, capability: &ModelCapability) -> bool {
+    match mode {
+        GenerationMode::TextToVideo => *capability == ModelCapability::TextToVideo,
+        GenerationMode::ImageToVideo => matches!(
+            capability,
+            ModelCapability::ImageToVideo
+                | ModelCapability::MultiImageToVideo
+                | ModelCapability::StartEndImageToVideo
+                | ModelCapability::KeyframesToVideo
+        ),
+        GenerationMode::VideoToVideo => matches!(
+            capability,
+            ModelCapability::VideoToVideo
+                | ModelCapability::VideoInpainting
+                | ModelCapability::VideoUpscale
+        ),
+        GenerationMode::TextToImage | GenerationMode::ImageToImage => false,
     }
 }
 
@@ -3417,26 +3455,9 @@ async fn generate_image(
             ));
         }
     };
-    if request.mode == GenerationMode::TextToImage
-        && requested_capability != ModelCapability::TextToImage
-    {
+    if !is_valid_image_capability_for_mode(&request.mode, &requested_capability) {
         return Err(ApiError::bad_request(
-            "TEXT_TO_IMAGE est la seule capacité autorisée pour ce mode.",
-        ));
-    }
-    if request.mode == GenerationMode::ImageToImage
-        && !matches!(
-            requested_capability,
-            ModelCapability::ImageToImage
-                | ModelCapability::Inpainting
-                | ModelCapability::Outpainting
-                | ModelCapability::ImageVariation
-                | ModelCapability::ImageUpscale
-                | ModelCapability::ControlledImageGeneration
-        )
-    {
-        return Err(ApiError::bad_request(
-            "Capacité IMAGE_TO_IMAGE invalide pour ce mode.",
+            "Capacité image invalide pour ce mode.",
         ));
     }
     if !entry.capabilities.contains(&expected_capability)
@@ -3703,7 +3724,10 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
                         generation.negative_prompt.as_deref(),
                         &relative,
                         Some(&input_path.to_string_lossy()),
-                        mask_path.as_ref().map(|path| path.to_string_lossy()).as_deref(),
+                        mask_path
+                            .as_ref()
+                            .map(|path| path.to_string_lossy())
+                            .as_deref(),
                         control_path
                             .as_ref()
                             .map(|path| path.to_string_lossy())
@@ -3875,38 +3899,14 @@ async fn generate_video(
         .model_id
         .unwrap_or_else(|| "vidio-motion-local".into());
     let entry = resolve_model(&state, &model_id).await?;
-    if mode == GenerationMode::TextToVideo && requested_capability != ModelCapability::TextToVideo
-    {
+    if !is_valid_video_capability_for_mode(&mode, &requested_capability) {
         return Err(ApiError::bad_request(
-            "TEXT_TO_VIDEO est la seule capacité autorisée pour ce mode.",
+            "Capacité vidéo invalide pour ce mode.",
         ));
     }
-    if mode == GenerationMode::ImageToVideo
-        && !matches!(
-            requested_capability,
-            ModelCapability::ImageToVideo
-                | ModelCapability::MultiImageToVideo
-                | ModelCapability::StartEndImageToVideo
-                | ModelCapability::KeyframesToVideo
-        )
+    if !entry.capabilities.contains(&expected)
+        || !entry.capabilities.contains(&requested_capability)
     {
-        return Err(ApiError::bad_request(
-            "Capacité IMAGE_TO_VIDEO invalide pour ce mode.",
-        ));
-    }
-    if mode == GenerationMode::VideoToVideo
-        && !matches!(
-            requested_capability,
-            ModelCapability::VideoToVideo
-                | ModelCapability::VideoInpainting
-                | ModelCapability::VideoUpscale
-        )
-    {
-        return Err(ApiError::bad_request(
-            "Capacité VIDEO_TO_VIDEO invalide pour ce mode.",
-        ));
-    }
-    if !entry.capabilities.contains(&expected) || !entry.capabilities.contains(&requested_capability) {
         return Err(ApiError::conflict(
             "Ce modèle ne supporte pas le mode vidéo choisi.",
         ));
@@ -4454,7 +4454,11 @@ async fn get_generation(
 
 #[cfg(test)]
 mod tests {
-    use super::{AppSettings, CanvasEngine, GenerationMode, ModelIdQuery, local_runtime_models};
+    use super::{
+        AppSettings, CanvasEngine, GenerationMode, ModelCapability, ModelIdQuery, image_endpoint,
+        is_valid_image_capability_for_mode, is_valid_video_capability_for_mode,
+        local_runtime_models, video_endpoint,
+    };
 
     #[test]
     fn query_model_ids_preserve_encoded_hugging_face_slashes() {
@@ -4509,6 +4513,140 @@ mod tests {
             CanvasEngine::palette("ville futuriste"),
             CanvasEngine::palette("forêt")
         );
+    }
+
+    #[test]
+    fn backend_routes_all_image_capabilities_to_expected_worker_endpoints() {
+        assert_eq!(
+            image_endpoint(&ModelCapability::TextToImage),
+            "/v1/generate/text-to-image"
+        );
+        assert_eq!(
+            image_endpoint(&ModelCapability::ImageToImage),
+            "/v1/generate/image-to-image"
+        );
+        assert_eq!(
+            image_endpoint(&ModelCapability::Inpainting),
+            "/v1/generate/inpainting"
+        );
+        assert_eq!(
+            image_endpoint(&ModelCapability::Outpainting),
+            "/v1/generate/outpainting"
+        );
+        assert_eq!(
+            image_endpoint(&ModelCapability::ImageVariation),
+            "/v1/generate/image-variation"
+        );
+        assert_eq!(
+            image_endpoint(&ModelCapability::ImageUpscale),
+            "/v1/generate/image-upscale"
+        );
+        assert_eq!(
+            image_endpoint(&ModelCapability::ControlledImageGeneration),
+            "/v1/generate/controlled-image-generation"
+        );
+    }
+
+    #[test]
+    fn backend_routes_all_video_capabilities_to_expected_worker_endpoints() {
+        assert_eq!(
+            video_endpoint(&ModelCapability::TextToVideo),
+            "/v1/generate/text-to-video"
+        );
+        assert_eq!(
+            video_endpoint(&ModelCapability::ImageToVideo),
+            "/v1/generate/image-to-video"
+        );
+        assert_eq!(
+            video_endpoint(&ModelCapability::MultiImageToVideo),
+            "/v1/generate/multi-image-to-video"
+        );
+        assert_eq!(
+            video_endpoint(&ModelCapability::StartEndImageToVideo),
+            "/v1/generate/start-end-image-to-video"
+        );
+        assert_eq!(
+            video_endpoint(&ModelCapability::KeyframesToVideo),
+            "/v1/generate/keyframes-to-video"
+        );
+        assert_eq!(
+            video_endpoint(&ModelCapability::VideoToVideo),
+            "/v1/generate/video-to-video"
+        );
+        assert_eq!(
+            video_endpoint(&ModelCapability::VideoInpainting),
+            "/v1/generate/video-inpainting"
+        );
+        assert_eq!(
+            video_endpoint(&ModelCapability::VideoUpscale),
+            "/v1/generate/video-upscale"
+        );
+    }
+
+    #[test]
+    fn backend_validates_image_mode_capability_families() {
+        assert!(is_valid_image_capability_for_mode(
+            &GenerationMode::TextToImage,
+            &ModelCapability::TextToImage
+        ));
+        for capability in [
+            ModelCapability::ImageToImage,
+            ModelCapability::Inpainting,
+            ModelCapability::Outpainting,
+            ModelCapability::ImageVariation,
+            ModelCapability::ImageUpscale,
+            ModelCapability::ControlledImageGeneration,
+        ] {
+            assert!(is_valid_image_capability_for_mode(
+                &GenerationMode::ImageToImage,
+                &capability
+            ));
+        }
+        assert!(!is_valid_image_capability_for_mode(
+            &GenerationMode::TextToImage,
+            &ModelCapability::ImageToImage
+        ));
+        assert!(!is_valid_image_capability_for_mode(
+            &GenerationMode::ImageToImage,
+            &ModelCapability::TextToImage
+        ));
+    }
+
+    #[test]
+    fn backend_validates_video_mode_capability_families() {
+        assert!(is_valid_video_capability_for_mode(
+            &GenerationMode::TextToVideo,
+            &ModelCapability::TextToVideo
+        ));
+        for capability in [
+            ModelCapability::ImageToVideo,
+            ModelCapability::MultiImageToVideo,
+            ModelCapability::StartEndImageToVideo,
+            ModelCapability::KeyframesToVideo,
+        ] {
+            assert!(is_valid_video_capability_for_mode(
+                &GenerationMode::ImageToVideo,
+                &capability
+            ));
+        }
+        for capability in [
+            ModelCapability::VideoToVideo,
+            ModelCapability::VideoInpainting,
+            ModelCapability::VideoUpscale,
+        ] {
+            assert!(is_valid_video_capability_for_mode(
+                &GenerationMode::VideoToVideo,
+                &capability
+            ));
+        }
+        assert!(!is_valid_video_capability_for_mode(
+            &GenerationMode::VideoToVideo,
+            &ModelCapability::ImageToVideo
+        ));
+        assert!(!is_valid_video_capability_for_mode(
+            &GenerationMode::ImageToVideo,
+            &ModelCapability::VideoUpscale
+        ));
     }
 
     #[tokio::test]

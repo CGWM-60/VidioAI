@@ -35,6 +35,14 @@ wait_http() {
   return 1
 }
 
+container_ip() {
+  local service=${1:?service requis}
+  local cid
+  cid=$(compose ps -q "${service}" || true)
+  [[ -n "${cid}" ]] || return 1
+  docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${cid}" 2>/dev/null || true
+}
+
 wait_service_running() {
   local service=${1:?service requis}
   local attempts=${2:-90}
@@ -74,18 +82,36 @@ wait_http "http://127.0.0.1:${HTTP_PORT}/" || {
 
 backend_before=$(compose ps -q backend)
 frontend_before=$(compose ps -q frontend)
+backend_ip_before=$(container_ip backend)
+frontend_ip_before=$(container_ip frontend)
 
 compose up -d --force-recreate backend
 wait_service_running backend || { compose ps -a; compose logs --tail=120 backend proxy; exit 1; }
 wait_http "http://127.0.0.1:${HTTP_PORT}/api/health" || { compose ps -a; compose logs --tail=120 backend proxy; exit 1; }
 backend_after=$(compose ps -q backend)
 [[ "${backend_before}" != "${backend_after}" ]] || { echo "Backend non recréé." >&2; exit 1; }
+backend_ip_after=$(container_ip backend)
+if [[ -n "${backend_ip_before}" && -n "${backend_ip_after}" && "${backend_ip_before}" != "${backend_ip_after}" ]]; then
+  echo "Backend IP modifiée: ${backend_ip_before} -> ${backend_ip_after}"
+else
+  echo "Backend recréé sans changement d'IP observable (pool Docker inchangé)."
+fi
 
 compose up -d --force-recreate frontend
 wait_service_running frontend || { compose ps -a; compose logs --tail=120 frontend proxy; exit 1; }
 wait_http "http://127.0.0.1:${HTTP_PORT}/" || { compose ps -a; compose logs --tail=120 frontend proxy; exit 1; }
 frontend_after=$(compose ps -q frontend)
 [[ "${frontend_before}" != "${frontend_after}" ]] || { echo "Frontend non recréé." >&2; exit 1; }
+frontend_ip_after=$(container_ip frontend)
+if [[ -n "${frontend_ip_before}" && -n "${frontend_ip_after}" && "${frontend_ip_before}" != "${frontend_ip_after}" ]]; then
+  echo "Frontend IP modifiée: ${frontend_ip_before} -> ${frontend_ip_after}"
+else
+  echo "Frontend recréé sans changement d'IP observable (pool Docker inchangé)."
+fi
+
+# Validation explicite : pas de redémarrage manuel du proxy avant ces checks.
+wait_http "http://127.0.0.1:${HTTP_PORT}/api/health" || { compose ps -a; compose logs --tail=120 proxy backend; exit 1; }
+wait_http "http://127.0.0.1:${HTTP_PORT}/" || { compose ps -a; compose logs --tail=120 proxy frontend; exit 1; }
 
 compose up -d --force-recreate proxy
 wait_service_running proxy || { compose ps -a; compose logs --tail=120 proxy; exit 1; }

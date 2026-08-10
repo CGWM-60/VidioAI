@@ -11,6 +11,11 @@ compose() {
   docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" "$@"
 }
 
+has_service() {
+  local service=${1:?service requis}
+  compose config --services | grep -Fxq "${service}"
+}
+
 service_container_id() {
   local service=${1:?service requis}
   compose ps -q "${service}" 2>/dev/null || true
@@ -58,7 +63,7 @@ trap dump_diagnostics ERR
 cd "${PROJECT_DIR}"
 test -f .previous-version || { echo "Aucune version précédente connue." >&2; exit 1; }
 PREVIOUS_VERSION=$(<.previous-version)
-CURRENT_VERSION=$(<.current-version 2>/dev/null || true)
+CURRENT_VERSION=$(cat .current-version 2>/dev/null || true)
 [[ -n "${PREVIOUS_VERSION}" && "${PREVIOUS_VERSION}" != "latest" ]] || { echo "Version de rollback invalide." >&2; exit 1; }
 set -a
 source "${ENV_FILE}"
@@ -67,14 +72,12 @@ curl -fsS -X POST -H "Authorization: Bearer ${VIDIOAI_ADMIN_TOKEN}" \
   "http://127.0.0.1:${VIDIOAI_HTTP_PORT:-8080}/api/admin/drain" >/dev/null || true
 export VIDIOAI_VERSION="${PREVIOUS_VERSION}"
 compose pull
-compose up -d --remove-orphans worker
-wait_for_service worker
-compose up -d --remove-orphans backend
-wait_for_service backend
-compose up -d --remove-orphans frontend
-wait_for_service frontend
-compose up -d --remove-orphans proxy
-wait_for_service proxy
+for service in worker backend frontend proxy; do
+  if has_service "${service}"; then
+    compose up -d --remove-orphans "${service}"
+    wait_for_service "${service}"
+  fi
+done
 "${PROJECT_DIR}/deploy/scripts/smoke-test.sh" "http://127.0.0.1:${VIDIOAI_HTTP_PORT:-8080}"
 printf '%s\n' "${PREVIOUS_VERSION}" > .current-version
 if [[ -n "${CURRENT_VERSION}" ]]; then printf '%s\n' "${CURRENT_VERSION}" > .previous-version; fi

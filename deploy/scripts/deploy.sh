@@ -9,9 +9,15 @@ ENV_FILE=${VIDIOAI_ENV_FILE:-${PROJECT_DIR}/.env.production}
 COMPOSE_FILE=${VIDIOAI_COMPOSE_FILE:-${PROJECT_DIR}/compose.production.yml}
 WAIT_TIMEOUT=${VIDIOAI_DEPLOY_WAIT_TIMEOUT:-180}
 WAIT_INTERVAL=${VIDIOAI_DEPLOY_WAIT_INTERVAL:-2}
+BACKUP_DIR=${VIDIOAI_BACKUP_DIR:-/var/lib/vidioai/backups}
 
 compose() {
   docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" "$@"
+}
+
+has_service() {
+  local service=${1:?service requis}
+  compose config --services | grep -Fxq "${service}"
 }
 
 service_container_id() {
@@ -54,6 +60,12 @@ wait_for_service() {
   while (( SECONDS < deadline )); do
     IFS='|' read -r status health _cid <<<"$(service_state "${service}")"
     echo "[wait] ${service}: status=${status} health=${health}"
+    case "${status}" in
+      created|exited|dead|removing)
+        echo "Service ${service} bloqué dans un état terminal/non-démarré: ${status}" >&2
+        return 1
+        ;;
+    esac
     if [[ "${status}" == "running" && ( "${health}" == "healthy" || "${health}" == "none" ) ]]; then
       return 0
     fi
@@ -66,6 +78,9 @@ wait_for_service() {
 verify_stack_healthy() {
   local failed=0
   for service in worker backend frontend proxy; do
+    if ! has_service "${service}"; then
+      continue
+    fi
     IFS='|' read -r status health _cid <<<"$(service_state "${service}")"
     if [[ "${status}" != "running" || ( "${health}" != "healthy" && "${health}" != "none" ) ]]; then
       echo "Service invalide: ${service} status=${status} health=${health}" >&2
@@ -89,6 +104,8 @@ auto_rollback() {
     return 0
   fi
   echo "Rollback automatique impossible: script ou version précédente absente." >&2
+  echo "Nettoyage automatique de la stack en échec..." >&2
+  compose down --remove-orphans || true
   return 1
 }
 
@@ -106,8 +123,8 @@ test -f "${COMPOSE_FILE}" || { echo "Compose absent: ${COMPOSE_FILE}" >&2; exit 
 set -a
 source "${ENV_FILE}"
 set +a
-mkdir -p /var/lib/vidioai/backups
-cp "${ENV_FILE}" "/var/lib/vidioai/backups/env-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "${BACKUP_DIR}"
+cp "${ENV_FILE}" "${BACKUP_DIR}/env-$(date +%Y%m%d-%H%M%S)"
 
 if [[ "${VIDIOAI_RUN_PREFLIGHT:-true}" == "true" ]]; then
   VIDIOAI_PREFLIGHT_SKIP_TESTS=true \
@@ -116,10 +133,12 @@ fi
 
 # Le backend ne doit jamais démarrer en GPU_PRODUCTION sur les métriques du
 # conteneur. Le service natif et son contrat sont donc contrôlés avant le pull.
-systemctl is-active --quiet vidioai-host-agent.service \
-  || { echo "vidioai-host-agent.service n'est pas actif." >&2; exit 1; }
-curl -fsS -H "X-VidioAI-Host-Token: ${HOST_AGENT_TOKEN}" \
-  http://127.0.0.1:8091/system | jq -e '.source == "host"' >/dev/null
+if [[ "${VIDIOAI_SKIP_HOST_AGENT_CHECK:-false}" != "true" ]]; then
+  systemctl is-active --quiet vidioai-host-agent.service \
+    || { echo "vidioai-host-agent.service n'est pas actif." >&2; exit 1; }
+  curl -fsS -H "X-VidioAI-Host-Token: ${HOST_AGENT_TOKEN}" \
+    http://127.0.0.1:8091/system | jq -e '.source == "host"' >/dev/null
+fi
 
 if [[ -f .current-version ]]; then
   cp .current-version .previous-version
@@ -131,16 +150,16 @@ export VIDIOAI_VERSION="${VERSION}"
 compose pull
 
 # Démarrage explicite ordonné pour éviter les états intermédiaires silencieux.
-compose up -d --remove-orphans worker
-wait_for_service worker
-compose up -d --remove-orphans backend
-wait_for_service backend
-compose up -d --remove-orphans frontend
-wait_for_service frontend
-compose up -d --remove-orphans proxy
-wait_for_service proxy
+for service in worker backend frontend proxy; do
+  if has_service "${service}"; then
+    compose up -d --remove-orphans "${service}"
+    wait_for_service "${service}"
+  fi
+done
 verify_stack_healthy
 
-"${PROJECT_DIR}/deploy/scripts/smoke-test.sh" "http://127.0.0.1:${VIDIOAI_HTTP_PORT:-8080}"
+if [[ "${VIDIOAI_SKIP_SMOKE_TEST:-false}" != "true" ]]; then
+  "${PROJECT_DIR}/deploy/scripts/smoke-test.sh" "http://127.0.0.1:${VIDIOAI_HTTP_PORT:-8080}"
+fi
 printf '%s\n' "${VERSION}" > .current-version
 echo "Déploiement ${VERSION} validé."

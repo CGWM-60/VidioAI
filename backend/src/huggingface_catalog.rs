@@ -991,9 +991,7 @@ fn normalize_capabilities(pipeline: &str, tags: &[String]) -> Vec<ModelCapabilit
             "inpainting" | "image-inpainting" => Some(ModelCapability::Inpainting),
             "outpainting" | "image-outpainting" => Some(ModelCapability::Outpainting),
             "image-variation" | "variation" => Some(ModelCapability::ImageVariation),
-            "super-resolution" | "upscale" | "image-upscale" => {
-                Some(ModelCapability::ImageUpscale)
-            }
+            "super-resolution" | "upscale" | "image-upscale" => Some(ModelCapability::ImageUpscale),
             "controlnet" | "controlled-image-generation" => {
                 Some(ModelCapability::ControlledImageGeneration)
             }
@@ -1178,7 +1176,8 @@ fn runtime_match(
     if library == "diffusers" && has_safetensors && has_diffusers_index {
         let runtime_capabilities = infer_runtime_capabilities(capabilities, architecture, files);
         if !runtime_capabilities.is_empty() {
-            let detected = architecture.unwrap_or("classe résolue depuis model_index.json au chargement");
+            let detected =
+                architecture.unwrap_or("classe résolue depuis model_index.json au chargement");
             let labels = runtime_capabilities
                 .iter()
                 .map(ModelCapability::api_name)
@@ -1387,10 +1386,16 @@ fn requested_pipelines(query: &CatalogQuery) -> Vec<&'static str> {
             "CHAT" => vec!["text-generation"],
             "VISION" => vec!["image-text-to-text", "visual-question-answering"],
             "TEXT_TO_IMAGE" => vec!["text-to-image"],
-            "IMAGE_TO_IMAGE" | "INPAINTING" | "OUTPAINTING" | "IMAGE_VARIATION"
-            | "IMAGE_UPSCALE" | "CONTROLLED_IMAGE_GENERATION" => vec!["image-to-image"],
+            "IMAGE_TO_IMAGE"
+            | "INPAINTING"
+            | "OUTPAINTING"
+            | "IMAGE_VARIATION"
+            | "IMAGE_UPSCALE"
+            | "CONTROLLED_IMAGE_GENERATION" => vec!["image-to-image"],
             "TEXT_TO_VIDEO" => vec!["text-to-video"],
-            "IMAGE_TO_VIDEO" | "MULTI_IMAGE_TO_VIDEO" | "START_END_IMAGE_TO_VIDEO"
+            "IMAGE_TO_VIDEO"
+            | "MULTI_IMAGE_TO_VIDEO"
+            | "START_END_IMAGE_TO_VIDEO"
             | "KEYFRAMES_TO_VIDEO" => vec!["image-to-video"],
             "VIDEO_TO_VIDEO" | "VIDEO_INPAINTING" | "VIDEO_UPSCALE" => {
                 vec!["video-to-video"]
@@ -1471,7 +1476,15 @@ pub fn local_runtime_models() -> Vec<CatalogModel> {
             name: "Vidio Canvas Local".into(),
             description: "Moteur image procédural intégré, disponible hors ligne.".into(),
             kind: ModelKind::Image,
-            capabilities: vec![ModelCapability::TextToImage, ModelCapability::ImageToImage],
+            capabilities: vec![
+                ModelCapability::TextToImage,
+                ModelCapability::ImageToImage,
+                ModelCapability::Inpainting,
+                ModelCapability::Outpainting,
+                ModelCapability::ImageVariation,
+                ModelCapability::ImageUpscale,
+                ModelCapability::ControlledImageGeneration,
+            ],
             variants: vec![ModelVariant {
                 id: "builtin".into(),
                 label: "Intégré".into(),
@@ -1503,9 +1516,17 @@ pub fn local_runtime_models() -> Vec<CatalogModel> {
             quality_valid: true,
             runtime_name: Some("Vidio Canvas".into()),
             runtime_supported: true,
-            runtime_reason: "Moteur procédural local intégré (hors Worker GPU).".into(),
+            runtime_reason: "Moteur procédural local intégré couvrant toutes les familles image (hors Worker GPU).".into(),
             pipeline_class: Some("CanvasEngine".into()),
-            runtime_capabilities: vec![ModelCapability::TextToImage, ModelCapability::ImageToImage],
+            runtime_capabilities: vec![
+                ModelCapability::TextToImage,
+                ModelCapability::ImageToImage,
+                ModelCapability::Inpainting,
+                ModelCapability::Outpainting,
+                ModelCapability::ImageVariation,
+                ModelCapability::ImageUpscale,
+                ModelCapability::ControlledImageGeneration,
+            ],
             installable: false,
             local: true,
             hardware: HardwareEstimate {
@@ -1543,7 +1564,12 @@ pub fn local_runtime_models() -> Vec<CatalogModel> {
             capabilities: vec![
                 ModelCapability::TextToVideo,
                 ModelCapability::ImageToVideo,
+                ModelCapability::MultiImageToVideo,
+                ModelCapability::StartEndImageToVideo,
+                ModelCapability::KeyframesToVideo,
                 ModelCapability::VideoToVideo,
+                ModelCapability::VideoInpainting,
+                ModelCapability::VideoUpscale,
                 ModelCapability::Audio,
             ],
             variants: vec![ModelVariant {
@@ -1577,12 +1603,17 @@ pub fn local_runtime_models() -> Vec<CatalogModel> {
             quality_valid: true,
             runtime_name: Some("FFmpeg".into()),
             runtime_supported: true,
-            runtime_reason: "Moteur vidéo local FFmpeg intégré (hors Worker Diffusers).".into(),
+            runtime_reason: "Moteur vidéo local FFmpeg intégré couvrant toutes les familles vidéo (hors Worker Diffusers).".into(),
             pipeline_class: Some("FfmpegMotionEngine".into()),
             runtime_capabilities: vec![
                 ModelCapability::TextToVideo,
                 ModelCapability::ImageToVideo,
+                ModelCapability::MultiImageToVideo,
+                ModelCapability::StartEndImageToVideo,
+                ModelCapability::KeyframesToVideo,
                 ModelCapability::VideoToVideo,
+                ModelCapability::VideoInpainting,
+                ModelCapability::VideoUpscale,
             ],
             installable: false,
             local: true,
@@ -1688,8 +1719,16 @@ mod tests {
         let model = normalize_model(raw);
         assert!(model.quality_valid);
         assert!(model.runtime_supported);
-        assert!(model.runtime_capabilities.contains(&ModelCapability::ImageToVideo));
-        assert!(model.runtime_capabilities.contains(&ModelCapability::MultiImageToVideo));
+        assert!(
+            model
+                .runtime_capabilities
+                .contains(&ModelCapability::ImageToVideo)
+        );
+        assert!(
+            model
+                .runtime_capabilities
+                .contains(&ModelCapability::MultiImageToVideo)
+        );
         assert!(model.runtime_reason.contains("runtime dynamique"));
     }
 
