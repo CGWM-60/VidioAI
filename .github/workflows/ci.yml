@@ -87,9 +87,18 @@ jobs:
       - run: pytest -q
         working-directory: worker
 
+  deployment-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate shell syntax and S3 release paths
+        run: |
+          bash -n deploy/scripts/*.sh deploy/scripts/lib/*.sh deploy/tests/*.sh
+          bash deploy/tests/test-s3-paths.sh
+
 
   containers:
-    needs: [backend, frontend, worker]
+    needs: [backend, frontend, worker, deployment-scripts]
     runs-on:
       - self-hosted
       - Linux

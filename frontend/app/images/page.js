@@ -14,6 +14,7 @@ export default function ImagesPage() {
   const fileInput = useRef(null);
   const [mode, setMode] = useState("TEXT_TO_IMAGE");
   const [models, setModels] = useState([]);
+  const [profile, setProfile] = useState("LOCAL");
   const [modelId, setModelId] = useState("");
   const [prompt, setPrompt] = useState("Une voiture volante traverse une ville futuriste au coucher du soleil, ambiance cinématographique.");
   const [negativePrompt, setNegativePrompt] = useState("");
@@ -26,12 +27,25 @@ export default function ImagesPage() {
 
   // Seuls les modèles image réellement installés et compatibles apparaissent.
   useEffect(() => {
-    apiFetch("/api/models?category=IMAGE&installed=true&compatible=true&limit=60").then((catalog) => {
+    Promise.all([
+      apiFetch("/api/models?category=IMAGE&installed=true&compatible=true&limit=60&sort=compatibility"),
+      apiFetch("/api/ready"),
+    ]).then(([catalog, readiness]) => {
       const available = (catalog.items || catalog).filter((model) => model.kind === "IMAGE" && model.installed && model.compatible);
+      setProfile(readiness.profile || "LOCAL");
       setModels(available);
-      setModelId(available[0]?.id || "");
     }).catch((requestError) => setError(requestError.message));
   }, []);
+
+  // En production GPU, les moteurs procéduraux ne sont jamais proposés comme
+  // substitut silencieux. La capacité doit être déclarée par la matrice runtime.
+  const availableModels = useMemo(() => models.filter((model) =>
+    model.runtime_capabilities?.includes(mode)
+      && (profile !== "GPU_PRODUCTION" || model.engine_type === "ai")
+  ), [mode, models, profile]);
+  const selectedModelId = availableModels.some((model) => model.id === modelId)
+    ? modelId
+    : availableModels[0]?.id || "";
 
   // Un seul WebSocket reçoit la progression de toutes les générations. L'UUID
   // permet d'ignorer proprement les événements appartenant à une autre page.
@@ -70,7 +84,7 @@ export default function ImagesPage() {
         method: "POST",
         body: JSON.stringify({
           mode, prompt, negative_prompt: negativePrompt || null,
-          model_id: modelId, input_asset_id: mode === "IMAGE_TO_IMAGE" ? sourceAsset.id : null,
+          model_id: selectedModelId, input_asset_id: mode === "IMAGE_TO_IMAGE" ? sourceAsset.id : null,
         }),
       });
       setGeneration(created);
@@ -81,7 +95,7 @@ export default function ImagesPage() {
     <div className={styles.page}>
       <header className={styles.pageHeading}>
         <div><h1><BsStars /> Génération d’image</h1><p>Créez des images à partir d’un texte ou transformez une image existante.</p></div>
-        <div className={styles.creditBadge}><span>Runtime</span><strong>Local & privé</strong></div>
+        <div className={styles.creditBadge}><span>Runtime</span><strong>{profile === "GPU_PRODUCTION" ? "CUDA Worker privé" : "Local & privé"}</strong></div>
       </header>
       {error && <div className={styles.errorBanner} role="alert">{error}</div>}
 
@@ -106,20 +120,21 @@ export default function ImagesPage() {
 
           <label className={styles.formGroup}><span>Prompt <small>{prompt.length} / 1000</small></span><textarea maxLength={1000} rows={5} value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
           <label className={styles.formGroup}><span>Prompt négatif <small>(optionnel)</small></span><textarea maxLength={1000} rows={2} value={negativePrompt} onChange={(event) => setNegativePrompt(event.target.value)} placeholder="flou, texte, watermark…" /></label>
-          <label className={styles.formGroup}><span>Modèle</span><select value={modelId} onChange={(event) => setModelId(event.target.value)}>{models.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</select></label>
+          <label className={styles.formGroup}><span>Modèle</span><select value={selectedModelId} onChange={(event) => setModelId(event.target.value)}>{availableModels.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.engine}</option>)}</select></label>
+          {!availableModels.length && <div className={styles.warningBanner}>Aucun modèle {mode.replaceAll("_", " → ")} installé et READY. Le pipeline n’est pas remplacé par une génération factice.</div>}
 
           <div className={styles.presetGrid}>
             <div className={styles.selectedPreset}><BsCheckCircleFill /><strong>Réaliste</strong><small>Style</small></div>
             <div><strong>1:1</strong><small>Ratio</small></div>
             <div><strong>1024p</strong><small>Qualité</small></div>
           </div>
-          <button className={styles.generateButton} disabled={busy || uploading || !modelId || prompt.trim().length < 3}><BsStars /> {busy ? "Génération en cours…" : "Générer l’image"}</button>
+          <button className={styles.generateButton} disabled={busy || uploading || !selectedModelId || prompt.trim().length < 3}><BsStars /> {busy ? "Génération en cours…" : "Générer l’image"}</button>
           <p className={styles.costNote}>Exécution locale · aucun crédit externe utilisé</p>
         </form>
 
         <section className={styles.resultPanel}>
           <div className={styles.resultMeta}>
-            <div><span>Modèle</span><strong>{models.find((model) => model.id === modelId)?.name || "—"}</strong></div>
+            <div><span>Modèle</span><strong>{availableModels.find((model) => model.id === selectedModelId)?.name || "—"}</strong></div>
             <div><span>Progression</span><strong>{generation?.progress || 0} %</strong></div>
             <div><span>Statut</span><strong className={generation?.status === "completed" ? styles.statusReady : ""}>{generation?.status || "Prêt"}</strong></div>
           </div>

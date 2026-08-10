@@ -243,7 +243,10 @@ un snapshot, puis produire et relire un vrai PNG :
 
 ```bash
 export VIDIOAI_SMOKE_PROFILE=GPU_PRODUCTION
-export VIDIOAI_SMOKE_AI_MODEL_ID=stable-image-core
+# Facultatif : sans cette variable, le smoke test sélectionne dynamiquement le
+# premier modèle IMAGE public, installable et compatible. Si elle est fournie,
+# sa valeur doit être l'identifiant Hugging Face complet organisation/modèle.
+export VIDIOAI_SMOKE_AI_MODEL_ID=stabilityai/sd-turbo
 ./deploy/scripts/smoke-test.sh http://127.0.0.1:8080
 ```
 

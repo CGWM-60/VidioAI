@@ -76,9 +76,16 @@ services:
     environment:
       APP_ENV: LOCAL
       GPU_REQUIRED: "false"
-      HF_HOME: /models/huggingface
+      HF_HOME: /data/cache/huggingface
+      HF_HUB_CACHE: /data/cache/huggingface/hub
+      HUGGINGFACE_HUB_CACHE: /data/cache/huggingface/hub
+      TRANSFORMERS_CACHE: /data/cache/huggingface/transformers
+      DIFFUSERS_CACHE: /data/cache/huggingface/diffusers
+      TORCH_HOME: /data/cache/torch
+      XDG_CACHE_HOME: /data/cache/xdg
+      TMPDIR: /data/worker-work
       VIDIOAI_MODELS_DIR: /models
-      VIDIOAI_WORK_DIR: /worker-work
+      VIDIOAI_WORK_DIR: /data/worker-work
       VIDIOAI_OUTPUTS_DIR: /data/work
 
     volumes:

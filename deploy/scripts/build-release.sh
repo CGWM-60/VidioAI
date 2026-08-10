@@ -4,6 +4,7 @@ set -Eeuo pipefail
 # Construit et publie les trois images applicatives. À exécuter en CI ou sur une
 # machine de build, jamais sur l'Instance GPU de production.
 PROJECT_DIR=${VIDIOAI_PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
+source "${PROJECT_DIR}/deploy/scripts/lib/s3-paths.sh"
 VERSION=${1:?Usage: build-release.sh <version-immuable>}
 REGISTRY=${VIDIOAI_REGISTRY:?VIDIOAI_REGISTRY requis}
 PLATFORM=${VIDIOAI_PLATFORM:-linux/amd64}
@@ -63,16 +64,19 @@ jq -n --arg version "${VERSION}" --arg registry "${REGISTRY}" \
   deploy/bin/vidioai-host-agent deploy/systemd/vidioai-host-agent.service > SHA256SUMS)
 tar -C "${PROJECT_DIR}/output" -czf "${PROJECT_DIR}/output/vidioai-release-${VERSION}.tar.gz" "release-${VERSION}"
 if [[ -n "${AWS_S3_BUCKET:-}" ]]; then
+  vidioai_validate_s3_bucket "${AWS_S3_BUCKET}"
+  DEPLOYMENT_URI=$(vidioai_release_uri "${AWS_S3_BUCKET}" "${VERSION}" deployment.tar.gz)
+  MANIFEST_URI=$(vidioai_release_uri "${AWS_S3_BUCKET}" "${VERSION}" release.json)
   AWS_ENDPOINT_ARGS=()
   if [[ -n "${AWS_ENDPOINT_URL_S3:-}" ]]; then
     AWS_ENDPOINT_ARGS=(--endpoint-url "${AWS_ENDPOINT_URL_S3}")
   fi
   aws s3 cp "${PROJECT_DIR}/output/vidioai-release-${VERSION}.tar.gz" \
-    "s3://${AWS_S3_BUCKET}/releases/${VERSION}/deployment.tar.gz" \
+    "${DEPLOYMENT_URI}" \
     --storage-class "${AWS_S3_STORAGE_CLASS:-STANDARD}" \
     "${AWS_ENDPOINT_ARGS[@]}"
   aws s3 cp "${RELEASE_DIR}/release.json" \
-    "s3://${AWS_S3_BUCKET}/releases/${VERSION}/release.json" \
+    "${MANIFEST_URI}" \
     --storage-class "${AWS_S3_STORAGE_CLASS:-STANDARD}" \
     "${AWS_ENDPOINT_ARGS[@]}"
 fi

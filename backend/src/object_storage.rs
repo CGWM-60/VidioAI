@@ -46,6 +46,11 @@ impl S3Storage {
         if self.bucket.is_empty() {
             return Err("AWS_S3_BUCKET est obligatoire quand S3 est activé".to_owned());
         }
+        if self.bucket.contains('/') || self.bucket.starts_with("s3://") {
+            return Err(
+                "AWS_S3_BUCKET doit être un nom de bucket sans schéma ni préfixe".to_owned(),
+            );
+        }
         let mut command = Command::new("aws");
         command
             .args(args)
@@ -113,5 +118,22 @@ impl ObjectStorage for S3Storage {
             &self.storage_class,
         ])
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::S3Storage;
+
+    #[tokio::test]
+    async fn a_bucket_prefixed_with_itself_is_rejected_before_aws_is_called() {
+        let storage = S3Storage {
+            enabled: true,
+            bucket: "vidioai-production/vidioai-production".into(),
+            endpoint: None,
+            storage_class: "STANDARD".into(),
+        };
+        let error = storage.aws(&["s3api", "head-bucket"]).await.unwrap_err();
+        assert!(error.contains("sans schéma ni préfixe"));
     }
 }

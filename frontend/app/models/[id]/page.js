@@ -1,8 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { useParams, useRouter } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
+import { Suspense, useCallback, useEffect, useState } from "react";
 import { BsArrowLeft, BsCheck2, BsCloudDownload, BsCpu, BsPlay, BsStop } from "react-icons/bs";
 import { apiFetch } from "../../lib/api";
 import styles from "../../studio.module.css";
@@ -27,22 +27,22 @@ function sourceLabel(hardware) {
   return "Informations matérielles insuffisantes";
 }
 
-/** Page de détail entièrement alimentée par GET /api/models/{id}. */
-export default function ModelDetailsPage() {
+/** Page de détail alimentée par la route query-safe `/api/models/by-id`. */
+function ModelDetailsContent() {
   const { id } = useParams();
+  const queryModelId = useSearchParams().get("model_id");
   const router = useRouter();
-  // Next conserve le slash encodé dans le segment dynamique. On normalise une
-  // seule fois avant de construire l'URL API, sinon `%2F` devient `%252F`.
-  const modelId = decodeURIComponent(id);
-  const apiId = encodeURIComponent(modelId);
+  // La query string est canonique pour les repositories organisation/modèle.
+  // Le segment dynamique reste toléré pour les anciens liens et moteurs locaux.
+  const modelId = queryModelId || decodeURIComponent(id || "");
   const [model, setModel] = useState(null);
   const [runtimeBusy, setRuntimeBusy] = useState(false);
   const [error, setError] = useState("");
 
   const refresh = useCallback(async () => {
-    try { setModel(await apiFetch(`/api/models/${apiId}`)); setError(""); }
+    try { setModel(await apiFetch(`/api/models/by-id?model_id=${encodeURIComponent(modelId)}`)); setError(""); }
     catch (requestError) { setError(requestError.message); }
-  }, [apiId]);
+  }, [modelId]);
 
   useEffect(() => {
     const request = Promise.resolve().then(refresh);
@@ -51,7 +51,13 @@ export default function ModelDetailsPage() {
 
   async function changeRuntime(action) {
     setRuntimeBusy(true);
-    try { await apiFetch(`/api/models/${apiId}/${action}`, { method: "POST" }); await refresh(); }
+    try {
+      await apiFetch(`/api/models/${action}`, {
+        method: "POST",
+        body: JSON.stringify({ model_id: modelId }),
+      });
+      await refresh();
+    }
     catch (requestError) { setError(requestError.message); }
     finally { setRuntimeBusy(false); }
   }
@@ -63,7 +69,7 @@ export default function ModelDetailsPage() {
         method: "POST",
         body: JSON.stringify({ model_id: model.id, revision: model.revision }),
       });
-      router.push(`/models/${encodeURIComponent(model.id)}/install?job=${job.id}`);
+      router.push(`/models/install?model_id=${encodeURIComponent(model.id)}&job=${job.id}`);
     } catch (requestError) { setError(requestError.message); setRuntimeBusy(false); }
   }
 
@@ -90,6 +96,18 @@ export default function ModelDetailsPage() {
       <section className={styles.largePanel}>
         <h2>Capacités</h2>
         <div className={styles.capabilityCards}>{model.capabilities.map((item) => <span key={item}><BsCheck2 /> {item.replaceAll("_", " ")}</span>)}</div>
+      </section>
+      <section className={styles.largePanel}>
+        <h2>Pourquoi ce modèle est-il utilisable ou non ?</h2>
+        <div className={styles.compatibilityChecks}>
+          {model.compatibility_checks.map((check) => (
+            <div className={check.ok ? styles.compatibilityOk : styles.compatibilityKo} key={check.key}>
+              <strong>{check.ok ? "✓" : "✕"} {check.label}</strong>
+              <span>{check.detail}</span>
+            </div>
+          ))}
+        </div>
+        <p className={styles.measuredNote}>Pipeline détecté : {model.pipeline_class || model.pipeline_tag || "non déterminé"}</p>
       </section>
       <section className={`${styles.largePanel} ${styles.hardwarePanel}`} title="Les estimations sont calculées à partir des poids et de la configuration Hugging Face. La consommation réelle varie selon la résolution et les paramètres de génération.">
         <div className={styles.hardwareHeading}>
@@ -120,8 +138,12 @@ export default function ModelDetailsPage() {
       <div className={styles.footerActions}>
         {model.installed && !model.loaded && <button className={styles.primaryButton} disabled={runtimeBusy} onClick={() => changeRuntime("load")}><BsPlay /> Charger le modèle</button>}
         {model.loaded && <button className={styles.secondaryButton} disabled={runtimeBusy} onClick={() => changeRuntime("unload")}><BsStop /> Décharger</button>}
-        {!model.installed && <button className={styles.primaryButton} disabled={!model.installable || runtimeBusy} onClick={startInstall}><BsCloudDownload /> {model.gated ? "Accès Hugging Face requis" : model.runtime_supported ? "Installer cette révision" : "Runtime non supporté"}</button>}
+        {!model.installed && <button className={styles.primaryButton} disabled={!model.installable || runtimeBusy} onClick={startInstall}><BsCloudDownload /> {model.gated && !model.access_authorized ? "Accès Hugging Face requis" : model.runtime_supported ? "Installer cette révision" : "Pipeline non implémenté"}</button>}
       </div>
     </div>
   );
+}
+
+export default function ModelDetailsPage() {
+  return <Suspense fallback={<div className={styles.page}><div className={styles.stateCard}>Chargement du modèle…</div></div>}><ModelDetailsContent /></Suspense>;
 }

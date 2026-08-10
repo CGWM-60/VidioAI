@@ -112,10 +112,6 @@ impl HostSnapshot {
         self.gpus.iter().find(|gpu| gpu.is_nvidia())
     }
 
-    pub fn total_ram_bytes(&self) -> Option<u64> {
-        self.ram.total_bytes
-    }
-
     pub fn total_vram_bytes(&self) -> Option<u64> {
         self.gpus
             .iter()

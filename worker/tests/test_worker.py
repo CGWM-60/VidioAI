@@ -111,7 +111,7 @@ def test_valid_l3_snapshot_is_reused_without_hugging_face_call(tmp_path: Path) -
     status = manager.install_model(
         "stable-image-core",
         "stabilityai/sd-turbo",
-        "main",
+        "commit-sha",
         ["TEXT_TO_IMAGE"],
     )
     assert status["state"] == "INSTALLED"

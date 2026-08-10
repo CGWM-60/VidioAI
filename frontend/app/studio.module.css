@@ -334,6 +334,20 @@
 .projectGrid span { color: #74839a; font-size: 10px; }
 .projectGrid article > button { position: absolute; right: 13px; bottom: 13px; color: #dc8092; border: 0; background: transparent; }
 
+/* La compatibilité reste lisible dans la carte compacte puis détaillée sur la
+   fiche. Le texte peut revenir à la ligne afin de ne jamais créer de scroll
+   horizontal avec un nom de pipeline ou de repository très long. */
+.compactCompatibility { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 7px; }
+.compactCompatibility span { padding: 4px 7px; border: 1px solid var(--border); border-radius: 999px; font-size: 10px; }
+.checkGood { color: #61df99; background: rgba(48, 190, 116, .08); }
+.checkBad { color: #f2a5b0; background: rgba(221, 91, 111, .08); }
+.runtimeReason { display: block; max-width: 760px; margin-top: 7px; color: #d2b7ff; overflow-wrap: anywhere; }
+.compatibilityChecks { display: grid; gap: 10px; margin-top: 16px; }
+.compatibilityChecks > div { display: grid; grid-template-columns: minmax(170px, .35fr) 1fr; gap: 14px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; }
+.compatibilityChecks span { color: #aeb9ca; overflow-wrap: anywhere; }
+.compatibilityOk strong { color: #61df99; }
+.compatibilityKo strong { color: #f2a5b0; }
+
 /* La sidebar consomme 252 px : dès 1400 px de viewport, le contenu restant est
    trop étroit pour quatre colonnes. On replie alors les actions afin d'éviter
    toute barre de défilement horizontale. */
@@ -392,4 +406,5 @@
   .projectCreate { flex-direction: column; }
   .dashboardRecent article { grid-template-columns: 1fr auto; }
   .dashboardRecent article small { display: none; }
+  .compatibilityChecks > div { grid-template-columns: 1fr; gap: 5px; }
 }

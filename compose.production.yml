@@ -62,10 +62,20 @@ services:
       VIDIOAI_MODELS_DIR: /models
       VIDIOAI_WORK_DIR: /worker-work
       VIDIOAI_OUTPUTS_DIR: /work
-      HF_HOME: /models/huggingface
+      # Tous les caches et temporaires lourds pointent vers le Scratch hôte.
+      # `/models` ne contient que les snapshots atomiques activés par VidioAI.
+      HF_HOME: /cache/huggingface
+      HF_HUB_CACHE: /cache/huggingface/hub
+      HUGGINGFACE_HUB_CACHE: /cache/huggingface/hub
+      TRANSFORMERS_CACHE: /cache/huggingface/transformers
+      DIFFUSERS_CACHE: /cache/huggingface/diffusers
+      TORCH_HOME: /cache/torch
+      XDG_CACHE_HOME: /cache/xdg
+      TMPDIR: /worker-work
       HF_TOKEN: ${HF_TOKEN:-}
     volumes:
       - ${VIDIOAI_SCRATCH_DIR:-/var/lib/vidioai/scratch}/models:/models
+      - ${VIDIOAI_SCRATCH_DIR:-/var/lib/vidioai/scratch}/cache:/cache
       - ${VIDIOAI_SCRATCH_DIR:-/var/lib/vidioai/scratch}/worker-work:/worker-work
       - ${VIDIOAI_SCRATCH_DIR:-/var/lib/vidioai/scratch}/work:/work
     expose: ["8000"]

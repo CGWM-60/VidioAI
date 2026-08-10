@@ -334,12 +334,22 @@ pub struct ModelView {
     /// capacités du modèle. Les modèles vidéo restent catalogués sans être
     /// présentés comme installables par le runtime T2I actuel.
     pub runtime_supported: bool,
+    /// Justification fournie par la matrice pipeline/library/architecture.
+    pub runtime_reason: String,
+    pub pipeline_class: Option<String>,
+    pub runtime_capabilities: Vec<ModelCapability>,
     /// Alias métier explicite demandé par le contrat catalogue.
     pub vidioai_supported: bool,
     pub source_available: bool,
     pub hardware_compatible: bool,
+    /// Capacités libres observées au moment de la réponse. Elles expliquent la
+    /// décision et ne doivent pas être confondues avec la capacité physique.
+    pub available_ram_bytes: u64,
+    pub available_vram_bytes: u64,
     pub installable: bool,
+    pub compatibility_checks: Vec<CompatibilityCheck>,
     pub accessibility: String,
+    pub access_authorized: bool,
     pub gated: bool,
     pub private: bool,
     pub author: Option<String>,
@@ -360,6 +370,16 @@ pub struct ModelView {
     /// Objet normalisé détaillant la provenance et les fourchettes. Le frontend
     /// n'a plus à interpréter une variante comme une mesure exacte.
     pub hardware: HardwareEstimate,
+}
+
+/// Une décision de compatibilité est exposée comme une liste de contrôles
+/// lisibles plutôt qu'un opaque « supporté/non supporté ».
+#[derive(Debug, Clone, Serialize)]
+pub struct CompatibilityCheck {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub ok: bool,
+    pub detail: String,
 }
 
 // -----------------------------------------------------------------------------
@@ -890,7 +910,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/chats/{id}/messages", post(send_chat_message))
         .route("/models", get(get_models))
         .route("/models/catalog/refresh", post(refresh_models))
+        // Les routes query/body sont la forme canonique : un ID Hugging Face
+        // contient un slash et ne doit pas dépendre du décodage du reverse proxy.
+        .route(
+            "/models/by-id",
+            get(get_model_from_query).delete(delete_model_from_query),
+        )
         .route("/models/install", post(install_model_from_body))
+        .route("/models/load", post(load_model_from_body))
+        .route("/models/unload", post(unload_model_from_body))
+        // Compatibilité conservée pour les anciens clients et les IDs locaux
+        // sans slash. Les nouvelles interfaces n'utilisent plus ces routes.
         .route("/models/{id}", get(get_model).delete(delete_model))
         .route("/models/{id}/install", post(install_model))
         .route("/models/{id}/load", post(load_model))
@@ -1860,9 +1890,69 @@ async fn record_worker_benchmark(
     }
 }
 
+/// Instantané partagé par toutes les cartes d'une même réponse catalogue. Sans
+/// ce contexte, une page de 20 modèles interrogerait 20 fois le Host Agent et
+/// le Worker, avec des résultats susceptibles de varier au milieu de la liste.
+struct ModelMachineContext {
+    profile: HostSnapshot,
+    runtime_available: bool,
+    cuda_available: bool,
+    available_ram_bytes: u64,
+    available_vram_bytes: u64,
+}
+
+async fn model_machine_context(state: &AppState) -> ModelMachineContext {
+    let host = resolve_system(state.host_agent.as_ref());
+    let worker = async {
+        let Some(worker) = &state.worker else {
+            return (None, None);
+        };
+        // La disponibilité globale CUDA ne dépend jamais de l'installation du
+        // modèle affiché. C'était la cause des faux « non supporté » du catalogue.
+        let (ready, resources) = tokio::join!(worker.ready(), worker.resources());
+        (ready.ok(), resources.ok())
+    };
+    let ((profile, _), (ready, resources)) = tokio::join!(host, worker);
+    let available_ram_bytes = profile
+        .ram
+        .available_bytes
+        .or(profile.ram.total_bytes)
+        .unwrap_or(u64::MAX);
+    let available_vram_bytes = resources
+        .as_ref()
+        .and_then(|value| value.gpu.as_ref())
+        .map(|gpu| gpu.vram_total_bytes.saturating_sub(gpu.vram_used_bytes))
+        .or_else(|| {
+            profile
+                .physical_nvidia()
+                .and_then(|gpu| gpu.vram_available_bytes.or(gpu.vram_total_bytes))
+        })
+        .unwrap_or_default();
+    ModelMachineContext {
+        profile,
+        runtime_available: ready
+            .as_ref()
+            .is_some_and(|status| status.runtime_available),
+        cuda_available: ready
+            .as_ref()
+            .is_some_and(|status| status.ready && status.cuda_available),
+        available_ram_bytes,
+        available_vram_bytes,
+    }
+}
+
 /// Enrichit les métadonnées publiques avec l'état du disque, du runtime et les
 /// ressources réellement disponibles sur la machine courante.
 async fn model_view(state: &AppState, entry: &CatalogEntry) -> ModelView {
+    let machine = model_machine_context(state).await;
+    model_view_with_machine(state, entry, &machine).await
+}
+
+async fn model_view_with_machine(
+    state: &AppState,
+    entry: &CatalogEntry,
+    machine: &ModelMachineContext,
+) -> ModelView {
     let installed_revision = installed_revision(state, entry).await;
     let installed = entry.local || installed_revision.is_some();
     let worker_status = if !entry.local && installed {
@@ -1882,9 +1972,8 @@ async fn model_view(state: &AppState, entry: &CatalogEntry) -> ModelView {
                 && status.runtime_compatible
                 && status.validation_test
         });
-    let (machine_profile, _) = resolve_system(state.host_agent.as_ref()).await;
-    let available_ram = machine_profile.total_ram_bytes().unwrap_or(u64::MAX);
-    let available_vram = machine_profile.total_vram_bytes().unwrap_or_default();
+    let available_ram = machine.available_ram_bytes;
+    let available_vram = machine.available_vram_bytes;
     // Un benchmark attaché à cette révision remplace l'estimation du Hub. Une
     // mesure d'une ancienne révision ne doit jamais être réutilisée.
     let mut hardware_estimate = entry.hardware.clone();
@@ -1902,16 +1991,15 @@ async fn model_view(state: &AppState, entry: &CatalogEntry) -> ModelView {
             vram_bytes: available_vram,
             // La présence physique CUDA ne suffit pas pour exécuter le modèle.
             // Seul le worker atteste que le runtime est réellement accessible.
-            cuda_available: worker_status
-                .as_ref()
-                .is_some_and(|status| status.runtime_available),
+            cuda_available: machine.cuda_available,
         }),
     );
     let recommended = entry.variants.iter().find(|variant| {
         variant.ram_required <= available_ram
             && (variant.vram_required == 0 || variant.vram_required <= available_vram)
     });
-    let storage_compatible = machine_profile
+    let storage_compatible = machine
+        .profile
         .storage
         .available_bytes
         .is_none_or(|available| {
@@ -1945,6 +2033,78 @@ async fn model_view(state: &AppState, entry: &CatalogEntry) -> ModelView {
         "NOT_INSTALLED".into()
     };
 
+    let runtime_detail = if machine.runtime_available || entry.local {
+        entry.runtime_reason.clone()
+    } else {
+        format!(
+            "{} Runtime Worker indisponible sur cette instance.",
+            entry.runtime_reason
+        )
+    };
+    let access_ok = entry.access_authorized;
+    let compatibility_checks = vec![
+        CompatibilityCheck {
+            key: "source",
+            label: "Source Hugging Face",
+            ok: entry.source_available,
+            detail: if entry.source_available {
+                format!("Repository {} accessible.", entry.repository)
+            } else {
+                "Métadonnées ou fichiers sources indisponibles.".into()
+            },
+        },
+        CompatibilityCheck {
+            key: "access",
+            label: "Droits d'accès",
+            ok: access_ok,
+            detail: if entry.access_authorized && (entry.gated || entry.private) {
+                "HF_TOKEN autorisé : les fichiers de configuration sont accessibles.".into()
+            } else if entry.gated {
+                "Repository gated : HF_TOKEN doit disposer de l'autorisation.".into()
+            } else if entry.private {
+                "Repository privé : HF_TOKEN autorisé requis.".into()
+            } else {
+                "Repository public.".into()
+            },
+        },
+        CompatibilityCheck {
+            key: "hardware",
+            label: "Configuration matérielle",
+            ok: hardware_compatible,
+            detail: format!(
+                "VRAM disponible {:.1} Go · RAM disponible {:.1} Go{}.",
+                available_vram as f64 / 1_073_741_824.0,
+                available_ram as f64 / 1_073_741_824.0,
+                if storage_compatible {
+                    ""
+                } else {
+                    " · espace disque insuffisant"
+                }
+            ),
+        },
+        CompatibilityCheck {
+            key: "runtime",
+            label: "Pipeline VidioAI",
+            ok: entry.runtime_supported && (entry.local || machine.runtime_available),
+            detail: runtime_detail,
+        },
+        CompatibilityCheck {
+            key: "files",
+            label: "Fichiers requis",
+            ok: entry.quality_valid,
+            detail: if entry.quality_valid {
+                "Manifest et poids détectés dans le repository.".into()
+            } else {
+                "Manifest Diffusers ou poids Safetensors incomplets.".into()
+            },
+        },
+    ];
+    let compatible = hardware_compatible
+        && entry.runtime_supported
+        && entry.source_available
+        && entry.quality_valid
+        && (entry.local || machine.runtime_available);
+
     ModelView {
         id: entry.id.clone(),
         name: entry.name.clone(),
@@ -1955,7 +2115,7 @@ async fn model_view(state: &AppState, entry: &CatalogEntry) -> ModelView {
         installed,
         runtime_ready,
         installation_state,
-        compatible: hardware_compatible && entry.runtime_supported,
+        compatible,
         recommended_variant: recommended.map(|variant| variant.id.clone()),
         loaded: state.runtime.read().await.contains_key(&entry.id),
         repository: entry.repository.clone(),
@@ -1974,11 +2134,18 @@ async fn model_view(state: &AppState, entry: &CatalogEntry) -> ModelView {
             .unwrap_or_else(|| "Non supporté".into()),
         engine_type: if entry.local { "procedural" } else { "ai" }.into(),
         runtime_supported: entry.runtime_supported,
+        runtime_reason: entry.runtime_reason.clone(),
+        pipeline_class: entry.pipeline_class.clone(),
+        runtime_capabilities: entry.runtime_capabilities.clone(),
         vidioai_supported: entry.runtime_supported,
         source_available: entry.source_available,
         hardware_compatible,
-        installable: entry.installable && hardware_compatible,
+        available_ram_bytes: available_ram,
+        available_vram_bytes: available_vram,
+        installable: entry.installable && compatible && access_ok,
+        compatibility_checks,
         accessibility: entry.accessibility.clone(),
+        access_authorized: entry.access_authorized,
         gated: entry.gated,
         private: entry.private,
         author: entry.author.clone(),
@@ -2070,11 +2237,12 @@ async fn get_models(
     let mut entries = local_runtime_models();
     entries.extend(result.models);
     let mut views = Vec::with_capacity(entries.len());
+    let machine = model_machine_context(&state).await;
     for entry in entries {
         if !entry_matches_query(&entry, &query) {
             continue;
         }
-        let view = model_view(&state, &entry).await;
+        let view = model_view_with_machine(&state, &entry, &machine).await;
         if query
             .installed
             .is_some_and(|expected| view.installed != expected)
@@ -2132,8 +2300,29 @@ async fn get_model(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ModelView>, ApiError> {
-    let entry = resolve_model(&state, &id).await?;
-    Ok(Json(model_view(&state, &entry).await))
+    get_model_by_id(&state, &id).await
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelIdQuery {
+    model_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelActionInput {
+    model_id: String,
+}
+
+async fn get_model_from_query(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ModelIdQuery>,
+) -> Result<Json<ModelView>, ApiError> {
+    get_model_by_id(&state, &query.model_id).await
+}
+
+async fn get_model_by_id(state: &AppState, id: &str) -> Result<Json<ModelView>, ApiError> {
+    let entry = resolve_model(state, id).await?;
+    Ok(Json(model_view(state, &entry).await))
 }
 
 async fn install_model(
@@ -2174,10 +2363,13 @@ async fn start_model_install(
         entry.revision = revision;
     }
     let view = model_view(&state, &entry).await;
-    if view.installed {
+    // Une installation déjà à la révision courante est idempotemment refusée,
+    // mais une révision distante plus récente suit le même job atomique : c'est
+    // la voie de mise à jour, sans route spéciale ni perte de l'ID original.
+    if view.installed && !view.update_available {
         return Err(ApiError::conflict("Ce modèle est déjà installé."));
     }
-    if entry.gated || entry.private {
+    if (entry.gated || entry.private) && !entry.access_authorized {
         return Err(ApiError::unauthorized(
             "Ce modèle nécessite un accès Hugging Face autorisé via HF_TOKEN.",
         ));
@@ -2189,7 +2381,7 @@ async fn start_model_install(
     }
     if !view.compatible {
         return Err(ApiError::conflict(
-            "Ce modèle n'est pas compatible avec cette machine.",
+            "Ce modèle n'est pas installable ; consultez compatibility_checks pour la cause précise.",
         ));
     }
 
@@ -2213,8 +2405,40 @@ async fn start_model_install(
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
 
-/// Worker d'installation : téléchargement en flux, progression, vérification par
-/// SHA-256, installation atomique et marqueur final réellement écrit sur disque.
+/// Mesure les octets effectivement présents dans le staging du Worker. Cette
+/// valeur alimente la progression pendant que `snapshot_download` s'exécute ;
+/// aucun compteur temporel ou pourcentage simulé n'est utilisé.
+async fn staged_download_bytes(models_dir: &FilePath, storage_id: &str) -> u64 {
+    let downloads = models_dir.join(".downloads");
+    let prefix = format!("download-{storage_id}-");
+    let mut roots = Vec::new();
+    let Ok(mut entries) = fs::read_dir(downloads).await else {
+        return 0;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            roots.push(entry.path());
+        }
+    }
+    let mut bytes = 0_u64;
+    while let Some(path) = roots.pop() {
+        if let Ok(metadata) = fs::metadata(&path).await {
+            if metadata.is_file() {
+                bytes = bytes.saturating_add(metadata.len());
+            } else if metadata.is_dir()
+                && let Ok(mut children) = fs::read_dir(path).await
+            {
+                while let Ok(Some(child)) = children.next_entry().await {
+                    roots.push(child.path());
+                }
+            }
+        }
+    }
+    bytes
+}
+
+/// Worker d'installation : téléchargement en flux, progression mesurée sur le
+/// staging, vérification par SHA-256, installation atomique et état READY.
 async fn run_install(state: Arc<AppState>, job: Job, entry: CatalogEntry) {
     let result: Result<(), String> = async {
         let worker = state.worker.as_ref().ok_or_else(|| {
@@ -2249,9 +2473,45 @@ async fn run_install(state: Arc<AppState>, job: Job, entry: CatalogEntry) {
                 "Téléchargement atomique du snapshot Hugging Face",
             )
             .await;
-        let installed = worker
-            .install(&entry.storage_id, &entry.repository, &entry.revision)
-            .await?;
+        let mut installation = Box::pin(worker.install(
+            &entry.storage_id,
+            &entry.repository,
+            &entry.revision,
+        ));
+        let installed = loop {
+            tokio::select! {
+                result = &mut installation => break result?,
+                _ = sleep(Duration::from_secs(2)) => {
+                    let downloaded = staged_download_bytes(&settings.models_dir, &entry.storage_id).await;
+                    if downloaded > 0 {
+                        let progress = entry.estimated_size_bytes
+                            .filter(|total| *total > 0)
+                            .map(|total| 20 + ((downloaded.min(total) as f64 / total as f64) * 54.0) as u8)
+                            .unwrap_or(35)
+                            .min(74);
+                        let message = if let Some(total) = entry.estimated_size_bytes {
+                            format!(
+                                "Snapshot Hugging Face : {:.1} / {:.1} Go reçus",
+                                downloaded as f64 / 1_073_741_824.0,
+                                total as f64 / 1_073_741_824.0,
+                            )
+                        } else {
+                            format!(
+                                "Snapshot Hugging Face : {:.1} Go reçus (taille totale inconnue)",
+                                downloaded as f64 / 1_073_741_824.0,
+                            )
+                        };
+                        state.update_job(
+                            job.id,
+                            JobStatus::Running,
+                            "downloading",
+                            progress,
+                            &message,
+                        ).await;
+                    }
+                }
+            }
+        };
         if !installed.installed || !installed.weights_valid {
             return Err("Le worker n'a pas validé les poids téléchargés.".into());
         }
@@ -2331,7 +2591,18 @@ async fn delete_model(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let entry = resolve_model(&state, &id).await?;
+    delete_model_by_id(&state, &id).await
+}
+
+async fn delete_model_from_query(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ModelIdQuery>,
+) -> Result<StatusCode, ApiError> {
+    delete_model_by_id(&state, &query.model_id).await
+}
+
+async fn delete_model_by_id(state: &AppState, id: &str) -> Result<StatusCode, ApiError> {
+    let entry = resolve_model(state, id).await?;
     if entry.local {
         return Err(ApiError::conflict(
             "Le moteur intégré ne peut pas être supprimé.",
@@ -2340,7 +2611,7 @@ async fn delete_model(
     if let Some(worker) = &state.worker {
         let _ = worker.unload(&entry.storage_id).await;
     }
-    state.runtime.write().await.remove(&id);
+    state.runtime.write().await.remove(id);
     let directory = state
         .settings
         .get()
@@ -2360,8 +2631,19 @@ async fn load_model(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<RuntimeEntry>, ApiError> {
-    let entry = resolve_model(&state, &id).await?;
-    let view = model_view(&state, &entry).await;
+    load_model_by_id(&state, &id).await
+}
+
+async fn load_model_from_body(
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<ModelActionInput>,
+) -> Result<Json<RuntimeEntry>, ApiError> {
+    load_model_by_id(&state, &input.model_id).await
+}
+
+async fn load_model_by_id(state: &AppState, id: &str) -> Result<Json<RuntimeEntry>, ApiError> {
+    let entry = resolve_model(state, id).await?;
+    let view = model_view(state, &entry).await;
     if !view.installed {
         return Err(ApiError::conflict(
             "Installez le modèle avant de le charger.",
@@ -2372,7 +2654,7 @@ async fn load_model(
             "La mémoire disponible est insuffisante.",
         ));
     }
-    if let Some(existing) = state.runtime.read().await.get(&id).cloned() {
+    if let Some(existing) = state.runtime.read().await.get(id).cloned() {
         return Ok(Json(existing));
     }
     if !entry.local {
@@ -2390,10 +2672,10 @@ async fn load_model(
             ));
         }
         if let Some(observation) = &status.benchmark {
-            record_worker_benchmark(&state, &entry.id, &entry.revision, observation).await;
+            record_worker_benchmark(state, &entry.id, &entry.revision, observation).await;
         }
         let runtime = RuntimeEntry {
-            model_id: id.clone(),
+            model_id: id.to_owned(),
             state: "ready".into(),
             device: "GPU".into(),
             ram_bytes: 0,
@@ -2403,7 +2685,11 @@ async fn load_model(
                 .map_or(0, |variant| variant.vram_required),
             last_used_at: unix_now(),
         };
-        state.runtime.write().await.insert(id, runtime.clone());
+        state
+            .runtime
+            .write()
+            .await
+            .insert(id.to_owned(), runtime.clone());
         state.emit("resources.updated", &runtime);
         return Ok(Json(runtime));
     }
@@ -2414,7 +2700,7 @@ async fn load_model(
         .find(|variant| variant.id == variant_id)
         .unwrap_or(&entry.variants[0]);
     let runtime = RuntimeEntry {
-        model_id: id.clone(),
+        model_id: id.to_owned(),
         state: "warming_up".into(),
         device: if variant.vram_required > 0 {
             "GPU".into()
@@ -2425,10 +2711,10 @@ async fn load_model(
         vram_bytes: variant.vram_required,
         last_used_at: unix_now(),
     };
-    state.runtime.write().await.insert(id.clone(), runtime);
+    state.runtime.write().await.insert(id.to_owned(), runtime);
     sleep(Duration::from_millis(180)).await;
     let mut runtimes = state.runtime.write().await;
-    let ready = runtimes.get_mut(&id).expect("runtime inséré");
+    let ready = runtimes.get_mut(id).expect("runtime inséré");
     ready.state = "ready".into();
     let ready = ready.clone();
     state.emit("resources.updated", &ready);
@@ -2439,16 +2725,27 @@ async fn unload_model(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    unload_model_by_id(&state, &id).await
+}
+
+async fn unload_model_from_body(
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<ModelActionInput>,
+) -> Result<StatusCode, ApiError> {
+    unload_model_by_id(&state, &input.model_id).await
+}
+
+async fn unload_model_by_id(state: &AppState, id: &str) -> Result<StatusCode, ApiError> {
     if let Some(worker) = &state.worker {
         // Une réponse « non installé » est acceptable : le registre local reste
         // tout de même nettoyé. Les autres erreurs indiquent un worker coupé.
-        let _ = worker.unload(&storage_id(&id)).await;
+        let _ = worker.unload(&storage_id(id)).await;
     }
     state
         .runtime
         .write()
         .await
-        .remove(&id)
+        .remove(id)
         .ok_or_else(|| ApiError::not_found("Ce modèle n'est pas chargé."))?;
     state.emit(
         "resources.updated",
@@ -2935,10 +3232,21 @@ async fn generate_image(
             "input_asset_id est obligatoire en Image → Image.",
         ));
     }
-    let model_id = request
-        .model_id
-        .unwrap_or_else(|| "vidio-canvas-local".into());
+    let model_id = match request.model_id {
+        Some(model_id) => model_id,
+        None if state.profile == ApplicationProfile::GpuProduction => {
+            return Err(ApiError::bad_request(
+                "model_id est obligatoire en GPU_PRODUCTION ; aucun moteur procédural ne sera choisi automatiquement.",
+            ));
+        }
+        None => "vidio-canvas-local".into(),
+    };
     let entry = resolve_model(&state, &model_id).await?;
+    if state.profile == ApplicationProfile::GpuProduction && entry.local {
+        return Err(ApiError::conflict(
+            "Les moteurs procéduraux sont désactivés pour la génération d'image GPU_PRODUCTION.",
+        ));
+    }
     let expected_capability = match request.mode {
         GenerationMode::TextToImage => ModelCapability::TextToImage,
         GenerationMode::ImageToImage => ModelCapability::ImageToImage,
@@ -3593,7 +3901,21 @@ async fn get_generation(
 
 #[cfg(test)]
 mod tests {
-    use super::{AppSettings, CanvasEngine, GenerationMode, local_runtime_models};
+    use super::{AppSettings, CanvasEngine, GenerationMode, ModelIdQuery, local_runtime_models};
+
+    #[test]
+    fn query_model_ids_preserve_encoded_hugging_face_slashes() {
+        for repository in [
+            "black-forest-labs/FLUX.1-dev",
+            "stabilityai/stable-diffusion-3.5-large",
+            "stabilityai/stable-video-diffusion-img2vid",
+        ] {
+            let encoded = repository.replace('/', "%2F");
+            let query: ModelIdQuery =
+                serde_urlencoded::from_str(&format!("model_id={encoded}")).unwrap();
+            assert_eq!(query.model_id, repository);
+        }
+    }
 
     #[test]
     fn generation_modes_have_stable_json_names() {

@@ -9,21 +9,19 @@ import styles from "../../../studio.module.css";
 
 const STEPS = [
   ["checking", "Vérification", "Compatibilité et espace disque"],
-  ["downloading", "Téléchargement", "Réception des fichiers"],
-  ["verifying", "Vérification", "Intégrité SHA-256"],
-  ["installing", "Installation", "Mise en place des fichiers"],
-  ["verifying_runtime", "Runtime", "Validation des poids et du moteur"],
-  ["configuring", "Configuration", "Optimisation du runtime"],
-  ["testing", "Test", "Validation de lecture"],
+  ["restoring_cache", "Cache", "Recherche du snapshot S3"],
+  ["downloading", "Téléchargement", "Octets reçus depuis Hugging Face"],
+  ["validating_runtime", "Runtime", "Poids, chargement CUDA et inférence de test"],
+  ["saving_cache", "Sauvegarde", "Publication du snapshot validé vers S3"],
   ["ready", "Prêt à l’emploi", "Démarrage du modèle"],
 ];
 
 /** Suit le job par WebSocket après un unique GET d'amorçage. */
 function InstallContent() {
   const { id } = useParams();
-  const modelId = decodeURIComponent(id);
-  const apiId = encodeURIComponent(modelId);
-  const jobId = useSearchParams().get("job");
+  const searchParams = useSearchParams();
+  const modelId = searchParams.get("model_id") || decodeURIComponent(id || "");
+  const jobId = searchParams.get("job");
   const [model, setModel] = useState(null);
   const [job, setJob] = useState(null);
   const [error, setError] = useState("");
@@ -34,11 +32,11 @@ function InstallContent() {
     if (!jobId) { setError("Identifiant de job absent."); return; }
     try {
       const [modelData, jobData] = await Promise.all([
-        apiFetch(`/api/models/${apiId}`), apiFetch(`/api/jobs/${jobId}`),
+        apiFetch(`/api/models/by-id?model_id=${encodeURIComponent(modelId)}`), apiFetch(`/api/jobs/${jobId}`),
       ]);
       setModel(modelData); setJob(jobData);
     } catch (requestError) { setError(requestError.message); }
-  }, [apiId, jobId]);
+  }, [jobId, modelId]);
 
   useEffect(() => {
     const request = Promise.resolve().then(loadInitialState);
@@ -84,7 +82,7 @@ function InstallContent() {
             <div className={styles.progressRing} style={{ "--progress": `${(job?.progress || 0) * 3.6}deg` }}><strong>{job?.progress || 0}<small>%</small></strong></div>
             <h2>{complete ? "Installation terminée" : job?.status === "failed" ? "Installation échouée" : "Installation en cours…"}</h2>
             <p>{job?.message || "Préparation du worker…"}</p>
-            {complete && <Link className={styles.primaryButton} href={`/models/${encodeURIComponent(modelId)}`}>Ouvrir le modèle</Link>}
+            {complete && <Link className={styles.primaryButton} href={`/models/detail?model_id=${encodeURIComponent(modelId)}`}>Ouvrir le modèle</Link>}
             {job?.status === "failed" && <Link className={styles.secondaryButton} href="/models">Retour au catalogue</Link>}
           </div>
         </div>

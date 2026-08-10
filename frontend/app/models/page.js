@@ -114,7 +114,7 @@ export default function ModelsPage() {
         method: "POST",
         body: JSON.stringify({ model_id: model.id, revision: model.revision }),
       });
-      router.push(`/models/${encodeURIComponent(model.id)}/install?job=${job.id}`);
+      router.push(`/models/install?model_id=${encodeURIComponent(model.id)}&job=${job.id}`);
     } catch (requestError) {
       setError(requestError.message);
       setBusyId("");
@@ -160,6 +160,12 @@ export default function ModelsPage() {
                 </div>
                 <p>{model.description}</p>
                 <small className={styles.hardwareSummary} title={hardwareTooltip(model.hardware)}><BsCpu /> {hardwareSummary(model.hardware)} · {model.compatibility_level.toLowerCase().replaceAll("_", " ")}</small>
+                <div className={styles.compactCompatibility}>
+                  <span className={model.hardware_compatible ? styles.checkGood : styles.checkBad}>{model.hardware_compatible ? "✓" : "✕"} Matériel</span>
+                  <span className={model.runtime_supported ? styles.checkGood : styles.checkBad}>{model.runtime_supported ? "✓" : "✕"} Pipeline runtime</span>
+                  <span className={model.source_available ? styles.checkGood : styles.checkBad}>{model.source_available ? "✓" : "✕"} Source</span>
+                </div>
+                {!model.runtime_supported && <small className={styles.runtimeReason}>{model.runtime_reason}</small>}
                 {model.repository_url && <a className={styles.repositoryLink} href={model.repository_url} target="_blank" rel="noreferrer">Hugging Face · {model.repository}</a>}
               </div>
               <div className={styles.modelSize}>
@@ -168,11 +174,11 @@ export default function ModelsPage() {
               </div>
               <div className={styles.modelActions}>
                 {!model.installed ? (
-                  <button className={styles.primaryButton} title={!model.runtime_supported ? "Runtime VidioAI non disponible" : model.gated ? "Accès Hugging Face requis" : ""} disabled={!model.installable || busyId === model.id} onClick={() => startInstall(model)}>
-                    <BsCloudDownload /> {busyId === model.id ? "Préparation…" : model.gated ? "Accès requis" : model.runtime_supported ? "Installer" : "Non supporté"}
+                  <button className={styles.primaryButton} title={!model.runtime_supported ? model.runtime_reason : model.gated && !model.access_authorized ? "Accès Hugging Face requis" : ""} disabled={!model.installable || busyId === model.id} onClick={() => startInstall(model)}>
+                    <BsCloudDownload /> {busyId === model.id ? "Préparation…" : model.gated && !model.access_authorized ? "Accès requis" : model.runtime_supported ? "Installer" : "Pipeline non implémenté"}
                   </button>
                 ) : <span className={styles.readyBadge}>Prêt</span>}
-                <Link href={`/models/${encodeURIComponent(model.id)}`}>Détails <BsArrowRight /></Link>
+                <Link href={`/models/detail?model_id=${encodeURIComponent(model.id)}`}>Détails <BsArrowRight /></Link>
               </div>
             </article>
           ))}

@@ -15,7 +15,28 @@ case "${ID}" in
 esac
 
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y acl awscli ca-certificates curl file gnupg jq git openssl pciutils rsync
+DEBIAN_FRONTEND=noninteractive apt-get install -y acl ca-certificates curl file gnupg jq git openssl pciutils rsync unzip
+
+# Ubuntu Noble ne publie plus nécessairement le paquet `awscli`. L'installeur
+# officiel v2 est autonome et fonctionne aussi bien en x86_64 qu'en aarch64.
+if ! command -v aws >/dev/null 2>&1; then
+  case "$(uname -m)" in
+    x86_64|amd64) AWS_CLI_ARCH=x86_64 ;;
+    aarch64|arm64) AWS_CLI_ARCH=aarch64 ;;
+    *) echo "Architecture AWS CLI non supportée: $(uname -m)" >&2; exit 1 ;;
+  esac
+  (
+    AWS_CLI_TMP=$(mktemp -d /tmp/vidioai-awscli.XXXXXX)
+    # La cible est un répertoire temporaire créé ci-dessus, jamais un chemin
+    # fourni par l'environnement ou un répertoire système large.
+    trap 'rm -rf -- "${AWS_CLI_TMP}"' EXIT
+    curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${AWS_CLI_ARCH}.zip" \
+      -o "${AWS_CLI_TMP}/awscliv2.zip"
+    unzip -q "${AWS_CLI_TMP}/awscliv2.zip" -d "${AWS_CLI_TMP}"
+    "${AWS_CLI_TMP}/aws/install" --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli
+  )
+fi
+aws --version >/dev/null
 
 if ! command -v docker >/dev/null 2>&1; then
   curl -fsSL https://get.docker.com | sh
@@ -66,20 +87,35 @@ HOST_AGENT_TOKEN=${HOST_AGENT_TOKEN:-}
 if [[ -z "${HOST_AGENT_TOKEN}" && -f "${PRODUCTION_ENV}" ]]; then
   HOST_AGENT_TOKEN=$(sed -n 's/^HOST_AGENT_TOKEN=//p' "${PRODUCTION_ENV}" | tail -n 1)
 fi
-if [[ -z "${HOST_AGENT_TOKEN}" || "${HOST_AGENT_TOKEN}" == replace-with-* ]]; then
+if [[ ! "${HOST_AGENT_TOKEN}" =~ ^[A-Za-z0-9._-]{32,}$ || "${HOST_AGENT_TOKEN}" == replace-with-* ]]; then
   HOST_AGENT_TOKEN=$(openssl rand -hex 32)
-  if [[ -f "${PRODUCTION_ENV}" ]] && grep -q '^HOST_AGENT_TOKEN=' "${PRODUCTION_ENV}"; then
-    sed -i "s/^HOST_AGENT_TOKEN=.*/HOST_AGENT_TOKEN=${HOST_AGENT_TOKEN}/" "${PRODUCTION_ENV}"
-  else
-    printf '\nHOST_AGENT_URL=http://host.docker.internal:8091\nHOST_AGENT_TOKEN=%s\n' \
-      "${HOST_AGENT_TOKEN}" >> "${PRODUCTION_ENV}"
-  fi
 fi
+
+# Synchroniser systématiquement le secret choisi, y compris lorsqu'il a été
+# fourni au script. Auparavant ce cas pouvait laisser Compose et systemd avec
+# deux tokens différents et provoquer des 401 intermittents.
+touch "${PRODUCTION_ENV}"
+if grep -q '^HOST_AGENT_TOKEN=' "${PRODUCTION_ENV}"; then
+  sed -i "s/^HOST_AGENT_TOKEN=.*/HOST_AGENT_TOKEN=${HOST_AGENT_TOKEN}/" "${PRODUCTION_ENV}"
+else
+  if ! grep -q '^HOST_AGENT_URL=' "${PRODUCTION_ENV}"; then
+    printf '\nHOST_AGENT_URL=http://host.docker.internal:8091\n' >> "${PRODUCTION_ENV}"
+  fi
+  printf 'HOST_AGENT_TOKEN=%s\n' "${HOST_AGENT_TOKEN}" >> "${PRODUCTION_ENV}"
+fi
+chmod 0640 "${PRODUCTION_ENV}"
 umask 027
 printf 'HOST_AGENT_BIND=0.0.0.0:8091\nHOST_AGENT_TOKEN=%s\n' \
   "${HOST_AGENT_TOKEN}" > "${HOST_AGENT_ENV}"
 chown root:vidioai-host-agent "${HOST_AGENT_ENV}"
 chmod 0640 "${HOST_AGENT_ENV}"
+# Comparaison en mémoire uniquement : aucun secret n'est écrit sur stdout.
+PRODUCTION_HOST_TOKEN=$(sed -n 's/^HOST_AGENT_TOKEN=//p' "${PRODUCTION_ENV}" | tail -n 1)
+SERVICE_HOST_TOKEN=$(sed -n 's/^HOST_AGENT_TOKEN=//p' "${HOST_AGENT_ENV}" | tail -n 1)
+[[ "${PRODUCTION_HOST_TOKEN}" == "${SERVICE_HOST_TOKEN}" ]] || {
+  echo "Le token Host Agent diffère entre Compose et systemd." >&2
+  exit 1
+}
 systemctl daemon-reload
 systemctl enable --now vidioai-host-agent.service
 
@@ -93,10 +129,10 @@ for attempt in {1..30}; do
 done
 curl -fsS -H "X-VidioAI-Host-Token: ${HOST_AGENT_TOKEN}" \
   http://127.0.0.1:8091/system | jq -e '.source == "host" and .system and .cpu and .ram and .storage' >/dev/null
-echo "Bootstrap terminé. Docker: $(docker --version)"
 if ! command -v nvidia-smi >/dev/null 2>&1; then
   echo "NVIDIA absente : ce serveur ne peut pas utiliser GPU_PRODUCTION." >&2
   exit 1
 fi
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 docker run --rm --gpus all "${CUDA_TEST_IMAGE:-nvidia/cuda:12.8.1-base-ubuntu24.04}" nvidia-smi >/dev/null
+echo "Bootstrap terminé. Docker: $(docker --version) · AWS CLI: $(aws --version 2>&1)"

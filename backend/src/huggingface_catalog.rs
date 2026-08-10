@@ -24,7 +24,10 @@ const DEFAULT_TTL_SECONDS: u64 = 15 * 60;
 const MAX_PAGE_SIZE: usize = 60;
 const MAX_REMOTE_RESULTS: usize = 240;
 const GIB: u64 = 1024 * 1024 * 1024;
-const CACHE_SCHEMA_VERSION: u32 = 3;
+// Toute évolution du contrat normalisé invalide le cache disque précédent. Cela
+// évite notamment qu'un ancien booléen `runtime_supported` masque la raison
+// détaillée calculée par la nouvelle matrice de pipelines.
+const CACHE_SCHEMA_VERSION: u32 = 4;
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -108,10 +111,28 @@ pub struct CatalogModel {
     pub private: bool,
     pub disabled: bool,
     pub accessibility: String,
+    /// `true` lorsque les fichiers de configuration du repository ont été lus
+    /// avec succès. Pour un repo gated/privé, cela prouve que HF_TOKEN possède
+    /// l'autorisation nécessaire sans jamais exposer le token.
+    #[serde(default)]
+    pub access_authorized: bool,
     pub source_available: bool,
     pub quality_valid: bool,
     pub runtime_name: Option<String>,
     pub runtime_supported: bool,
+    /// Explication destinée à l'API et à l'interface. Le matériel et le runtime
+    /// sont volontairement deux axes différents : un modèle vidéo peut tenir
+    /// dans la VRAM tout en n'ayant aucun exécuteur VidioAI implémenté.
+    #[serde(default)]
+    pub runtime_reason: String,
+    /// Classe Diffusers détectée dans `model_index.json`/la configuration HF.
+    /// Elle reste informative : le Worker relit et valide le manifest téléchargé.
+    #[serde(default)]
+    pub pipeline_class: Option<String>,
+    /// Capacités que le Worker sait réellement exécuter pour ce repository.
+    /// Ce champ ne recopie jamais aveuglément les tags Hugging Face.
+    #[serde(default)]
+    pub runtime_capabilities: Vec<ModelCapability>,
     pub installable: bool,
     pub local: bool,
     /// Estimation sans la machine courante. `platform::model_view` y applique
@@ -501,7 +522,7 @@ impl HuggingFaceCatalogService {
                 // L'objet `config` de l'API Hub est volontairement résumé. La
                 // fiche détaillée complète donc les configurations légères sans
                 // télécharger les poids.
-                self.enrich_configuration(repository, &mut raw).await;
+                raw.access_authorized = self.enrich_configuration(repository, &mut raw).await;
                 Ok(normalize_model(raw))
             }
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
@@ -517,7 +538,7 @@ impl HuggingFaceCatalogService {
     /// Télécharge uniquement les petits JSON utiles à l'estimation. Le nombre
     /// est borné et les échecs sont tolérés : le service retombe alors sur les
     /// métadonnées Safetensors et les tailles LFS déjà reçues.
-    async fn enrich_configuration(&self, repository: &str, raw: &mut HfRawModel) {
+    async fn enrich_configuration(&self, repository: &str, raw: &mut HfRawModel) -> bool {
         let revision = raw.sha.as_deref().unwrap_or("main");
         let interesting = raw
             .siblings
@@ -545,7 +566,7 @@ impl HuggingFaceCatalogService {
             .map(str::to_owned)
             .collect::<Vec<_>>();
         if interesting.is_empty() {
-            return;
+            return false;
         }
 
         let requests = interesting.iter().map(|path| async move {
@@ -565,11 +586,13 @@ impl HuggingFaceCatalogService {
         });
         let mut merged = raw.config.as_object().cloned().unwrap_or_default();
         let mut components = serde_json::Map::new();
+        let mut fetched_configuration = false;
         for result in futures_util::future::join_all(requests)
             .await
             .into_iter()
             .flatten()
         {
+            fetched_configuration = true;
             match result.0.as_str() {
                 "config.json" => {
                     merged.insert("_root_config".into(), result.1);
@@ -586,6 +609,7 @@ impl HuggingFaceCatalogService {
             merged.insert("_component_configs".into(), Value::Object(components));
         }
         raw.config = Value::Object(merged);
+        fetched_configuration
     }
 }
 
@@ -597,6 +621,8 @@ struct HfRawModel {
     private: bool,
     #[serde(default)]
     gated: Value,
+    #[serde(skip)]
+    access_authorized: bool,
     #[serde(default)]
     disabled: bool,
     sha: Option<String>,
@@ -758,13 +784,16 @@ fn normalize_model(raw: HfRawModel) -> CatalogModel {
         let known: Vec<_> = files.iter().filter_map(|file| file.size).collect();
         (!known.is_empty()).then(|| known.into_iter().sum())
     });
-    let (runtime_name, runtime_supported) = runtime_match(
+    let (runtime_name, runtime_supported, runtime_reason, runtime_capabilities) = runtime_match(
         raw.library_name.as_deref(),
         &capabilities,
         &files,
         architecture.as_deref(),
     );
-    let accessibility = if raw.private {
+    let access_authorized = (!gated && !raw.private) || raw.access_authorized;
+    let accessibility = if access_authorized && (raw.private || gated) {
+        "AUTHORIZED"
+    } else if raw.private {
         "PRIVATE"
     } else if gated {
         "ACCESS_REQUIRED"
@@ -772,7 +801,7 @@ fn normalize_model(raw: HfRawModel) -> CatalogModel {
         "PUBLIC"
     }
     .to_owned();
-    let installable = runtime_supported && quality_valid && !raw.private && !gated;
+    let installable = runtime_supported && quality_valid && access_authorized;
     let hardware = HardwareEstimator::estimate(&HardwareMetadata {
         pipeline_tag: raw.pipeline_tag.clone(),
         library_name: raw.library_name.clone(),
@@ -829,7 +858,7 @@ fn normalize_model(raw: HfRawModel) -> CatalogModel {
         pipeline_tag: raw.pipeline_tag,
         tags: raw.tags,
         library: raw.library_name,
-        architecture,
+        architecture: architecture.clone(),
         license,
         files,
         estimated_size_bytes,
@@ -840,10 +869,14 @@ fn normalize_model(raw: HfRawModel) -> CatalogModel {
         private: raw.private,
         disabled: raw.disabled,
         accessibility,
+        access_authorized,
         source_available: true,
         quality_valid,
         runtime_name,
         runtime_supported,
+        runtime_reason,
+        pipeline_class: architecture.clone(),
+        runtime_capabilities,
         installable,
         local: false,
         hardware,
@@ -878,10 +911,16 @@ fn access_required_placeholder(repository: &str) -> CatalogModel {
         private: false,
         disabled: false,
         accessibility: "ACCESS_REQUIRED".into(),
+        access_authorized: false,
         source_available: true,
         quality_valid: false,
         runtime_name: None,
         runtime_supported: false,
+        runtime_reason:
+            "Métadonnées inaccessibles : fournissez un HF_TOKEN autorisé pour analyser le pipeline."
+                .into(),
+        pipeline_class: None,
+        runtime_capabilities: Vec::new(),
         installable: false,
         local: false,
         hardware: HardwareEstimate::default(),
@@ -987,6 +1026,22 @@ fn architecture_from_config(config: &Value) -> Option<String> {
                 .and_then(|value| value.get("_class_name"))
                 .and_then(Value::as_str)
         })
+        // La fiche détaillée range les JSON téléchargés sous des clés privées
+        // afin de ne pas écraser le résumé renvoyé par l'API Hub.
+        .or_else(|| {
+            config
+                .get("_model_index")
+                .and_then(|value| value.get("_class_name"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            config
+                .get("_root_config")
+                .and_then(|value| value.get("architectures"))
+                .and_then(Value::as_array)
+                .and_then(|values| values.first())
+                .and_then(Value::as_str)
+        })
         .map(str::to_owned)
 }
 
@@ -1013,7 +1068,7 @@ fn runtime_match(
     capabilities: &[ModelCapability],
     files: &[RepositoryFile],
     architecture: Option<&str>,
-) -> (Option<String>, bool) {
+) -> (Option<String>, bool, String, Vec<ModelCapability>) {
     let library = library.unwrap_or_default().to_ascii_lowercase();
     let has_safetensors = files
         .iter()
@@ -1021,12 +1076,27 @@ fn runtime_match(
     let has_diffusers_index = files
         .iter()
         .any(|file| file.path.rsplit('/').next() == Some("model_index.json"));
+    let explicitly_non_t2i_class = architecture.is_some_and(|class_name| {
+        ["Video", "ImageToImage", "Inpaint", "Upscale"]
+            .iter()
+            .any(|marker| class_name.contains(marker))
+    });
     if capabilities.contains(&ModelCapability::TextToImage)
         && library == "diffusers"
         && has_safetensors
         && has_diffusers_index
+        && !explicitly_non_t2i_class
     {
-        return (Some("Diffusers".into()), true);
+        let detected =
+            architecture.unwrap_or("classe résolue depuis model_index.json au chargement");
+        return (
+            Some("Diffusers AutoPipelineForText2Image".into()),
+            true,
+            format!(
+                "Pipeline TEXT_TO_IMAGE Diffusers exécutable par AutoPipelineForText2Image ({detected})."
+            ),
+            vec![ModelCapability::TextToImage],
+        );
     }
     if capabilities.contains(&ModelCapability::Chat)
         && library == "transformers"
@@ -1034,12 +1104,42 @@ fn runtime_match(
     {
         // Le moteur existe, mais son installateur révisionné n'est pas encore
         // relié au Model Runtime Manager. Il ne doit donc pas être installable.
-        return (Some("mistral.rs (détection uniquement)".into()), false);
+        return (
+            Some("mistral.rs (détection uniquement)".into()),
+            false,
+            "Architecture de chat détectée, mais aucun chargeur de chat n'est relié au Worker GPU."
+                .into(),
+            Vec::new(),
+        );
     }
     if library == "diffusers" {
-        return (Some("Diffusers (pipeline non supporté)".into()), false);
+        let requested = capabilities
+            .iter()
+            .map(|capability| format!("{capability:?}").to_ascii_uppercase())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return (
+            Some("Diffusers (pipeline non implémenté)".into()),
+            false,
+            format!(
+                "Matériel évalué séparément ; le Worker actuel n'implémente pas encore ce pipeline Diffusers ({requested})."
+            ),
+            Vec::new(),
+        );
     }
-    (None, false)
+    (
+        None,
+        false,
+        format!(
+            "Bibliothèque '{}' non prise en charge par le Worker GPU actuel.",
+            if library.is_empty() {
+                "non renseignée"
+            } else {
+                &library
+            }
+        ),
+        Vec::new(),
+    )
 }
 
 fn estimated_variant(size: Option<u64>, hardware: &HardwareEstimate) -> Vec<ModelVariant> {
@@ -1175,10 +1275,14 @@ pub fn local_runtime_models() -> Vec<CatalogModel> {
             private: true,
             disabled: false,
             accessibility: "LOCAL".into(),
+            access_authorized: true,
             source_available: true,
             quality_valid: true,
             runtime_name: Some("Vidio Canvas".into()),
             runtime_supported: true,
+            runtime_reason: "Moteur procédural local intégré (hors Worker GPU).".into(),
+            pipeline_class: Some("CanvasEngine".into()),
+            runtime_capabilities: vec![ModelCapability::TextToImage, ModelCapability::ImageToImage],
             installable: false,
             local: true,
             hardware: HardwareEstimate {
@@ -1245,10 +1349,18 @@ pub fn local_runtime_models() -> Vec<CatalogModel> {
             private: true,
             disabled: false,
             accessibility: "LOCAL".into(),
+            access_authorized: true,
             source_available: true,
             quality_valid: true,
             runtime_name: Some("FFmpeg".into()),
             runtime_supported: true,
+            runtime_reason: "Moteur vidéo local FFmpeg intégré (hors Worker Diffusers).".into(),
+            pipeline_class: Some("FfmpegMotionEngine".into()),
+            runtime_capabilities: vec![
+                ModelCapability::TextToVideo,
+                ModelCapability::ImageToVideo,
+                ModelCapability::VideoToVideo,
+            ],
             installable: false,
             local: true,
             hardware: HardwareEstimate {
@@ -1298,6 +1410,21 @@ mod tests {
     }
 
     #[test]
+    fn organization_model_ids_remain_lossless_for_every_production_example() {
+        // Ces identifiants couvrent points, tirets et surtout le slash qui ne
+        // doit jamais être confondu avec un séparateur de route HTTP.
+        for repository in [
+            "black-forest-labs/FLUX.1-dev",
+            "stabilityai/stable-diffusion-3.5-large",
+            "stabilityai/stable-video-diffusion-img2vid",
+        ] {
+            assert_eq!(normalize_repository_reference(repository), repository);
+            super::validate_repository_id(repository).expect("ID HF organisation/modèle valide");
+            assert!(!storage_id(repository).contains('/'));
+        }
+    }
+
+    #[test]
     fn diffusers_t2i_requires_weights_and_model_index() {
         let raw: HfRawModel = serde_json::from_value(json!({
             "id": "org/model", "pipeline_tag": "text-to-image", "library_name": "diffusers",
@@ -1313,6 +1440,33 @@ mod tests {
         assert!(model.runtime_supported);
         assert!(model.quality_valid);
         assert_eq!(model.capabilities, vec![ModelCapability::TextToImage]);
+        assert_eq!(
+            model.runtime_capabilities,
+            vec![ModelCapability::TextToImage]
+        );
+        assert!(model.runtime_reason.contains("AutoPipelineForText2Image"));
+    }
+
+    #[test]
+    fn diffusers_video_is_hardware_estimable_but_not_runtime_supported() {
+        let raw: HfRawModel = serde_json::from_value(json!({
+            "id": "stabilityai/stable-video-diffusion-img2vid",
+            "pipeline_tag": "image-to-video",
+            "library_name": "diffusers",
+            "sha": "abc",
+            "tags": ["safetensors"],
+            "siblings": [
+                {"rfilename": "model_index.json"},
+                {"rfilename": "unet/diffusion_pytorch_model.safetensors", "size": 42}
+            ],
+            "config": {"diffusers": {"_class_name": "StableVideoDiffusionPipeline"}}
+        }))
+        .unwrap();
+        let model = normalize_model(raw);
+        assert!(model.quality_valid);
+        assert!(!model.runtime_supported);
+        assert!(model.runtime_capabilities.is_empty());
+        assert!(model.runtime_reason.contains("pas encore"));
     }
 
     #[test]

@@ -260,6 +260,11 @@ class RuntimeManager:
         # après la même validation complète que pour un téléchargement HF.
         try:
             snapshot, pointer = self._active_snapshot(model_id)
+            # Ne jamais court-circuiter une mise à jour : `active.json` peut
+            # pointer vers l'ancienne révision alors que le backend a demandé le
+            # nouveau commit immuable publié par Hugging Face.
+            if pointer.get("revision") != revision:
+                raise WorkerError("Une révision plus récente doit être installée.", 409)
             validation = self.validate_snapshot(snapshot)
             cached = {
                 "model_id": model_id,
@@ -304,6 +309,9 @@ class RuntimeManager:
                 repo_id=repository,
                 revision=resolved_revision,
                 local_dir=temporary,
+                # Tous les blobs Hub, y compris les fichiers temporaires et le
+                # cache de reprise, résident sur le Scratch dédié en production.
+                cache_dir=self.settings.hf_home,
                 token=os.getenv("HF_TOKEN"),
                 ignore_patterns=[
                     "*.ckpt",
