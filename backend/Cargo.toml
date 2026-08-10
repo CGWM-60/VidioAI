@@ -1,0 +1,29 @@
+[package]
+name = "rust_ai"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Le backend doit compiler sur Linux en production comme sur macOS en local.
+# L'accélération GPU des gros modèles est confiée au worker dédié ; le serveur
+# HTTP conserve donc ici le backend CPU portable de mistral.rs.
+mistralrs = "0.8.1"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+clap = "4.6.6"
+futures = "0.3.33"
+rocket = "0.5.1"
+module = "0.4.0"
+image = "0.25"
+axum = { version = "0.8.9", features = ["ws", "multipart"] }
+all-smi = "0.25.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = "0.39.6"
+tower-http = { version = "0.7.0", features = ["cors", "limit"] }
+async-trait = "0.1"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4", "serde"] }
+rusqlite = { version = "0.37", features = ["bundled"] }

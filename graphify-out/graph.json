@@ -1,0 +1,1211 @@
+{
+  "directed": false,
+  "multigraph": false,
+  "graph": {},
+  "nodes": [
+    {
+      "label": "page.js",
+      "file_type": "code",
+      "source_file": "frontend/app/chat/page.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "chat_page",
+      "community": 2,
+      "norm_label": "page.js"
+    },
+    {
+      "label": "Chat()",
+      "file_type": "code",
+      "source_file": "frontend/app/chat/page.js",
+      "source_location": "L8",
+      "_origin": "ast",
+      "id": "chat_page_chat",
+      "community": 2,
+      "norm_label": "chat()"
+    },
+    {
+      "label": "Chat.jsx",
+      "file_type": "code",
+      "source_file": "frontend/app/components/Chat.jsx",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "components_chat",
+      "community": 22,
+      "norm_label": "chat.jsx"
+    },
+    {
+      "label": "ChatInput.jsx",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ChatInput.jsx",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "components_chatinput",
+      "community": 2,
+      "norm_label": "chatinput.jsx"
+    },
+    {
+      "label": "ChatInput()",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ChatInput.jsx",
+      "source_location": "L5",
+      "_origin": "ast",
+      "id": "components_chatinput_chatinput",
+      "community": 2,
+      "norm_label": "chatinput()"
+    },
+    {
+      "label": "Message.jsx",
+      "file_type": "code",
+      "source_file": "frontend/app/components/Message.jsx",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "components_message",
+      "community": 2,
+      "norm_label": "message.jsx"
+    },
+    {
+      "label": "Message()",
+      "file_type": "code",
+      "source_file": "frontend/app/components/Message.jsx",
+      "source_location": "L5",
+      "_origin": "ast",
+      "id": "components_message_message",
+      "community": 2,
+      "norm_label": "message()"
+    },
+    {
+      "label": "MessageList.jsx",
+      "file_type": "code",
+      "source_file": "frontend/app/components/MessageList.jsx",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "components_messagelist",
+      "community": 23,
+      "norm_label": "messagelist.jsx"
+    },
+    {
+      "label": "Sidebar.jsx",
+      "file_type": "code",
+      "source_file": "frontend/app/components/Sidebar.jsx",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "components_sidebar",
+      "community": 1,
+      "norm_label": "sidebar.jsx"
+    },
+    {
+      "label": "Sidebar()",
+      "file_type": "code",
+      "source_file": "frontend/app/components/Sidebar.jsx",
+      "source_location": "L17",
+      "_origin": "ast",
+      "id": "components_sidebar_sidebar",
+      "community": 1,
+      "norm_label": "sidebar()"
+    },
+    {
+      "label": "Badge.js",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/Badge.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_badge",
+      "community": 0,
+      "norm_label": "badge.js"
+    },
+    {
+      "label": "Badge()",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/Badge.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_badge_badge",
+      "community": 0,
+      "norm_label": "badge()"
+    },
+    {
+      "label": "Button.js",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/Button.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_button",
+      "community": 0,
+      "norm_label": "button.js"
+    },
+    {
+      "label": "Button()",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/Button.js",
+      "source_location": "L3",
+      "_origin": "ast",
+      "id": "ui_button_button",
+      "community": 0,
+      "norm_label": "button()"
+    },
+    {
+      "label": "Card.js",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/Card.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_card",
+      "community": 10,
+      "norm_label": "card.js"
+    },
+    {
+      "label": "Card()",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/Card.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_card_card",
+      "community": 10,
+      "norm_label": "card()"
+    },
+    {
+      "label": "CircularProgress.js",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/CircularProgress.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_circularprogress",
+      "community": 11,
+      "norm_label": "circularprogress.js"
+    },
+    {
+      "label": "CircularProgress()",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/CircularProgress.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_circularprogress_circularprogress",
+      "community": 11,
+      "norm_label": "circularprogress()"
+    },
+    {
+      "label": "EmptyState.js",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/EmptyState.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_emptystate",
+      "community": 12,
+      "norm_label": "emptystate.js"
+    },
+    {
+      "label": "EmptyState()",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/EmptyState.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_emptystate_emptystate",
+      "community": 12,
+      "norm_label": "emptystate()"
+    },
+    {
+      "label": "ErrorState.js",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/ErrorState.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_errorstate",
+      "community": 0,
+      "norm_label": "errorstate.js"
+    },
+    {
+      "label": "ErrorState()",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/ErrorState.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_errorstate_errorstate",
+      "community": 0,
+      "norm_label": "errorstate()"
+    },
+    {
+      "label": "Input.js",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/Input.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_input",
+      "community": 13,
+      "norm_label": "input.js"
+    },
+    {
+      "label": "Input()",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/Input.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_input_input",
+      "community": 13,
+      "norm_label": "input()"
+    },
+    {
+      "label": "LoadingState.js",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/LoadingState.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_loadingstate",
+      "community": 14,
+      "norm_label": "loadingstate.js"
+    },
+    {
+      "label": "LoadingState()",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/LoadingState.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_loadingstate_loadingstate",
+      "community": 14,
+      "norm_label": "loadingstate()"
+    },
+    {
+      "label": "Modal.js",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/Modal.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_modal",
+      "community": 15,
+      "norm_label": "modal.js"
+    },
+    {
+      "label": "Modal()",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/Modal.js",
+      "source_location": "L5",
+      "_origin": "ast",
+      "id": "ui_modal_modal",
+      "community": 15,
+      "norm_label": "modal()"
+    },
+    {
+      "label": "Panel.js",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/Panel.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_panel",
+      "community": 16,
+      "norm_label": "panel.js"
+    },
+    {
+      "label": "Panel()",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/Panel.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_panel_panel",
+      "community": 16,
+      "norm_label": "panel()"
+    },
+    {
+      "label": "ProgressBar.js",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/ProgressBar.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_progressbar",
+      "community": 0,
+      "norm_label": "progressbar.js"
+    },
+    {
+      "label": "ProgressBar()",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/ProgressBar.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_progressbar_progressbar",
+      "community": 0,
+      "norm_label": "progressbar()"
+    },
+    {
+      "label": "Select.js",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/Select.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_select",
+      "community": 17,
+      "norm_label": "select.js"
+    },
+    {
+      "label": "Select()",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/Select.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_select_select",
+      "community": 17,
+      "norm_label": "select()"
+    },
+    {
+      "label": "Tabs.js",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/Tabs.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_tabs",
+      "community": 18,
+      "norm_label": "tabs.js"
+    },
+    {
+      "label": "Tabs()",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/Tabs.js",
+      "source_location": "L3",
+      "_origin": "ast",
+      "id": "ui_tabs_tabs",
+      "community": 18,
+      "norm_label": "tabs()"
+    },
+    {
+      "label": "Textarea.js",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/Textarea.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_textarea",
+      "community": 0,
+      "norm_label": "textarea.js"
+    },
+    {
+      "label": "Textarea()",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/Textarea.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_textarea_textarea",
+      "community": 0,
+      "norm_label": "textarea()"
+    },
+    {
+      "label": "Toast.js",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/Toast.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_toast",
+      "community": 19,
+      "norm_label": "toast.js"
+    },
+    {
+      "label": "Toast()",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/Toast.js",
+      "source_location": "L5",
+      "_origin": "ast",
+      "id": "ui_toast_toast",
+      "community": 19,
+      "norm_label": "toast()"
+    },
+    {
+      "label": "Toggle.js",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/Toggle.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_toggle",
+      "community": 20,
+      "norm_label": "toggle.js"
+    },
+    {
+      "label": "Toggle()",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/Toggle.js",
+      "source_location": "L3",
+      "_origin": "ast",
+      "id": "ui_toggle_toggle",
+      "community": 20,
+      "norm_label": "toggle()"
+    },
+    {
+      "label": "UploadZone.js",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/UploadZone.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_uploadzone",
+      "community": 21,
+      "norm_label": "uploadzone.js"
+    },
+    {
+      "label": "UploadZone()",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/UploadZone.js",
+      "source_location": "L5",
+      "_origin": "ast",
+      "id": "ui_uploadzone_uploadzone",
+      "community": 21,
+      "norm_label": "uploadzone()"
+    },
+    {
+      "label": "index.js",
+      "file_type": "code",
+      "source_file": "frontend/app/components/ui/index.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_index",
+      "community": 0,
+      "norm_label": "index.js"
+    },
+    {
+      "label": "page.js",
+      "file_type": "code",
+      "source_file": "frontend/app/generations/page.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "generations_page",
+      "community": 4,
+      "norm_label": "page.js"
+    },
+    {
+      "label": "generations()",
+      "file_type": "code",
+      "source_file": "frontend/app/generations/page.js",
+      "source_location": "L3",
+      "_origin": "ast",
+      "id": "generations_page_generations",
+      "community": 4,
+      "norm_label": "generations()"
+    },
+    {
+      "label": "page.js",
+      "file_type": "code",
+      "source_file": "frontend/app/images/page.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "images_page",
+      "community": 5,
+      "norm_label": "page.js"
+    },
+    {
+      "label": "images()",
+      "file_type": "code",
+      "source_file": "frontend/app/images/page.js",
+      "source_location": "L3",
+      "_origin": "ast",
+      "id": "images_page_images",
+      "community": 5,
+      "norm_label": "images()"
+    },
+    {
+      "label": "layout.js",
+      "file_type": "code",
+      "source_file": "frontend/app/layout.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "app_layout",
+      "community": 1,
+      "norm_label": "layout.js"
+    },
+    {
+      "label": "geistSans",
+      "file_type": "code",
+      "source_file": "frontend/app/layout.js",
+      "source_location": "L7",
+      "_origin": "ast",
+      "id": "app_layout_geistsans",
+      "community": 1,
+      "norm_label": "geistsans"
+    },
+    {
+      "label": "geistMono",
+      "file_type": "code",
+      "source_file": "frontend/app/layout.js",
+      "source_location": "L12",
+      "_origin": "ast",
+      "id": "app_layout_geistmono",
+      "community": 1,
+      "norm_label": "geistmono"
+    },
+    {
+      "label": "RootLayout()",
+      "file_type": "code",
+      "source_file": "frontend/app/layout.js",
+      "source_location": "L17",
+      "_origin": "ast",
+      "id": "app_layout_rootlayout",
+      "community": 1,
+      "norm_label": "rootlayout()"
+    },
+    {
+      "label": "page.js",
+      "file_type": "code",
+      "source_file": "frontend/app/models/page.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "models_page",
+      "community": 6,
+      "norm_label": "page.js"
+    },
+    {
+      "label": "models()",
+      "file_type": "code",
+      "source_file": "frontend/app/models/page.js",
+      "source_location": "L3",
+      "_origin": "ast",
+      "id": "models_page_models",
+      "community": 6,
+      "norm_label": "models()"
+    },
+    {
+      "label": "page.js",
+      "file_type": "code",
+      "source_file": "frontend/app/page.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "app_page",
+      "community": 3,
+      "norm_label": "page.js"
+    },
+    {
+      "label": "Home()",
+      "file_type": "code",
+      "source_file": "frontend/app/page.js",
+      "source_location": "L3",
+      "_origin": "ast",
+      "id": "app_page_home",
+      "community": 3,
+      "norm_label": "home()"
+    },
+    {
+      "label": "page.js",
+      "file_type": "code",
+      "source_file": "frontend/app/projects/page.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "projects_page",
+      "community": 7,
+      "norm_label": "page.js"
+    },
+    {
+      "label": "projects()",
+      "file_type": "code",
+      "source_file": "frontend/app/projects/page.js",
+      "source_location": "L3",
+      "_origin": "ast",
+      "id": "projects_page_projects",
+      "community": 7,
+      "norm_label": "projects()"
+    },
+    {
+      "label": "page.js",
+      "file_type": "code",
+      "source_file": "frontend/app/resources/page.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "resources_page",
+      "community": 8,
+      "norm_label": "page.js"
+    },
+    {
+      "label": "ressources()",
+      "file_type": "code",
+      "source_file": "frontend/app/resources/page.js",
+      "source_location": "L3",
+      "_origin": "ast",
+      "id": "resources_page_ressources",
+      "community": 8,
+      "norm_label": "ressources()"
+    },
+    {
+      "label": "page.js",
+      "file_type": "code",
+      "source_file": "frontend/app/settings/page.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "settings_page",
+      "community": 9,
+      "norm_label": "page.js"
+    },
+    {
+      "label": "settings()",
+      "file_type": "code",
+      "source_file": "frontend/app/settings/page.js",
+      "source_location": "L3",
+      "_origin": "ast",
+      "id": "settings_page_settings",
+      "community": 9,
+      "norm_label": "settings()"
+    },
+    {
+      "label": "page.js",
+      "file_type": "code",
+      "source_file": "frontend/app/ui-demo/page.js",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "ui_demo_page",
+      "community": 0,
+      "norm_label": "page.js"
+    },
+    {
+      "label": "UiDemoPage()",
+      "file_type": "code",
+      "source_file": "frontend/app/ui-demo/page.js",
+      "source_location": "L24",
+      "_origin": "ast",
+      "id": "ui_demo_page_uidemopage",
+      "community": 0,
+      "norm_label": "uidemopage()"
+    }
+  ],
+  "links": [
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/chat/page.js",
+      "source_location": "L8",
+      "weight": 1.0,
+      "source": "chat_page",
+      "target": "chat_page_chat",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "imports_from",
+      "context": "import",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/chat/page.js",
+      "source_location": "L6",
+      "weight": 1.0,
+      "source": "chat_page",
+      "target": "components_chatinput",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "imports_from",
+      "context": "import",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/chat/page.js",
+      "source_location": "L5",
+      "weight": 1.0,
+      "source": "chat_page",
+      "target": "components_message",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ChatInput.jsx",
+      "source_location": "L5",
+      "weight": 1.0,
+      "source": "components_chatinput",
+      "target": "components_chatinput_chatinput",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/Message.jsx",
+      "source_location": "L5",
+      "weight": 1.0,
+      "source": "components_message",
+      "target": "components_message_message",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "imports_from",
+      "context": "import",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/layout.js",
+      "source_location": "L5",
+      "weight": 1.0,
+      "source": "app_layout",
+      "target": "components_sidebar",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/Sidebar.jsx",
+      "source_location": "L17",
+      "weight": 1.0,
+      "source": "components_sidebar",
+      "target": "components_sidebar_sidebar",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/Badge.js",
+      "source_location": "L1",
+      "weight": 1.0,
+      "source": "ui_badge",
+      "target": "ui_badge_badge",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "re_exports",
+      "context": "export",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/index.js",
+      "source_location": "L11",
+      "weight": 1.0,
+      "source": "ui_index",
+      "target": "ui_badge",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/Button.js",
+      "source_location": "L3",
+      "weight": 1.0,
+      "source": "ui_button",
+      "target": "ui_button_button",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "re_exports",
+      "context": "export",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/index.js",
+      "source_location": "L1",
+      "weight": 1.0,
+      "source": "ui_index",
+      "target": "ui_button",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/Card.js",
+      "source_location": "L1",
+      "weight": 1.0,
+      "source": "ui_card",
+      "target": "ui_card_card",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "re_exports",
+      "context": "export",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/index.js",
+      "source_location": "L8",
+      "weight": 1.0,
+      "source": "ui_index",
+      "target": "ui_card",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/CircularProgress.js",
+      "source_location": "L1",
+      "weight": 1.0,
+      "source": "ui_circularprogress",
+      "target": "ui_circularprogress_circularprogress",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "re_exports",
+      "context": "export",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/index.js",
+      "source_location": "L14",
+      "weight": 1.0,
+      "source": "ui_index",
+      "target": "ui_circularprogress",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/EmptyState.js",
+      "source_location": "L1",
+      "weight": 1.0,
+      "source": "ui_emptystate",
+      "target": "ui_emptystate_emptystate",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "re_exports",
+      "context": "export",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/index.js",
+      "source_location": "L19",
+      "weight": 1.0,
+      "source": "ui_index",
+      "target": "ui_emptystate",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/ErrorState.js",
+      "source_location": "L1",
+      "weight": 1.0,
+      "source": "ui_errorstate",
+      "target": "ui_errorstate_errorstate",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "re_exports",
+      "context": "export",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/index.js",
+      "source_location": "L20",
+      "weight": 1.0,
+      "source": "ui_index",
+      "target": "ui_errorstate",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "re_exports",
+      "context": "export",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/index.js",
+      "source_location": "L2",
+      "weight": 1.0,
+      "source": "ui_index",
+      "target": "ui_input",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/Input.js",
+      "source_location": "L1",
+      "weight": 1.0,
+      "source": "ui_input",
+      "target": "ui_input_input",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "re_exports",
+      "context": "export",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/index.js",
+      "source_location": "L21",
+      "weight": 1.0,
+      "source": "ui_index",
+      "target": "ui_loadingstate",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/LoadingState.js",
+      "source_location": "L1",
+      "weight": 1.0,
+      "source": "ui_loadingstate",
+      "target": "ui_loadingstate_loadingstate",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "re_exports",
+      "context": "export",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/index.js",
+      "source_location": "L16",
+      "weight": 1.0,
+      "source": "ui_index",
+      "target": "ui_modal",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/Modal.js",
+      "source_location": "L5",
+      "weight": 1.0,
+      "source": "ui_modal",
+      "target": "ui_modal_modal",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "re_exports",
+      "context": "export",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/index.js",
+      "source_location": "L9",
+      "weight": 1.0,
+      "source": "ui_index",
+      "target": "ui_panel",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/Panel.js",
+      "source_location": "L1",
+      "weight": 1.0,
+      "source": "ui_panel",
+      "target": "ui_panel_panel",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "re_exports",
+      "context": "export",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/index.js",
+      "source_location": "L13",
+      "weight": 1.0,
+      "source": "ui_index",
+      "target": "ui_progressbar",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/ProgressBar.js",
+      "source_location": "L1",
+      "weight": 1.0,
+      "source": "ui_progressbar",
+      "target": "ui_progressbar_progressbar",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "re_exports",
+      "context": "export",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/index.js",
+      "source_location": "L4",
+      "weight": 1.0,
+      "source": "ui_index",
+      "target": "ui_select",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/Select.js",
+      "source_location": "L1",
+      "weight": 1.0,
+      "source": "ui_select",
+      "target": "ui_select_select",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "re_exports",
+      "context": "export",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/index.js",
+      "source_location": "L6",
+      "weight": 1.0,
+      "source": "ui_index",
+      "target": "ui_tabs",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/Tabs.js",
+      "source_location": "L3",
+      "weight": 1.0,
+      "source": "ui_tabs",
+      "target": "ui_tabs_tabs",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "re_exports",
+      "context": "export",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/index.js",
+      "source_location": "L3",
+      "weight": 1.0,
+      "source": "ui_index",
+      "target": "ui_textarea",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/Textarea.js",
+      "source_location": "L1",
+      "weight": 1.0,
+      "source": "ui_textarea",
+      "target": "ui_textarea_textarea",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "re_exports",
+      "context": "export",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/index.js",
+      "source_location": "L17",
+      "weight": 1.0,
+      "source": "ui_index",
+      "target": "ui_toast",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/Toast.js",
+      "source_location": "L5",
+      "weight": 1.0,
+      "source": "ui_toast",
+      "target": "ui_toast_toast",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "re_exports",
+      "context": "export",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/index.js",
+      "source_location": "L5",
+      "weight": 1.0,
+      "source": "ui_index",
+      "target": "ui_toggle",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/Toggle.js",
+      "source_location": "L3",
+      "weight": 1.0,
+      "source": "ui_toggle",
+      "target": "ui_toggle_toggle",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "re_exports",
+      "context": "export",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/index.js",
+      "source_location": "L23",
+      "weight": 1.0,
+      "source": "ui_index",
+      "target": "ui_uploadzone",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/components/ui/UploadZone.js",
+      "source_location": "L5",
+      "weight": 1.0,
+      "source": "ui_uploadzone",
+      "target": "ui_uploadzone_uploadzone",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "imports_from",
+      "context": "import",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/ui-demo/page.js",
+      "source_location": "L4",
+      "weight": 1.0,
+      "source": "ui_demo_page",
+      "target": "ui_index",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/generations/page.js",
+      "source_location": "L3",
+      "weight": 1.0,
+      "source": "generations_page",
+      "target": "generations_page_generations",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/images/page.js",
+      "source_location": "L3",
+      "weight": 1.0,
+      "source": "images_page",
+      "target": "images_page_images",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/layout.js",
+      "source_location": "L12",
+      "weight": 1.0,
+      "source": "app_layout",
+      "target": "app_layout_geistmono",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/layout.js",
+      "source_location": "L7",
+      "weight": 1.0,
+      "source": "app_layout",
+      "target": "app_layout_geistsans",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/layout.js",
+      "source_location": "L17",
+      "weight": 1.0,
+      "source": "app_layout",
+      "target": "app_layout_rootlayout",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/models/page.js",
+      "source_location": "L3",
+      "weight": 1.0,
+      "source": "models_page",
+      "target": "models_page_models",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/page.js",
+      "source_location": "L3",
+      "weight": 1.0,
+      "source": "app_page",
+      "target": "app_page_home",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/projects/page.js",
+      "source_location": "L3",
+      "weight": 1.0,
+      "source": "projects_page",
+      "target": "projects_page_projects",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/resources/page.js",
+      "source_location": "L3",
+      "weight": 1.0,
+      "source": "resources_page",
+      "target": "resources_page_ressources",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/settings/page.js",
+      "source_location": "L3",
+      "weight": 1.0,
+      "source": "settings_page",
+      "target": "settings_page_settings",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "frontend/app/ui-demo/page.js",
+      "source_location": "L24",
+      "weight": 1.0,
+      "source": "ui_demo_page",
+      "target": "ui_demo_page_uidemopage",
+      "confidence_score": 1.0
+    }
+  ],
+  "hyperedges": []
+}

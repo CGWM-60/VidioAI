@@ -1,0 +1,34 @@
+[Unit]
+Description=VidioAI Host Resource Agent
+Documentation=file:/opt/vidioai/DEPLOIEMENT_SCALEWAY_GPU.md
+After=network-online.target
+Wants=network-online.target
+Before=docker.service
+
+[Service]
+Type=simple
+User=vidioai-host-agent
+Group=vidioai-host-agent
+EnvironmentFile=/etc/vidioai/host-agent.env
+ExecStart=/usr/local/bin/vidioai-host-agent
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=20s
+KillSignal=SIGTERM
+
+# Durcissement : l'agent ne doit qu'interroger le noyau, les volumes et
+# nvidia-smi puis ouvrir son port privé. Il ne possède aucun droit Docker.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
+

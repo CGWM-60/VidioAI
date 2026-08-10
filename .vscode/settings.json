@@ -1,0 +1,9 @@
+{
+    "git.ignoreLimitWarning": true,
+    // Le dépôt est multi-projets et le manifest Rust n'est pas à la racine.
+    // Sans ce lien, Rust Analyzer peut signaler à tort `rusqlite`, `JobStatus`
+    // ou `crate::platform` comme introuvables dans job_store.rs.
+    "rust-analyzer.linkedProjects": [
+        "backend/Cargo.toml"
+    ]
+}

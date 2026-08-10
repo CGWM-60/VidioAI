@@ -1,0 +1,167 @@
+{
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/chat/page.js": {
+    "mtime": 1786282509.207097,
+    "ast_hash": "afc82ec30b1cc1d518e828f54c26dd7a",
+    "semantic_hash": "afc82ec30b1cc1d518e828f54c26dd7a"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/Chat.jsx": {
+    "mtime": 1786205743.3556547,
+    "ast_hash": "d41d8cd98f00b204e9800998ecf8427e",
+    "semantic_hash": "d41d8cd98f00b204e9800998ecf8427e"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/ChatInput.jsx": {
+    "mtime": 1786282076.900785,
+    "ast_hash": "eb2c9bbe287f2ecd12f00340416927b3",
+    "semantic_hash": "eb2c9bbe287f2ecd12f00340416927b3"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/Message.jsx": {
+    "mtime": 1786283260.0064745,
+    "ast_hash": "22dde7f25b4a48de2fda139786506325",
+    "semantic_hash": "22dde7f25b4a48de2fda139786506325"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/MessageList.jsx": {
+    "mtime": 1786205766.422132,
+    "ast_hash": "d41d8cd98f00b204e9800998ecf8427e",
+    "semantic_hash": "d41d8cd98f00b204e9800998ecf8427e"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/Sidebar.jsx": {
+    "mtime": 1786281952.7377324,
+    "ast_hash": "08c1417e4024cc356a6fce1f6f2563e9",
+    "semantic_hash": "08c1417e4024cc356a6fce1f6f2563e9"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/ui/Badge.js": {
+    "mtime": 1786285401.4395978,
+    "ast_hash": "40df9575044d2b3adf626af7f55ba7b5",
+    "semantic_hash": "40df9575044d2b3adf626af7f55ba7b5"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/ui/Button.js": {
+    "mtime": 1786285401.4429417,
+    "ast_hash": "68d27d37caa32a7b79d8e026f6bd966c",
+    "semantic_hash": "68d27d37caa32a7b79d8e026f6bd966c"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/ui/Card.js": {
+    "mtime": 1786285401.4489434,
+    "ast_hash": "014f96ab14ddd90176590cc7d848af4c",
+    "semantic_hash": "014f96ab14ddd90176590cc7d848af4c"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/ui/CircularProgress.js": {
+    "mtime": 1786285401.451665,
+    "ast_hash": "5c9ae7e7db09f05cfa8e8ec066c09d9b",
+    "semantic_hash": "5c9ae7e7db09f05cfa8e8ec066c09d9b"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/ui/EmptyState.js": {
+    "mtime": 1786285401.4589612,
+    "ast_hash": "ffec6c4cc1e61a06e4140d6ec440e7ba",
+    "semantic_hash": "ffec6c4cc1e61a06e4140d6ec440e7ba"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/ui/ErrorState.js": {
+    "mtime": 1786285401.465955,
+    "ast_hash": "31079c3c2c209dbd6594660d5780b57b",
+    "semantic_hash": "31079c3c2c209dbd6594660d5780b57b"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/ui/Input.js": {
+    "mtime": 1786285401.4760537,
+    "ast_hash": "85347fa7ab8db01fbba6c3c3ca265488",
+    "semantic_hash": "85347fa7ab8db01fbba6c3c3ca265488"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/ui/LoadingState.js": {
+    "mtime": 1786285401.4836028,
+    "ast_hash": "d34a3f77d352727e0fe26904e7c5bfde",
+    "semantic_hash": "d34a3f77d352727e0fe26904e7c5bfde"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/ui/Modal.js": {
+    "mtime": 1786285401.4909499,
+    "ast_hash": "403ad64621bd84eef92637ba24ac8c83",
+    "semantic_hash": "403ad64621bd84eef92637ba24ac8c83"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/ui/Panel.js": {
+    "mtime": 1786285401.498586,
+    "ast_hash": "108018e1d7b887748494fbed34763e10",
+    "semantic_hash": "108018e1d7b887748494fbed34763e10"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/ui/ProgressBar.js": {
+    "mtime": 1786285401.5019197,
+    "ast_hash": "73bced4c15ab326c0c3194a5829278ef",
+    "semantic_hash": "73bced4c15ab326c0c3194a5829278ef"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/ui/Select.js": {
+    "mtime": 1786285401.5099323,
+    "ast_hash": "a837ac9619014cc8248b1e9c40f9193d",
+    "semantic_hash": "a837ac9619014cc8248b1e9c40f9193d"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/ui/Tabs.js": {
+    "mtime": 1786285401.5184493,
+    "ast_hash": "cebfb129415ca4ca739ca84589468f19",
+    "semantic_hash": "cebfb129415ca4ca739ca84589468f19"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/ui/Textarea.js": {
+    "mtime": 1786285401.5240016,
+    "ast_hash": "2a10827182ac14979b18930ab2bb5f4e",
+    "semantic_hash": "2a10827182ac14979b18930ab2bb5f4e"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/ui/Toast.js": {
+    "mtime": 1786285401.5274937,
+    "ast_hash": "90f6383d81f4b47a2c291c33b9e4798c",
+    "semantic_hash": "90f6383d81f4b47a2c291c33b9e4798c"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/ui/Toggle.js": {
+    "mtime": 1786285401.5361106,
+    "ast_hash": "76900f3d1b142c255b8b403e56b33165",
+    "semantic_hash": "76900f3d1b142c255b8b403e56b33165"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/ui/UploadZone.js": {
+    "mtime": 1786285401.5448184,
+    "ast_hash": "4e036cbb692feb8c485e7f8a981ae50d",
+    "semantic_hash": "4e036cbb692feb8c485e7f8a981ae50d"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/components/ui/index.js": {
+    "mtime": 1786285401.4688845,
+    "ast_hash": "2b1977dad5072501e98f30725d40e3a6",
+    "semantic_hash": "2b1977dad5072501e98f30725d40e3a6"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/generations/page.js": {
+    "mtime": 1786281284.037396,
+    "ast_hash": "642fd4b30b485e99ca9025df71a24129",
+    "semantic_hash": "642fd4b30b485e99ca9025df71a24129"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/images/page.js": {
+    "mtime": 1786281289.0074217,
+    "ast_hash": "0365d37ee139e88fdfdce0c136c9b180",
+    "semantic_hash": "0365d37ee139e88fdfdce0c136c9b180"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/layout.js": {
+    "mtime": 1786281875.1267266,
+    "ast_hash": "deb09d32e20836e7980d3fc040c25330",
+    "semantic_hash": "deb09d32e20836e7980d3fc040c25330"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/models/page.js": {
+    "mtime": 1786281294.6773155,
+    "ast_hash": "4e13b5bf9fe3d7561985ab0ab0ae7ba5",
+    "semantic_hash": "4e13b5bf9fe3d7561985ab0ab0ae7ba5"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/page.js": {
+    "mtime": 1786193793.390724,
+    "ast_hash": "6d0c31cf490019e2e16630651e71f6f0",
+    "semantic_hash": "6d0c31cf490019e2e16630651e71f6f0"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/projects/page.js": {
+    "mtime": 1786281299.9345276,
+    "ast_hash": "db1187b38b51d2d15969331e92352548",
+    "semantic_hash": "db1187b38b51d2d15969331e92352548"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/resources/page.js": {
+    "mtime": 1786281304.719586,
+    "ast_hash": "dc41cf9870e59963bf41345296a9280e",
+    "semantic_hash": "dc41cf9870e59963bf41345296a9280e"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/settings/page.js": {
+    "mtime": 1786281310.0409825,
+    "ast_hash": "625461036d9b05335d06fe6df6c45ad5",
+    "semantic_hash": "625461036d9b05335d06fe6df6c45ad5"
+  },
+  "/Users/canguilieme/Documents/Developments/Dev_peso/Rust_dev/rust_ai/frontend/app/ui-demo/page.js": {
+    "mtime": 1786285421.5650852,
+    "ast_hash": "abf772fe28514c7c3f3c620234bebc8e",
+    "semantic_hash": "abf772fe28514c7c3f3c620234bebc8e"
+  }
+}

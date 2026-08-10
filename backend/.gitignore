@@ -1,0 +1,4 @@
+# Les poids, configurations locales, jobs et assets sont des données d'exécution.
+# Ils doivent survivre aux redémarrages sur la machine, mais ne jamais entrer dans Git.
+/data/
+/target/

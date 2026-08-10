@@ -1,0 +1,143 @@
+{
+  "communities": {
+    "0": [
+      "box",
+      "engine_ia_engine",
+      "engine_ia_engine_context",
+      "engine_ia_engine_messages",
+      "engine_ia_engine_modele",
+      "engine_ia_engine_rs_result",
+      "engine_ia_engine_rs_string",
+      "engine_ia_engine_text_messages_ia",
+      "error"
+    ],
+    "1": [
+      "engine_ia_ws_tchat",
+      "engine_ia_ws_tchat_charge_modele",
+      "engine_ia_ws_tchat_rs_result",
+      "engine_ia_ws_tchat_rs_string",
+      "engine_ia_ws_tchat_rs_websocket",
+      "engine_ia_ws_tchat_text_messages_ia_ws",
+      "main_handle_socket",
+      "main_rs_websocket",
+      "model"
+    ],
+    "2": [
+      "main",
+      "main_main",
+      "main_rs_intoresponse",
+      "main_rs_result",
+      "main_ws_handler",
+      "websocketupgrade"
+    ],
+    "3": [
+      "router",
+      "utils_health",
+      "utils_health_health_check",
+      "utils_health_register",
+      "utils_health_rs_intoresponse"
+    ],
+    "4": [
+      "utils_systeme",
+      "utils_systeme_check_pc",
+      "utils_systeme_hardwareprofile",
+      "utils_systeme_rs_result",
+      "utils_systeme_rs_string"
+    ],
+    "5": [
+      "engine_ia_mod"
+    ],
+    "6": [
+      "utils_mod"
+    ]
+  },
+  "cohesion": {
+    "0": 0.3055555555555556,
+    "1": 0.3333333333333333,
+    "2": 0.3333333333333333,
+    "3": 0.4,
+    "4": 0.5,
+    "5": 1.0,
+    "6": 1.0
+  },
+  "gods": [
+    {
+      "id": "engine_ia_ws_tchat_text_messages_ia_ws",
+      "label": "text_messages_ia_ws()",
+      "degree": 6
+    },
+    {
+      "id": "engine_ia_engine_text_messages_ia",
+      "label": "text_messages_ia()",
+      "degree": 5
+    },
+    {
+      "id": "engine_ia_ws_tchat_charge_modele",
+      "label": "charge_modele()",
+      "degree": 5
+    },
+    {
+      "id": "main_handle_socket",
+      "label": "handle_socket()",
+      "degree": 4
+    },
+    {
+      "id": "engine_ia_engine_rs_string",
+      "label": "String",
+      "degree": 3
+    },
+    {
+      "id": "engine_ia_engine_messages",
+      "label": "Messages",
+      "degree": 3
+    },
+    {
+      "id": "main_ws_handler",
+      "label": "ws_handler()",
+      "degree": 3
+    },
+    {
+      "id": "utils_systeme_hardwareprofile",
+      "label": "HardwareProfile",
+      "degree": 3
+    },
+    {
+      "id": "utils_systeme_check_pc",
+      "label": "check_pc()",
+      "degree": 3
+    },
+    {
+      "id": "engine_ia_engine_modele",
+      "label": "Modele",
+      "degree": 2
+    }
+  ],
+  "surprises": [
+    {
+      "source": "handle_socket()",
+      "target": "charge_modele()",
+      "source_files": [
+        "main.rs",
+        "engine_ia/ws_tchat.rs"
+      ],
+      "confidence": "INFERRED",
+      "relation": "calls",
+      "why": "inferred connection - not explicitly stated in source; connects across different repos/directories"
+    },
+    {
+      "source": "handle_socket()",
+      "target": "text_messages_ia_ws()",
+      "source_files": [
+        "main.rs",
+        "engine_ia/ws_tchat.rs"
+      ],
+      "confidence": "INFERRED",
+      "relation": "calls",
+      "why": "inferred connection - not explicitly stated in source; connects across different repos/directories"
+    }
+  ],
+  "tokens": {
+    "input": 0,
+    "output": 0
+  }
+}

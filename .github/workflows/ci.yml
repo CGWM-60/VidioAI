@@ -1,0 +1,73 @@
+name: VidioAI CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+      - run: cargo fmt --check
+        working-directory: backend
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: backend
+      - run: cargo test
+        working-directory: backend
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      - run: npm run lint
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend
+
+  worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: worker/requirements-test.txt
+      - run: pip install -r requirements-test.txt
+        working-directory: worker
+      - run: python -m compileall -q app
+        working-directory: worker
+      - run: pytest -q
+        working-directory: worker
+
+  containers:
+    needs: [backend, frontend, worker]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose config
+      - run: docker compose build
+      - name: Validate production compose
+        env:
+          VIDIOAI_REGISTRY: example.invalid/vidioai
+          VIDIOAI_VERSION: ci-test
+          VIDIOAI_WORKER_TOKEN: ci-worker-token-at-least-32-characters
+          VIDIOAI_ADMIN_TOKEN: ci-admin-token-at-least-32-characters
+          AWS_ACCESS_KEY_ID: ci
+          AWS_SECRET_ACCESS_KEY: ci-secret
+          AWS_S3_BUCKET: ci-bucket
+        run: docker compose -f compose.production.yml config --quiet

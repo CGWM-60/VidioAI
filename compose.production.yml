@@ -1,0 +1,113 @@
+name: vidioai-production
+
+# Ce fichier ne contient volontairement aucune directive `build`. L'instance
+# GPU ne fait que tirer des artefacts immuables publiés par la CI.
+services:
+  backend:
+    image: ${VIDIOAI_REGISTRY:?VIDIOAI_REGISTRY requis}/backend:${VIDIOAI_VERSION:?VIDIOAI_VERSION requis}
+    restart: unless-stopped
+    environment:
+      APP_ENV: GPU_PRODUCTION
+      RUST_LOG: ${RUST_LOG:-info}
+      VIDIOAI_STATE_DIR: /state
+      VIDIOAI_MODELS_DIR: /models
+      VIDIOAI_OUTPUTS_DIR: /outputs
+      VIDIOAI_CACHE_DIR: /cache
+      VIDIOAI_WORK_DIR: /work
+      VIDIOAI_WORKER_URL: http://worker:8000
+      HOST_AGENT_URL: ${HOST_AGENT_URL:-http://host.docker.internal:8091}
+      HOST_AGENT_TOKEN: ${HOST_AGENT_TOKEN:?host agent token requis}
+      VIDIOAI_WORKER_TOKEN: ${VIDIOAI_WORKER_TOKEN:?worker token requis}
+      VIDIOAI_ADMIN_TOKEN: ${VIDIOAI_ADMIN_TOKEN:?admin token requis}
+      # Le backend seul consulte le Hub ; le navigateur ne reçoit jamais ce token.
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+      HF_CATALOG_TTL_SECONDS: ${HF_CATALOG_TTL_SECONDS:-900}
+      VIDIOAI_S3_ENABLED: ${VIDIOAI_S3_ENABLED:-true}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID requis}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY requis}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-fr-par}
+      AWS_ENDPOINT_URL_S3: ${AWS_ENDPOINT_URL_S3:-https://s3.fr-par.scw.cloud}
+      AWS_S3_BUCKET: ${AWS_S3_BUCKET:?AWS_S3_BUCKET requis}
+      AWS_S3_STORAGE_CLASS: ${AWS_S3_STORAGE_CLASS:-ONEZONE_IA}
+    volumes:
+      - ${VIDIOAI_STATE_DIR:-/var/lib/vidioai/state}:/state
+      - ${VIDIOAI_SCRATCH_DIR:-/var/lib/vidioai/scratch}/models:/models
+      - ${VIDIOAI_OUTPUTS_DIR:-/var/lib/vidioai/outputs}:/outputs
+      - ${VIDIOAI_SCRATCH_DIR:-/var/lib/vidioai/scratch}/cache:/cache
+      - ${VIDIOAI_SCRATCH_DIR:-/var/lib/vidioai/scratch}/work:/work
+    expose: ["8080"]
+    # Docker Engine Linux ne crée pas ce DNS par défaut. `host-gateway` pointe
+    # vers la passerelle de l'hôte sans donner de privilèges au conteneur.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8080/api/ready"]
+      interval: 15s
+      timeout: 8s
+      retries: 12
+      start_period: 60s
+    stop_grace_period: 90s
+    depends_on:
+      worker:
+        condition: service_healthy
+
+  worker:
+    image: ${VIDIOAI_REGISTRY:?VIDIOAI_REGISTRY requis}/worker:${VIDIOAI_VERSION:?VIDIOAI_VERSION requis}
+    restart: unless-stopped
+    environment:
+      APP_ENV: GPU_PRODUCTION
+      GPU_REQUIRED: "true"
+      VIDIOAI_WORKER_TOKEN: ${VIDIOAI_WORKER_TOKEN:?worker token requis}
+      VIDIOAI_MODELS_DIR: /models
+      VIDIOAI_WORK_DIR: /worker-work
+      VIDIOAI_OUTPUTS_DIR: /work
+      HF_HOME: /models/huggingface
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ${VIDIOAI_SCRATCH_DIR:-/var/lib/vidioai/scratch}/models:/models
+      - ${VIDIOAI_SCRATCH_DIR:-/var/lib/vidioai/scratch}/worker-work:/worker-work
+      - ${VIDIOAI_SCRATCH_DIR:-/var/lib/vidioai/scratch}/work:/work
+    expose: ["8000"]
+    gpus: all
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 30s
+    stop_grace_period: 90s
+
+  frontend:
+    image: ${VIDIOAI_REGISTRY:?VIDIOAI_REGISTRY requis}/frontend:${VIDIOAI_VERSION:?VIDIOAI_VERSION requis}
+    restart: unless-stopped
+    environment:
+      VIDIOAI_BACKEND_URL: http://backend:8080
+    expose: ["3000"]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1:3000/"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  proxy:
+    image: nginx:1.27.5-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${VIDIOAI_HTTP_PORT:-8080}:80"
+    volumes:
+      - ./deploy/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+    depends_on:
+      frontend:
+        condition: service_healthy
+      backend:
+        condition: service_healthy

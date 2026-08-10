@@ -1,0 +1,14 @@
+# État éphémère du lanceur local (PID, token interne et journaux).
+.runtime/
+.playwright-cli/
+
+# Artefacts de compilation et caches locaux.
+target/
+backend/target/
+host-agent/target/
+frontend/.next/
+frontend/node_modules/
+
+# Secrets d'exploitation.
+.env
+.env.production

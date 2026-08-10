@@ -1,0 +1,775 @@
+{
+  "directed": false,
+  "multigraph": false,
+  "graph": {},
+  "nodes": [
+    {
+      "label": "engine.rs",
+      "file_type": "code",
+      "source_file": "engine_ia/engine.rs",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "engine_ia_engine",
+      "community": 0,
+      "norm_label": "engine.rs"
+    },
+    {
+      "label": "Modele",
+      "file_type": "code",
+      "source_file": "engine_ia/engine.rs",
+      "source_location": "L11",
+      "_origin": "ast",
+      "id": "engine_ia_engine_modele",
+      "community": 0,
+      "norm_label": "modele"
+    },
+    {
+      "label": "String",
+      "file_type": "code",
+      "source_file": "engine_ia/engine.rs",
+      "source_location": "L12",
+      "_origin": "ast",
+      "id": "engine_ia_engine_rs_string",
+      "community": 0,
+      "norm_label": "string"
+    },
+    {
+      "label": "Messages",
+      "file_type": "code",
+      "source_file": "engine_ia/engine.rs",
+      "source_location": "L15",
+      "_origin": "ast",
+      "id": "engine_ia_engine_messages",
+      "community": 0,
+      "norm_label": "messages"
+    },
+    {
+      "label": "Context",
+      "file_type": "code",
+      "source_file": "engine_ia/engine.rs",
+      "source_location": "L21",
+      "_origin": "ast",
+      "id": "engine_ia_engine_context",
+      "community": 0,
+      "norm_label": "context"
+    },
+    {
+      "label": "text_messages_ia()",
+      "file_type": "code",
+      "source_file": "engine_ia/engine.rs",
+      "source_location": "L27",
+      "_origin": "ast",
+      "id": "engine_ia_engine_text_messages_ia",
+      "community": 0,
+      "norm_label": "text_messages_ia()"
+    },
+    {
+      "label": "Result",
+      "file_type": "code",
+      "source_file": "engine_ia/engine.rs",
+      "source_location": "L27",
+      "_origin": "ast",
+      "id": "engine_ia_engine_rs_result",
+      "community": 0,
+      "norm_label": "result"
+    },
+    {
+      "label": "Box",
+      "file_type": "code",
+      "source_file": "engine_ia/engine.rs",
+      "source_location": "L27",
+      "_origin": "ast",
+      "id": "box",
+      "community": 0,
+      "norm_label": "box"
+    },
+    {
+      "label": "Error",
+      "file_type": "code",
+      "source_file": "engine_ia/engine.rs",
+      "source_location": "L27",
+      "_origin": "ast",
+      "id": "error",
+      "community": 0,
+      "norm_label": "error"
+    },
+    {
+      "label": "mod.rs",
+      "file_type": "code",
+      "source_file": "engine_ia/mod.rs",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "engine_ia_mod",
+      "community": 5,
+      "norm_label": "mod.rs"
+    },
+    {
+      "label": "ws_tchat.rs",
+      "file_type": "code",
+      "source_file": "engine_ia/ws_tchat.rs",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "engine_ia_ws_tchat",
+      "community": 1,
+      "norm_label": "ws_tchat.rs"
+    },
+    {
+      "label": "charge_modele()",
+      "file_type": "code",
+      "source_file": "engine_ia/ws_tchat.rs",
+      "source_location": "L8",
+      "_origin": "ast",
+      "id": "engine_ia_ws_tchat_charge_modele",
+      "community": 1,
+      "norm_label": "charge_modele()"
+    },
+    {
+      "label": "String",
+      "file_type": "code",
+      "source_file": "engine_ia/ws_tchat.rs",
+      "source_location": "L8",
+      "_origin": "ast",
+      "id": "engine_ia_ws_tchat_rs_string",
+      "community": 1,
+      "norm_label": "string"
+    },
+    {
+      "label": "Result",
+      "file_type": "code",
+      "source_file": "engine_ia/ws_tchat.rs",
+      "source_location": "L8",
+      "_origin": "ast",
+      "id": "engine_ia_ws_tchat_rs_result",
+      "community": 1,
+      "norm_label": "result"
+    },
+    {
+      "label": "Model",
+      "file_type": "code",
+      "source_file": "engine_ia/ws_tchat.rs",
+      "source_location": "L8",
+      "_origin": "ast",
+      "id": "model",
+      "community": 1,
+      "norm_label": "model"
+    },
+    {
+      "label": "text_messages_ia_ws()",
+      "file_type": "code",
+      "source_file": "engine_ia/ws_tchat.rs",
+      "source_location": "L18",
+      "_origin": "ast",
+      "id": "engine_ia_ws_tchat_text_messages_ia_ws",
+      "community": 1,
+      "norm_label": "text_messages_ia_ws()"
+    },
+    {
+      "label": "WebSocket",
+      "file_type": "code",
+      "source_file": "engine_ia/ws_tchat.rs",
+      "source_location": "L18",
+      "_origin": "ast",
+      "id": "engine_ia_ws_tchat_rs_websocket",
+      "community": 1,
+      "norm_label": "websocket"
+    },
+    {
+      "label": "main.rs",
+      "file_type": "code",
+      "source_file": "main.rs",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "main",
+      "community": 2,
+      "norm_label": "main.rs"
+    },
+    {
+      "label": "main()",
+      "file_type": "code",
+      "source_file": "main.rs",
+      "source_location": "L24",
+      "_origin": "ast",
+      "id": "main_main",
+      "community": 2,
+      "norm_label": "main()"
+    },
+    {
+      "label": "Result",
+      "file_type": "code",
+      "source_file": "main.rs",
+      "source_location": "L24",
+      "_origin": "ast",
+      "id": "main_rs_result",
+      "community": 2,
+      "norm_label": "result"
+    },
+    {
+      "label": "ws_handler()",
+      "file_type": "code",
+      "source_file": "main.rs",
+      "source_location": "L62",
+      "_origin": "ast",
+      "id": "main_ws_handler",
+      "community": 2,
+      "norm_label": "ws_handler()"
+    },
+    {
+      "label": "WebSocketUpgrade",
+      "file_type": "code",
+      "source_file": "main.rs",
+      "source_location": "L62",
+      "_origin": "ast",
+      "id": "websocketupgrade",
+      "community": 2,
+      "norm_label": "websocketupgrade"
+    },
+    {
+      "label": "IntoResponse",
+      "file_type": "code",
+      "source_file": "main.rs",
+      "source_location": "L62",
+      "_origin": "ast",
+      "id": "main_rs_intoresponse",
+      "community": 2,
+      "norm_label": "intoresponse"
+    },
+    {
+      "label": "handle_socket()",
+      "file_type": "code",
+      "source_file": "main.rs",
+      "source_location": "L73",
+      "_origin": "ast",
+      "id": "main_handle_socket",
+      "community": 1,
+      "norm_label": "handle_socket()"
+    },
+    {
+      "label": "WebSocket",
+      "file_type": "code",
+      "source_file": "main.rs",
+      "source_location": "L73",
+      "_origin": "ast",
+      "id": "main_rs_websocket",
+      "community": 1,
+      "norm_label": "websocket"
+    },
+    {
+      "label": "health.rs",
+      "file_type": "code",
+      "source_file": "utils/health.rs",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "utils_health",
+      "community": 3,
+      "norm_label": "health.rs"
+    },
+    {
+      "label": "register()",
+      "file_type": "code",
+      "source_file": "utils/health.rs",
+      "source_location": "L3",
+      "_origin": "ast",
+      "id": "utils_health_register",
+      "community": 3,
+      "norm_label": "register()"
+    },
+    {
+      "label": "Router",
+      "file_type": "code",
+      "source_file": "utils/health.rs",
+      "source_location": "L3",
+      "_origin": "ast",
+      "id": "router",
+      "community": 3,
+      "norm_label": "router"
+    },
+    {
+      "label": "health_check()",
+      "file_type": "code",
+      "source_file": "utils/health.rs",
+      "source_location": "L8",
+      "_origin": "ast",
+      "id": "utils_health_health_check",
+      "community": 3,
+      "norm_label": "health_check()"
+    },
+    {
+      "label": "IntoResponse",
+      "file_type": "code",
+      "source_file": "utils/health.rs",
+      "source_location": "L8",
+      "_origin": "ast",
+      "id": "utils_health_rs_intoresponse",
+      "community": 3,
+      "norm_label": "intoresponse"
+    },
+    {
+      "label": "mod.rs",
+      "file_type": "code",
+      "source_file": "utils/mod.rs",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "utils_mod",
+      "community": 6,
+      "norm_label": "mod.rs"
+    },
+    {
+      "label": "systeme.rs",
+      "file_type": "code",
+      "source_file": "utils/systeme.rs",
+      "source_location": "L1",
+      "_origin": "ast",
+      "id": "utils_systeme",
+      "community": 4,
+      "norm_label": "systeme.rs"
+    },
+    {
+      "label": "HardwareProfile",
+      "file_type": "code",
+      "source_file": "utils/systeme.rs",
+      "source_location": "L5",
+      "_origin": "ast",
+      "id": "utils_systeme_hardwareprofile",
+      "community": 4,
+      "norm_label": "hardwareprofile"
+    },
+    {
+      "label": "String",
+      "file_type": "code",
+      "source_file": "utils/systeme.rs",
+      "source_location": "L6",
+      "_origin": "ast",
+      "id": "utils_systeme_rs_string",
+      "community": 4,
+      "norm_label": "string"
+    },
+    {
+      "label": "check_pc()",
+      "file_type": "code",
+      "source_file": "utils/systeme.rs",
+      "source_location": "L25",
+      "_origin": "ast",
+      "id": "utils_systeme_check_pc",
+      "community": 4,
+      "norm_label": "check_pc()"
+    },
+    {
+      "label": "Result",
+      "file_type": "code",
+      "source_file": "utils/systeme.rs",
+      "source_location": "L25",
+      "_origin": "ast",
+      "id": "utils_systeme_rs_result",
+      "community": 4,
+      "norm_label": "result"
+    }
+  ],
+  "links": [
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "engine_ia/engine.rs",
+      "source_location": "L21",
+      "weight": 1.0,
+      "source": "engine_ia_engine",
+      "target": "engine_ia_engine_context",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "engine_ia/engine.rs",
+      "source_location": "L15",
+      "weight": 1.0,
+      "source": "engine_ia_engine",
+      "target": "engine_ia_engine_messages",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "engine_ia/engine.rs",
+      "source_location": "L11",
+      "weight": 1.0,
+      "source": "engine_ia_engine",
+      "target": "engine_ia_engine_modele",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "engine_ia/engine.rs",
+      "source_location": "L27",
+      "weight": 1.0,
+      "source": "engine_ia_engine",
+      "target": "engine_ia_engine_text_messages_ia",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "engine_ia/engine.rs",
+      "source_location": "L12",
+      "weight": 1.0,
+      "context": "field",
+      "source": "engine_ia_engine_modele",
+      "target": "engine_ia_engine_rs_string",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "engine_ia/engine.rs",
+      "source_location": "L18",
+      "weight": 1.0,
+      "context": "field",
+      "source": "engine_ia_engine_messages",
+      "target": "engine_ia_engine_rs_string",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "engine_ia/engine.rs",
+      "source_location": "L27",
+      "weight": 1.0,
+      "context": "generic_arg",
+      "source": "engine_ia_engine_text_messages_ia",
+      "target": "engine_ia_engine_rs_string",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "engine_ia/engine.rs",
+      "source_location": "L23",
+      "weight": 1.0,
+      "context": "field",
+      "source": "engine_ia_engine_context",
+      "target": "engine_ia_engine_messages",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "engine_ia/engine.rs",
+      "source_location": "L27",
+      "weight": 1.0,
+      "context": "generic_arg",
+      "source": "engine_ia_engine_text_messages_ia",
+      "target": "box",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "engine_ia/engine.rs",
+      "source_location": "L27",
+      "weight": 1.0,
+      "context": "return_type",
+      "source": "engine_ia_engine_text_messages_ia",
+      "target": "engine_ia_engine_rs_result",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "engine_ia/engine.rs",
+      "source_location": "L27",
+      "weight": 1.0,
+      "context": "generic_arg",
+      "source": "engine_ia_engine_text_messages_ia",
+      "target": "error",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "engine_ia/ws_tchat.rs",
+      "source_location": "L8",
+      "weight": 1.0,
+      "source": "engine_ia_ws_tchat",
+      "target": "engine_ia_ws_tchat_charge_modele",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "engine_ia/ws_tchat.rs",
+      "source_location": "L18",
+      "weight": 1.0,
+      "source": "engine_ia_ws_tchat",
+      "target": "engine_ia_ws_tchat_text_messages_ia_ws",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "engine_ia/ws_tchat.rs",
+      "source_location": "L8",
+      "weight": 1.0,
+      "context": "return_type",
+      "source": "engine_ia_ws_tchat_charge_modele",
+      "target": "engine_ia_ws_tchat_rs_result",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "engine_ia/ws_tchat.rs",
+      "source_location": "L8",
+      "weight": 1.0,
+      "context": "parameter_type",
+      "source": "engine_ia_ws_tchat_charge_modele",
+      "target": "engine_ia_ws_tchat_rs_string",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "engine_ia/ws_tchat.rs",
+      "source_location": "L8",
+      "weight": 1.0,
+      "context": "generic_arg",
+      "source": "engine_ia_ws_tchat_charge_modele",
+      "target": "model",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "INFERRED",
+      "confidence_score": 0.8,
+      "source_file": "main.rs",
+      "source_location": "L78",
+      "weight": 1.0,
+      "source": "main_handle_socket",
+      "target": "engine_ia_ws_tchat_charge_modele"
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "engine_ia/ws_tchat.rs",
+      "source_location": "L18",
+      "weight": 1.0,
+      "context": "parameter_type",
+      "source": "engine_ia_ws_tchat_text_messages_ia_ws",
+      "target": "engine_ia_ws_tchat_rs_string",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "engine_ia/ws_tchat.rs",
+      "source_location": "L18",
+      "weight": 1.0,
+      "context": "return_type",
+      "source": "engine_ia_ws_tchat_text_messages_ia_ws",
+      "target": "engine_ia_ws_tchat_rs_result",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "engine_ia/ws_tchat.rs",
+      "source_location": "L18",
+      "weight": 1.0,
+      "context": "parameter_type",
+      "source": "engine_ia_ws_tchat_text_messages_ia_ws",
+      "target": "model",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "engine_ia/ws_tchat.rs",
+      "source_location": "L18",
+      "weight": 1.0,
+      "context": "parameter_type",
+      "source": "engine_ia_ws_tchat_text_messages_ia_ws",
+      "target": "engine_ia_ws_tchat_rs_websocket",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "calls",
+      "context": "call",
+      "confidence": "INFERRED",
+      "confidence_score": 0.8,
+      "source_file": "main.rs",
+      "source_location": "L107",
+      "weight": 1.0,
+      "source": "main_handle_socket",
+      "target": "engine_ia_ws_tchat_text_messages_ia_ws"
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "main.rs",
+      "source_location": "L73",
+      "weight": 1.0,
+      "source": "main",
+      "target": "main_handle_socket",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "main.rs",
+      "source_location": "L24",
+      "weight": 1.0,
+      "source": "main",
+      "target": "main_main",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "main.rs",
+      "source_location": "L62",
+      "weight": 1.0,
+      "source": "main",
+      "target": "main_ws_handler",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "main.rs",
+      "source_location": "L24",
+      "weight": 1.0,
+      "context": "return_type",
+      "source": "main_main",
+      "target": "main_rs_result",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "main.rs",
+      "source_location": "L62",
+      "weight": 1.0,
+      "context": "return_type",
+      "source": "main_ws_handler",
+      "target": "main_rs_intoresponse",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "main.rs",
+      "source_location": "L62",
+      "weight": 1.0,
+      "context": "parameter_type",
+      "source": "main_ws_handler",
+      "target": "websocketupgrade",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "main.rs",
+      "source_location": "L73",
+      "weight": 1.0,
+      "context": "parameter_type",
+      "source": "main_handle_socket",
+      "target": "main_rs_websocket",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "utils/health.rs",
+      "source_location": "L8",
+      "weight": 1.0,
+      "source": "utils_health",
+      "target": "utils_health_health_check",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "utils/health.rs",
+      "source_location": "L3",
+      "weight": 1.0,
+      "source": "utils_health",
+      "target": "utils_health_register",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "utils/health.rs",
+      "source_location": "L3",
+      "weight": 1.0,
+      "context": "return_type",
+      "source": "utils_health_register",
+      "target": "router",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "utils/health.rs",
+      "source_location": "L8",
+      "weight": 1.0,
+      "context": "return_type",
+      "source": "utils_health_health_check",
+      "target": "utils_health_rs_intoresponse",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "utils/systeme.rs",
+      "source_location": "L25",
+      "weight": 1.0,
+      "source": "utils_systeme",
+      "target": "utils_systeme_check_pc",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "utils/systeme.rs",
+      "source_location": "L5",
+      "weight": 1.0,
+      "source": "utils_systeme",
+      "target": "utils_systeme_hardwareprofile",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "utils/systeme.rs",
+      "source_location": "L25",
+      "weight": 1.0,
+      "context": "generic_arg",
+      "source": "utils_systeme_check_pc",
+      "target": "utils_systeme_hardwareprofile",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "utils/systeme.rs",
+      "source_location": "L22",
+      "weight": 1.0,
+      "context": "field",
+      "source": "utils_systeme_hardwareprofile",
+      "target": "utils_systeme_rs_string",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "source_file": "utils/systeme.rs",
+      "source_location": "L25",
+      "weight": 1.0,
+      "context": "return_type",
+      "source": "utils_systeme_check_pc",
+      "target": "utils_systeme_rs_result",
+      "confidence_score": 1.0
+    }
+  ],
+  "hyperedges": []
+}

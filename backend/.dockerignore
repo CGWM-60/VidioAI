@@ -1,0 +1,7 @@
+# Les artefacts locaux Rust pèsent plusieurs gigaoctets et ne participent pas
+# au build reproductible : Docker recompilera uniquement Cargo.lock + src/.
+target
+data
+.env*
+*.log
+.DS_Store

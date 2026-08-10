@@ -1,0 +1,633 @@
+.page {
+  min-height: 100vh;
+  padding: 26px 32px 24px;
+  color: var(--foreground);
+}
+
+.pageHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 22px;
+}
+
+.pageHeader h1 {
+  margin: 0;
+  color: #f7f8fc;
+  font-size: clamp(29px, 3vw, 34px);
+  font-weight: 720;
+  letter-spacing: -0.045em;
+}
+
+.pageHeader p {
+  margin: 5px 0 0;
+  color: var(--foreground-secondary);
+  font-size: 13px;
+}
+
+.headerActions {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+}
+
+.liveStatus {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  color: #d7dde7;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.liveStatus > span {
+  width: 9px;
+  height: 9px;
+  background: var(--success);
+  border-radius: 50%;
+  box-shadow: 0 0 14px rgba(72, 220, 148, 0.5);
+}
+
+.liveStatusError > span {
+  background: var(--danger);
+  box-shadow: 0 0 14px rgba(255, 109, 130, 0.44);
+}
+
+.dashboard {
+  display: grid;
+  gap: 18px;
+}
+
+.panel {
+  min-width: 0;
+  padding: 18px;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 90% 0%, rgba(92, 75, 141, 0.08), transparent 35%),
+    linear-gradient(145deg, rgba(17, 27, 43, 0.92), rgba(10, 19, 33, 0.93));
+  border: 1px solid rgba(151, 166, 192, 0.19);
+  border-radius: 12px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.14);
+}
+
+.panelTitle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 14px;
+  color: #f2f4f8;
+  font-size: 15px;
+  font-weight: 680;
+}
+
+.panelTitle > span {
+  display: grid;
+  place-items: center;
+  color: #8f5bff;
+}
+
+.panelTitle svg {
+  width: 20px;
+  height: 20px;
+}
+
+.statePanel {
+  min-height: 430px;
+  display: grid;
+  place-items: center;
+}
+
+.staleNotice {
+  padding: 11px 14px;
+  color: #ffd5dc;
+  background: rgba(151, 42, 65, 0.16);
+  border: 1px solid rgba(255, 109, 130, 0.26);
+  border-radius: 9px;
+  font-size: 12px;
+}
+
+.statusPanel {
+  display: grid;
+  grid-template-columns: minmax(360px, 1.4fr) 2fr;
+  align-items: center;
+  min-height: 118px;
+  padding: 18px 34px;
+}
+
+.healthSummary {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+}
+
+.serverIllustration {
+  display: grid;
+  place-items: center;
+  width: 72px;
+  height: 72px;
+  flex: 0 0 72px;
+  color: #9d72ff;
+  background: rgba(112, 70, 214, 0.08);
+  border: 1px solid rgba(142, 94, 246, 0.2);
+  border-radius: 13px;
+  box-shadow: inset 0 0 24px rgba(123, 73, 235, 0.08), 0 0 28px rgba(107, 59, 211, 0.13);
+}
+
+.serverIllustration svg {
+  width: 39px;
+  height: 39px;
+  filter: drop-shadow(0 0 8px rgba(139, 91, 249, 0.5));
+}
+
+.healthSummary > div > span,
+.metric span,
+.gpuMetrics span {
+  color: var(--foreground-secondary);
+  font-size: 12px;
+}
+
+.healthSummary strong {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 3px;
+  color: #54e38f;
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: -0.035em;
+}
+
+.healthSummary strong svg {
+  width: 17px;
+  height: 17px;
+}
+
+.healthSummary .degradedStatus {
+  color: #f5bd4f;
+}
+
+.sourceBadge {
+  display: inline-flex;
+  padding: 2px 7px;
+  color: #c9b6ff;
+  background: rgba(126, 82, 235, 0.13);
+  border: 1px solid rgba(153, 112, 250, 0.25);
+  border-radius: 999px;
+}
+
+.healthSummary p {
+  margin: 2px 0 0;
+  color: var(--foreground-secondary);
+  font-size: 12px;
+}
+
+.metricsGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 18px;
+  padding-left: 34px;
+}
+
+.metric {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  min-width: 0;
+}
+
+.metricIcon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 23px;
+  color: #aebbd0 !important;
+}
+
+.metricIcon svg {
+  width: 21px;
+  height: 21px;
+}
+
+.metric > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.metric strong {
+  overflow: hidden;
+  color: #54e38f;
+  font-size: 17px;
+  font-weight: 680;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.summaryGrid {
+  display: grid;
+  grid-template-columns: 1fr 1.05fr 1.2fr;
+  gap: 18px;
+}
+
+.summaryGrid > .panel {
+  min-height: 248px;
+}
+
+.infoList,
+.memoryStats {
+  display: grid;
+}
+
+.infoRow {
+  display: grid;
+  grid-template-columns: minmax(90px, 0.8fr) minmax(0, 1.2fr);
+  align-items: center;
+  gap: 12px;
+  min-height: 37px;
+  border-bottom: 1px solid rgba(151, 166, 192, 0.13);
+}
+
+.infoRow:last-child {
+  border-bottom: 0;
+}
+
+.infoRow > span {
+  color: #d7dce5;
+  font-size: 12px;
+}
+
+.infoValue {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  justify-items: end;
+}
+
+.infoValue > strong {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  color: #f2f4f8;
+  font-size: 12px;
+  font-weight: 540;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.infoValue :global(.progress-track) {
+  width: min(100%, 180px);
+}
+
+.memoryLayout {
+  display: grid;
+  grid-template-columns: 138px minmax(0, 1fr);
+  align-items: center;
+  gap: 16px;
+}
+
+.memoryLayout :global(.vidio-circular-label) {
+  margin-top: -39px;
+  color: var(--foreground-secondary);
+  font-size: 11px;
+  pointer-events: none;
+}
+
+.memoryLayout :global(.vidio-circular-center strong) {
+  font-size: 29px;
+}
+
+.unknownDial {
+  display: grid;
+  place-items: center;
+  width: 126px;
+  height: 126px;
+  color: var(--foreground-secondary);
+  border: 13px solid rgba(123, 139, 166, 0.13);
+  border-radius: 50%;
+  font-size: 11px;
+  text-align: center;
+}
+
+.memoryStats .infoRow {
+  grid-template-columns: 1fr 1fr;
+}
+
+.gpuPanel {
+  padding-bottom: 17px;
+}
+
+.gpuLayout {
+  display: grid;
+  grid-template-columns: minmax(240px, 0.95fr) 3.05fr;
+  align-items: stretch;
+}
+
+.gpuIdentity {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding-right: 24px;
+  border-right: 1px solid rgba(151, 166, 192, 0.14);
+}
+
+.gpuBadge {
+  display: grid;
+  place-items: center;
+  width: 58px;
+  height: 58px;
+  flex: 0 0 58px;
+  color: #9e73ff;
+  background: linear-gradient(145deg, rgba(133, 76, 243, 0.18), rgba(15, 28, 45, 0.85));
+  border: 1px solid rgba(151, 104, 245, 0.25);
+  border-radius: 10px;
+}
+
+.gpuBadge svg {
+  width: 28px;
+  height: 28px;
+}
+
+.gpuIdentity > div {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.gpuIdentity strong {
+  overflow: hidden;
+  color: #f6f7fa;
+  font-size: 16px;
+  font-weight: 680;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gpuIdentity span:last-child {
+  color: var(--foreground-secondary);
+  font-size: 12px;
+}
+
+.gpuMetrics {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(74px, 1fr));
+  align-items: center;
+  gap: 16px;
+  padding-left: 25px;
+}
+
+.gpuMetrics > div {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+
+.gpuMetrics strong {
+  overflow: hidden;
+  color: #f4f5f8;
+  font-size: 16px;
+  font-weight: 680;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gpuUsage {
+  align-self: center;
+}
+
+.greenProgress :global(.progress-value) {
+  background: linear-gradient(90deg, #40cf80, #63e69c);
+  box-shadow: 0 0 12px rgba(72, 220, 148, 0.3);
+}
+
+.storagePanel {
+  padding-bottom: 0;
+}
+
+.storageHeader,
+.storageRow {
+  display: grid;
+  grid-template-columns: 1.5fr 0.8fr 0.8fr 0.85fr 0.8fr 1.4fr;
+  align-items: center;
+  gap: 18px;
+}
+
+.storageHeader {
+  min-height: 30px;
+  color: var(--foreground-secondary);
+  border-bottom: 1px solid rgba(151, 166, 192, 0.18);
+  font-size: 11px;
+}
+
+.storageRow {
+  min-height: 46px;
+  color: #e8ebf1;
+  border-bottom: 1px solid rgba(151, 166, 192, 0.11);
+  font-size: 12px;
+}
+
+.storageRow:last-of-type {
+  border-bottom: 0;
+}
+
+.storageRow > strong {
+  font-weight: 560;
+}
+
+.storageVolume {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+
+.storageVolume svg {
+  color: #9f75ff;
+}
+
+.storageVolume strong {
+  overflow: hidden;
+  font-weight: 590;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.storageUsage {
+  display: grid;
+  grid-template-columns: minmax(80px, 1fr) 42px;
+  align-items: center;
+  gap: 12px;
+}
+
+.storageUsage > strong {
+  text-align: right;
+}
+
+.storageFooter {
+  display: flex;
+  align-items: center;
+  gap: 60px;
+  min-height: 46px;
+  margin: 0 -18px;
+  padding: 0 18px;
+  color: var(--foreground-secondary);
+  background: rgba(4, 12, 24, 0.22);
+  border-top: 1px solid rgba(151, 166, 192, 0.14);
+  font-size: 12px;
+}
+
+.storageFooter strong {
+  color: #54e38f;
+  font-weight: 650;
+}
+
+@media (max-width: 1250px) {
+  .statusPanel {
+    grid-template-columns: 1fr;
+    gap: 24px;
+  }
+
+  .metricsGrid {
+    padding-left: 0;
+  }
+
+  .summaryGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .summaryGrid > .panel:last-child {
+    grid-column: 1 / -1;
+  }
+
+  .gpuLayout {
+    grid-template-columns: 1fr;
+    gap: 22px;
+  }
+
+  .gpuIdentity {
+    padding: 0 0 20px;
+    border-right: 0;
+    border-bottom: 1px solid rgba(151, 166, 192, 0.14);
+  }
+
+  .gpuMetrics {
+    padding-left: 0;
+  }
+}
+
+@media (max-width: 980px) {
+  .page {
+    padding: 25px 22px 32px;
+  }
+
+  .gpuMetrics {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .storageHeader {
+    display: none;
+  }
+
+  .storageRow {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px 24px;
+    padding: 10px 0 20px;
+  }
+
+  .storageRow > *::before {
+    display: block;
+    margin-bottom: 4px;
+    color: var(--foreground-muted);
+    font-size: 10px;
+  }
+
+  .storageRow > :nth-child(1)::before { content: "Volume"; }
+  .storageRow > :nth-child(2)::before { content: "Type"; }
+  .storageRow > :nth-child(3)::before { content: "Total"; }
+  .storageRow > :nth-child(4)::before { content: "Utilisé"; }
+  .storageRow > :nth-child(5)::before { content: "Disponible"; }
+  .storageRow > :nth-child(6)::before { content: "Utilisation"; }
+}
+
+@media (max-width: 700px) {
+  .page {
+    padding: 20px 14px 28px;
+  }
+
+  .pageHeader,
+  .headerActions,
+  .storageFooter {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .headerActions {
+    gap: 14px;
+  }
+
+  .liveStatus {
+    justify-content: flex-start;
+  }
+
+  .statusPanel {
+    padding: 20px;
+  }
+
+  .healthSummary {
+    align-items: flex-start;
+  }
+
+  .serverIllustration {
+    width: 54px;
+    height: 54px;
+    flex-basis: 54px;
+  }
+
+  .serverIllustration svg {
+    width: 29px;
+    height: 29px;
+  }
+
+  .healthSummary strong {
+    font-size: 21px;
+  }
+
+  .metricsGrid,
+  .summaryGrid,
+  .gpuMetrics,
+  .storageRow {
+    grid-template-columns: 1fr;
+  }
+
+  .summaryGrid > .panel:last-child {
+    grid-column: auto;
+  }
+
+  .metric {
+    padding: 10px 0;
+    border-bottom: 1px solid rgba(151, 166, 192, 0.12);
+  }
+
+  .memoryLayout {
+    grid-template-columns: 1fr;
+    justify-items: center;
+  }
+
+  .memoryStats {
+    width: 100%;
+  }
+
+  .gpuMetrics {
+    gap: 16px;
+  }
+
+  .gpuMetrics > div {
+    padding-bottom: 12px;
+    border-bottom: 1px solid rgba(151, 166, 192, 0.12);
+  }
+
+  .storageFooter {
+    gap: 6px;
+    padding-top: 12px;
+    padding-bottom: 12px;
+  }
+}

@@ -1,0 +1,19 @@
+[package]
+name = "vidioai-host-agent"
+version = "0.1.0"
+edition = "2024"
+description = "Agent natif minimal exposant les ressources physiques de l'hôte VidioAI"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = "0.39.6"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+

@@ -1,0 +1,6 @@
+# Next et npm reconstruisent ces répertoires dans leurs stages dédiés.
+node_modules
+.next
+.env*
+*.log
+.DS_Store
