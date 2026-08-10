@@ -62,12 +62,16 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq
+          sudo apt-get install -y \
+            jq \
+            protobuf-compiler
+
           python -m pip install --upgrade pip
           python -m pip install awscli
 
           jq --version
           aws --version
+          protoc --version
 
       # --------------------------------------------------------
       # 6. Docker Buildx
