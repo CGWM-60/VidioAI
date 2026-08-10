@@ -3689,9 +3689,11 @@ async fn generate_video(
     let mut input_images = request.input_images.clone();
     if mode != GenerationMode::TextToVideo {
         if mode == GenerationMode::ImageToVideo {
-            if request.input_asset_id.is_some() && input_images.is_empty() {
+            if let Some(asset_id) = request.input_asset_id
+                && input_images.is_empty()
+            {
                 input_images.push(GenerationInputImage {
-                    asset_id: request.input_asset_id.unwrap(),
+                    asset_id,
                     order: 0,
                     role: "start_frame".into(),
                 });
@@ -3737,7 +3739,7 @@ async fn generate_video(
     let generation = Generation {
         id: Uuid::new_v4(),
         kind: AssetKind::Video,
-        mode: mode,
+        mode,
         prompt: prompt.to_string(),
         negative_prompt: None,
         model_id,
