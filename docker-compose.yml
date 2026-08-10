@@ -1,14 +1,13 @@
 name: vidioai
 
 services:
+
   backend:
     build:
       context: ./backend
-      # Les attestations OCI sont utiles lors d'une publication CI, mais elles
-      # peuvent rester bloquées dans Docker Desktop après l'export local.
-      provenance: false
-      sbom: false
+
     restart: unless-stopped
+
     environment:
       APP_ENV: LOCAL
       VIDIOAI_STATE_DIR: /data/state
@@ -17,51 +16,63 @@ services:
       VIDIOAI_CACHE_DIR: /data/cache
       VIDIOAI_WORK_DIR: /data/work
       VIDIOAI_WORKER_URL: ${VIDIOAI_WORKER_URL:-}
-      # Le Host Agent reste un processus natif. Docker Desktop résout ce nom
-      # automatiquement ; `extra_hosts` couvre également Docker Engine Linux.
       HOST_AGENT_URL: ${HOST_AGENT_URL:-http://host.docker.internal:8091}
       HOST_AGENT_TOKEN: ${HOST_AGENT_TOKEN:-}
       HF_TOKEN: ${HF_TOKEN:-}
       HF_CATALOG_TTL_SECONDS: ${HF_CATALOG_TTL_SECONDS:-900}
       RUST_LOG: ${RUST_LOG:-info}
+
     volumes:
       - vidioai-data:/data
-    expose: ["8080"]
+
+    expose:
+      - "8080"
+
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/ready"]
+      test:
+        - CMD
+        - curl
+        - --fail
+        - http://localhost:8080/api/ready
       interval: 15s
       timeout: 5s
       retries: 8
       start_period: 20s
+
     stop_grace_period: 45s
+
 
   frontend:
     build:
       context: ./frontend
-      provenance: false
-      sbom: false
       args:
         NEXT_PUBLIC_API_URL: ""
+
     restart: unless-stopped
+
     environment:
       VIDIOAI_BACKEND_URL: http://backend:8080
-    expose: ["3000"]
+
+    expose:
+      - "3000"
+
     depends_on:
       backend:
         condition: service_healthy
 
-  # Le worker possède son propre cycle de vie et peut être remplacé par une
-  # image CUDA sans reconstruire l'API. Le profil évite de le démarrer sur une
-  # machine sans GPU tant que l'adaptateur Diffusers n'est pas configuré.
+
   worker:
     build:
       context: ./worker
-      provenance: false
-      sbom: false
-    profiles: ["gpu"]
+
+    profiles:
+      - gpu
+
     restart: unless-stopped
+
     environment:
       APP_ENV: LOCAL
       GPU_REQUIRED: "false"
@@ -69,27 +80,36 @@ services:
       VIDIOAI_MODELS_DIR: /models
       VIDIOAI_WORK_DIR: /worker-work
       VIDIOAI_OUTPUTS_DIR: /data/work
+
     volumes:
       - vidioai-models:/models
       - vidioai-data:/data
+
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
               count: all
-              capabilities: [gpu]
+              capabilities:
+                - gpu
+
 
   proxy:
     image: nginx:1.27-alpine
+
     restart: unless-stopped
+
     ports:
       - "${VIDIOAI_HTTP_PORT:-80}:80"
+
     volumes:
       - ./deploy/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+
     depends_on:
       - frontend
       - backend
+
 
 volumes:
   vidioai-data:
