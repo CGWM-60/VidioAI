@@ -16,10 +16,11 @@ services:
       VIDIOAI_CACHE_DIR: /data/cache
       VIDIOAI_WORK_DIR: /data/work
       VIDIOAI_WORKER_URL: ${VIDIOAI_WORKER_URL:-}
-      HOST_AGENT_URL: ${HOST_AGENT_URL:-http://host.docker.internal:8091}
+      HOST_AGENT_URL: ${HOST_AGENT_URL:-}
       HOST_AGENT_TOKEN: ${HOST_AGENT_TOKEN:-}
       HF_TOKEN: ${HF_TOKEN:-}
       HF_CATALOG_TTL_SECONDS: ${HF_CATALOG_TTL_SECONDS:-900}
+      VIDIOAI_S3_ENABLED: "false"
       RUST_LOG: ${RUST_LOG:-info}
 
     volumes:
@@ -58,6 +59,18 @@ services:
 
     expose:
       - "3000"
+
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - --spider
+        - --quiet
+        - http://127.0.0.1:3000/
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
 
     depends_on:
       backend:
@@ -103,7 +116,7 @@ services:
 
 
   proxy:
-    image: nginx:1.27-alpine
+    image: nginx:1.27.5-alpine
 
     restart: unless-stopped
 
@@ -113,9 +126,22 @@ services:
     volumes:
       - ./deploy/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
 
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - --spider
+        - --quiet
+        - http://127.0.0.1/api/health
+      interval: 15s
+      timeout: 5s
+      retries: 8
+
     depends_on:
-      - frontend
-      - backend
+      frontend:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
 
 
 volumes:

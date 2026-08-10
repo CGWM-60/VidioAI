@@ -106,10 +106,30 @@ class RuntimeManager:
             )
             raise WorkerError(self._runtime_error, 503) from error
 
+    @staticmethod
+    def _hf_token() -> str | None:
+        token = os.getenv("HF_TOKEN")
+        if token is None:
+            return None
+        cleaned = token.strip()
+        return cleaned or None
+
+    @staticmethod
+    def _looks_like_hf_auth_error(error: Exception) -> bool:
+        name = type(error).__name__
+        if name in {"GatedRepoError", "HfHubHTTPError"}:
+            return True
+        response = getattr(error, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if status_code in {401, 403}:
+            return True
+        message = str(error).lower()
+        return any(fragment in message for fragment in ["gated", "private", "authentication", "forbidden", "access"])
+
     def runtime_status(self) -> dict[str, Any]:
         configuration_errors = self.settings.configuration_errors()
         try:
-            torch, _, _ = self._imports()
+            torch, _ = self._imports()
             runtime_available = True
             cuda_available = bool(torch.cuda.is_available())
             cuda_version = getattr(torch.version, "cuda", None)
@@ -297,7 +317,8 @@ class RuntimeManager:
         try:
             _, hub = self._imports()
             HfApi, snapshot_download = hub
-            info = HfApi(token=os.getenv("HF_TOKEN")).model_info(
+            hf_token = self._hf_token()
+            info = HfApi(token=hf_token).model_info(
                 repository, revision=revision
             )
             resolved_revision = self._safe_segment(info.sha)
@@ -308,7 +329,7 @@ class RuntimeManager:
                 # Tous les blobs Hub, y compris les fichiers temporaires et le
                 # cache de reprise, résident sur le Scratch dédié en production.
                 cache_dir=self.settings.hf_home,
-                token=os.getenv("HF_TOKEN"),
+                token=hf_token,
                 ignore_patterns=[
                     "*.ckpt",
                     "*.onnx",
@@ -364,6 +385,18 @@ class RuntimeManager:
                 }
             raise
         except Exception as error:
+            if self._hf_token() is None and self._looks_like_hf_auth_error(error):
+                message = (
+                    "Accès Hugging Face requis: ce repository est protégé "
+                    "(gated/private) et nécessite un HF_TOKEN valide."
+                )
+                with self._lock:
+                    self._model_states[model_id] = {
+                        "model_id": model_id,
+                        "state": ModelState.FAILED,
+                        "error": message,
+                    }
+                raise WorkerError(message, 403) from error
             message = f"Installation impossible: {type(error).__name__}: {error}"
             with self._lock:
                 self._model_states[model_id] = {

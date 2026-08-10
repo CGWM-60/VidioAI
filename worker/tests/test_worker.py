@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.adapters.image_to_video import ImageToVideoAdapter
@@ -212,3 +214,272 @@ def test_valid_l3_snapshot_is_reused_without_hugging_face_call(tmp_path: Path) -
     assert status["state"] == "INSTALLED"
     assert status["weights_valid"] is True
     assert status["validation_test"] is False
+
+
+def _write_fake_snapshot(target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "model_index.json").write_text(
+        json.dumps({"_class_name": "StableDiffusionPipeline"}),
+        encoding="utf-8",
+    )
+    (target / "model.safetensors").write_bytes(b"w" * 2048)
+
+
+def _fake_torch(*, cuda_available: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        cuda=SimpleNamespace(is_available=lambda: cuda_available),
+        version=SimpleNamespace(cuda="12.4" if cuda_available else None),
+        __version__="2.9.0",
+    )
+
+
+def test_runtime_status_handles_runtime_import_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+
+    def failing_imports() -> tuple[object, object]:
+        raise WorkerError("Runtime IA indisponible: import error", 503)
+
+    monkeypatch.setattr(manager, "_imports", failing_imports)
+    status = manager.runtime_status()
+    assert status["ready"] is False
+    assert status["runtime_available"] is False
+    assert status["cuda_available"] is False
+    assert any("import error" in error for error in status["errors"])
+
+
+def test_imports_contract_is_two_values(tmp_path: Path) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+    manager._runtime_modules = (_fake_torch(cuda_available=False), (object(), object()))
+    torch, hub = manager._imports()
+    assert torch is not None
+    assert isinstance(hub, tuple)
+    assert len(hub) == 2
+
+
+def test_imports_raises_worker_error_when_runtime_error_is_cached(tmp_path: Path) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+    manager._runtime_error = "runtime cassé"
+    with pytest.raises(WorkerError) as error:
+        manager._imports()
+    assert error.value.status_code == 503
+    assert "runtime cassé" in str(error.value)
+
+
+def test_runtime_status_cuda_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+
+    fake_torch = _fake_torch(cuda_available=False)
+    monkeypatch.setattr(manager, "_imports", lambda: (fake_torch, object()))
+
+    status = manager.runtime_status()
+    assert status["runtime_available"] is True
+    assert status["cuda_available"] is False
+    assert status["torch_version"] == "2.9.0"
+
+
+def test_runtime_status_cuda_present(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+
+    fake_torch = _fake_torch(cuda_available=True)
+    monkeypatch.setattr(manager, "_imports", lambda: (fake_torch, object()))
+
+    status = manager.runtime_status()
+    assert status["runtime_available"] is True
+    assert status["cuda_available"] is True
+    assert status["cuda_version"] == "12.4"
+    assert status["ready"] is True
+
+
+def test_ready_endpoint_exposes_runtime_import_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    application = create_app(settings(tmp_path))
+
+    def failing_imports() -> tuple[object, object]:
+        raise WorkerError("Runtime IA indisponible: import error", 503)
+
+    monkeypatch.setattr(application.state.manager, "_imports", failing_imports)
+    client = TestClient(application)
+    response = client.get(
+        "/ready", headers={"X-VidioAI-Worker-Token": "test-token"}
+    )
+    assert response.status_code == 503
+    payload = response.json()
+    assert payload["ready"] is False
+    assert payload["runtime_available"] is False
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_install_model_never_sends_empty_bearer_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+    observed = {"api_token": "UNSET", "download_token": "UNSET"}
+
+    class FakeHfApi:
+        def __init__(self, token: str | None = None) -> None:
+            observed["api_token"] = token
+
+        def model_info(self, repository: str, revision: str = "main") -> SimpleNamespace:
+            return SimpleNamespace(sha="commit-sha")
+
+    def fake_snapshot_download(**kwargs) -> None:
+        observed["download_token"] = kwargs.get("token")
+        _write_fake_snapshot(Path(kwargs["local_dir"]))
+
+    monkeypatch.setattr(
+        manager,
+        "_imports",
+        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+    )
+    monkeypatch.setenv("HF_TOKEN", value)
+
+    status = manager.install_model(
+        "stable-image-core",
+        "stabilityai/sd-turbo",
+        "main",
+        ["TEXT_TO_IMAGE"],
+    )
+    assert status["state"] == "INSTALLED"
+    assert observed["api_token"] is None
+    assert observed["download_token"] is None
+
+
+def test_install_model_public_repository_works_without_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+    observed = {"api_token": "UNSET", "download_token": "UNSET"}
+
+    class FakeHfApi:
+        def __init__(self, token: str | None = None) -> None:
+            observed["api_token"] = token
+
+        def model_info(self, repository: str, revision: str = "main") -> SimpleNamespace:
+            return SimpleNamespace(sha="commit-sha")
+
+    def fake_snapshot_download(**kwargs) -> None:
+        observed["download_token"] = kwargs.get("token")
+        _write_fake_snapshot(Path(kwargs["local_dir"]))
+
+    monkeypatch.setattr(
+        manager,
+        "_imports",
+        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+    )
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+
+    status = manager.install_model(
+        "stable-image-core",
+        "stabilityai/sd-turbo",
+        "main",
+        ["TEXT_TO_IMAGE"],
+    )
+    assert status["state"] == "INSTALLED"
+    assert observed["api_token"] is None
+    assert observed["download_token"] is None
+
+
+def test_install_model_public_repository_works_with_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+    observed = {"api_token": None, "download_token": None}
+
+    class FakeHfApi:
+        def __init__(self, token: str | None = None) -> None:
+            observed["api_token"] = token
+
+        def model_info(self, repository: str, revision: str = "main") -> SimpleNamespace:
+            return SimpleNamespace(sha="commit-sha")
+
+    def fake_snapshot_download(**kwargs) -> None:
+        observed["download_token"] = kwargs.get("token")
+        _write_fake_snapshot(Path(kwargs["local_dir"]))
+
+    monkeypatch.setattr(
+        manager,
+        "_imports",
+        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+    )
+    monkeypatch.setenv("HF_TOKEN", "hf_valid_token")
+
+    status = manager.install_model(
+        "stable-image-core",
+        "stabilityai/sd-turbo",
+        "main",
+        ["TEXT_TO_IMAGE"],
+    )
+    assert status["state"] == "INSTALLED"
+    assert observed["api_token"] == "hf_valid_token"
+    assert observed["download_token"] == "hf_valid_token"
+
+
+def test_install_model_gated_without_token_returns_access_required_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+
+    class GatedRepoError(Exception):
+        pass
+
+    class FakeHfApi:
+        def __init__(self, token: str | None = None) -> None:
+            del token
+
+        def model_info(self, repository: str, revision: str = "main") -> SimpleNamespace:
+            raise GatedRepoError("Repository is gated and requires authentication")
+
+    def fake_snapshot_download(**kwargs) -> None:
+        _write_fake_snapshot(Path(kwargs["local_dir"]))
+
+    monkeypatch.setattr(
+        manager,
+        "_imports",
+        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+    )
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+
+    with pytest.raises(WorkerError) as error:
+        manager.install_model(
+            "stable-image-core",
+            "stabilityai/sd-turbo",
+            "main",
+            ["TEXT_TO_IMAGE"],
+        )
+    assert error.value.status_code == 403
+    assert "Accès Hugging Face requis" in str(error.value)
+
+
+def test_install_model_private_without_token_returns_access_required_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+
+    class PrivateRepoError(Exception):
+        pass
+
+    class FakeHfApi:
+        def __init__(self, token: str | None = None) -> None:
+            del token
+
+        def model_info(self, repository: str, revision: str = "main") -> SimpleNamespace:
+            raise PrivateRepoError("private repository: authentication required")
+
+    def fake_snapshot_download(**kwargs) -> None:
+        _write_fake_snapshot(Path(kwargs["local_dir"]))
+
+    monkeypatch.setattr(
+        manager,
+        "_imports",
+        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+    )
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+
+    with pytest.raises(WorkerError) as error:
+        manager.install_model(
+            "stable-image-core",
+            "stabilityai/sd-turbo",
+            "main",
+            ["TEXT_TO_IMAGE"],
+        )
+    assert error.value.status_code == 403
+    assert "Accès Hugging Face requis" in str(error.value)

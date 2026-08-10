@@ -26,6 +26,10 @@ npm --prefix frontend run lint
 npm --prefix frontend run build
 python -m pip install --disable-pip-version-check -r worker/requirements-test.txt
 python -m pytest -q worker
+bash deploy/tests/test-s3-paths.sh
+if [[ "${VIDIOAI_RUN_COMPOSE_TESTS:-true}" == "true" ]]; then
+  bash deploy/tests/test-compose-orchestration.sh
+fi
 
 for service in backend frontend worker; do
   docker buildx build \
@@ -50,7 +54,7 @@ docker run --rm --platform "${PLATFORM}" \
   -w /src rust:1.96-bookworm \
   sh -c 'cargo build --release --locked && cp /tmp/vidioai-host-agent-target/release/vidioai-host-agent /out/'
 cp deploy/systemd/vidioai-host-agent.service "${RELEASE_DIR}/deploy/systemd/"
-cp deploy/scripts/{bootstrap-server,deploy,rollback,smoke-test,shutdown}.sh "${RELEASE_DIR}/deploy/scripts/"
+cp deploy/scripts/{bootstrap-server,deploy,rollback,smoke-test,shutdown,preflight,gpu-acceptance}.sh "${RELEASE_DIR}/deploy/scripts/"
 
 # Les digests sont capturés après publication afin que l'audit puisse relier un
 # tag lisible aux couches exactes tirées par Docker.
