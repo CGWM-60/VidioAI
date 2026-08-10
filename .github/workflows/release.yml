@@ -4,122 +4,146 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version de la release (ex: 2026.08.10-1)"
+        description: "Version de la release (ex: 2026.08.10-3)"
         required: true
         type: string
 
 jobs:
   release:
-    name: Build and publish release
-    runs-on: ubuntu-24.04
+    name: Build and publish VidioAI release
+
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+      - vidioai-build
 
     permissions:
       contents: read
 
     steps:
       # --------------------------------------------------------
-      # 1. Récupération du projet
+      # 1. Récupérer VidioAI
       # --------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
+
       # --------------------------------------------------------
       # 2. Rust
       # --------------------------------------------------------
-      - name: Install Rust 1.96
-        shell: bash
-        run: |
-          rustup toolchain install 1.96.0
-          rustup default 1.96.0
-          rustup component add rustfmt clippy
-          rustc --version
-          cargo --version
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
 
       # --------------------------------------------------------
-      # 3. Node.js pour Next.js
+      # 3. Node.js / Next.js
       # --------------------------------------------------------
-      - name: Setup Node.js 22
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
+
       # --------------------------------------------------------
-      # 4. Python pour le worker
+      # 4. Python worker
       # --------------------------------------------------------
-      - name: Setup Python 3.12
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: worker/requirements-test.txt
 
+
       # --------------------------------------------------------
-      # 5. Outils nécessaires au build-release.sh
+      # 5. AWS CLI
       # --------------------------------------------------------
-      - name: Install system tools
+      - name: Install AWS CLI
         shell: bash
         run: |
-          sudo apt-get update
-
-          sudo apt-get install -y \
-            jq \
-            protobuf-compiler \
-            libdrm-dev \
-            pkg-config
-
           python -m pip install --upgrade pip
           python -m pip install awscli
 
-          jq --version
           aws --version
-          protoc --version
 
-          echo "Checking DRM libraries..."
-          ldconfig -p | grep libdrm || true
 
       # --------------------------------------------------------
-      # 6. Docker Buildx
+      # 6. Vérifier le serveur de build
+      # --------------------------------------------------------
+      - name: Check build server
+        shell: bash
+        run: |
+          echo "=== CPU ==="
+          nproc
+
+          echo "=== RAM ==="
+          free -h
+
+          echo "=== DISK ==="
+          df -h
+
+          echo "=== DOCKER ==="
+          docker --version
+          docker compose version
+          docker buildx version
+
+          echo "=== SYSTEM DEPENDENCIES ==="
+          protoc --version
+          pkg-config --version
+          jq --version
+          cmake --version
+
+          echo "=== DOCKER DISK USAGE ==="
+          docker system df
+
+
+      # --------------------------------------------------------
+      # 7. Docker Buildx
       # --------------------------------------------------------
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Check Docker
-        shell: bash
-        run: |
-          docker --version
-          docker buildx version
 
       # --------------------------------------------------------
-      # 7. Connexion au Container Registry Scaleway
+      # 8. Connexion Scaleway Container Registry
       # --------------------------------------------------------
       - name: Login to Scaleway Container Registry
         shell: bash
         env:
           REGISTRY: ${{ vars.VIDIOAI_REGISTRY }}
           SCW_SECRET_KEY: ${{ secrets.SCW_CI_SECRET_KEY }}
+
         run: |
           printf '%s' "${SCW_SECRET_KEY}" \
             | docker login "${REGISTRY}" \
                 --username nologin \
                 --password-stdin
 
+
       # --------------------------------------------------------
-      # 8. Vérification du script
+      # 9. Vérifier build-release.sh
       # --------------------------------------------------------
       - name: Check release script
         shell: bash
         run: |
           test -f deploy/scripts/build-release.sh
+
           chmod +x deploy/scripts/build-release.sh
+
           bash -n deploy/scripts/build-release.sh
 
+
       # --------------------------------------------------------
-      # 9. Build complet + publication
+      # 10. Construction + publication
       # --------------------------------------------------------
       - name: Build and publish VidioAI release
         shell: bash
+
         env:
           VIDIOAI_REGISTRY: ${{ vars.VIDIOAI_REGISTRY }}
 
@@ -131,14 +155,17 @@ jobs:
           AWS_S3_BUCKET: ${{ vars.AWS_S3_BUCKET }}
 
           AWS_S3_STORAGE_CLASS: STANDARD
+
         run: |
           ./deploy/scripts/build-release.sh "${{ inputs.version }}"
 
+
       # --------------------------------------------------------
-      # 10. Vérifier que le bundle existe
+      # 11. Vérifier le bundle
       # --------------------------------------------------------
       - name: Check generated release
         shell: bash
+
         run: |
           RELEASE="output/vidioai-release-${{ inputs.version }}.tar.gz"
 
@@ -147,11 +174,13 @@ jobs:
           echo "Release generated:"
           ls -lh "${RELEASE}"
 
+
       # --------------------------------------------------------
-      # 11. Conserver également le bundle dans GitHub
+      # 12. Garder également le bundle sur GitHub
       # --------------------------------------------------------
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
+
         with:
           name: vidioai-release-${{ inputs.version }}
           path: output/vidioai-release-${{ inputs.version }}.tar.gz
