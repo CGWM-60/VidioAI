@@ -73,9 +73,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "supported": [
                 "TEXT_TO_IMAGE",
                 "IMAGE_TO_IMAGE",
+                "INPAINTING",
+                "OUTPAINTING",
+                "IMAGE_VARIATION",
+                "IMAGE_UPSCALE",
+                "CONTROLLED_IMAGE_GENERATION",
                 "TEXT_TO_VIDEO",
                 "IMAGE_TO_VIDEO",
+                "MULTI_IMAGE_TO_VIDEO",
+                "START_END_IMAGE_TO_VIDEO",
+                "KEYFRAMES_TO_VIDEO",
                 "VIDEO_TO_VIDEO",
+                "VIDEO_INPAINTING",
+                "VIDEO_UPSCALE",
             ],
             "unsupported": [],
             "engine_type": "ai",
@@ -121,7 +131,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def text_to_image(
         request: GenerateImageRequest, _auth: None = Depends(authorize)
     ) -> dict[str, object]:
-        result = await asyncio.to_thread(manager.generate_image, request.model_dump())
+        payload = request.model_dump()
+        payload["capability"] = payload.get("capability") or "TEXT_TO_IMAGE"
+        result = await asyncio.to_thread(manager.generate_image, payload)
         if result["state"] == "FAILED":
             raise WorkerError(str(result["error"]), 500)
         if result["state"] == "CANCELLED":
@@ -131,7 +143,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def image_to_image(
         request: GenerateImageRequest, _auth: None = Depends(authorize)
     ) -> dict[str, object]:
-        result = await asyncio.to_thread(manager.generate_image, request.model_dump())
+        payload = request.model_dump()
+        payload["capability"] = payload.get("capability") or "IMAGE_TO_IMAGE"
+        result = await asyncio.to_thread(manager.generate_image, payload)
         if result["state"] == "FAILED":
             raise WorkerError(str(result["error"]), 500)
         if result["state"] == "CANCELLED":
@@ -141,7 +155,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def text_to_video(
         request: GenerateVideoRequest, _auth: None = Depends(authorize)
     ) -> dict[str, object]:
-        result = await asyncio.to_thread(manager.generate_image, request.model_dump())
+        payload = request.model_dump()
+        payload["capability"] = payload.get("capability") or "TEXT_TO_VIDEO"
+        result = await asyncio.to_thread(manager.generate_image, payload)
         if result["state"] == "FAILED":
             raise WorkerError(str(result["error"]), 500)
         if result["state"] == "CANCELLED":
@@ -151,7 +167,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def image_to_video(
         request: GenerateVideoRequest, _auth: None = Depends(authorize)
     ) -> dict[str, object]:
-        result = await asyncio.to_thread(manager.generate_image, request.model_dump())
+        payload = request.model_dump()
+        payload["capability"] = payload.get("capability") or "IMAGE_TO_VIDEO"
+        result = await asyncio.to_thread(manager.generate_image, payload)
         if result["state"] == "FAILED":
             raise WorkerError(str(result["error"]), 500)
         if result["state"] == "CANCELLED":
@@ -161,7 +179,129 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def video_to_video(
         request: GenerateVideoRequest, _auth: None = Depends(authorize)
     ) -> dict[str, object]:
-        result = await asyncio.to_thread(manager.generate_image, request.model_dump())
+        payload = request.model_dump()
+        payload["capability"] = payload.get("capability") or "VIDEO_TO_VIDEO"
+        result = await asyncio.to_thread(manager.generate_image, payload)
+        if result["state"] == "FAILED":
+            raise WorkerError(str(result["error"]), 500)
+        if result["state"] == "CANCELLED":
+            raise WorkerError("La génération a été annulée.", 409)
+        return result
+
+    async def inpainting(
+        request: GenerateImageRequest, _auth: None = Depends(authorize)
+    ) -> dict[str, object]:
+        payload = request.model_dump()
+        payload["capability"] = "INPAINTING"
+        result = await asyncio.to_thread(manager.generate_image, payload)
+        if result["state"] == "FAILED":
+            raise WorkerError(str(result["error"]), 500)
+        if result["state"] == "CANCELLED":
+            raise WorkerError("La génération a été annulée.", 409)
+        return result
+
+    async def outpainting(
+        request: GenerateImageRequest, _auth: None = Depends(authorize)
+    ) -> dict[str, object]:
+        payload = request.model_dump()
+        payload["capability"] = "OUTPAINTING"
+        result = await asyncio.to_thread(manager.generate_image, payload)
+        if result["state"] == "FAILED":
+            raise WorkerError(str(result["error"]), 500)
+        if result["state"] == "CANCELLED":
+            raise WorkerError("La génération a été annulée.", 409)
+        return result
+
+    async def image_variation(
+        request: GenerateImageRequest, _auth: None = Depends(authorize)
+    ) -> dict[str, object]:
+        payload = request.model_dump()
+        payload["capability"] = "IMAGE_VARIATION"
+        result = await asyncio.to_thread(manager.generate_image, payload)
+        if result["state"] == "FAILED":
+            raise WorkerError(str(result["error"]), 500)
+        if result["state"] == "CANCELLED":
+            raise WorkerError("La génération a été annulée.", 409)
+        return result
+
+    async def image_upscale(
+        request: GenerateImageRequest, _auth: None = Depends(authorize)
+    ) -> dict[str, object]:
+        payload = request.model_dump()
+        payload["capability"] = "IMAGE_UPSCALE"
+        result = await asyncio.to_thread(manager.generate_image, payload)
+        if result["state"] == "FAILED":
+            raise WorkerError(str(result["error"]), 500)
+        if result["state"] == "CANCELLED":
+            raise WorkerError("La génération a été annulée.", 409)
+        return result
+
+    async def controlled_image_generation(
+        request: GenerateImageRequest, _auth: None = Depends(authorize)
+    ) -> dict[str, object]:
+        payload = request.model_dump()
+        payload["capability"] = "CONTROLLED_IMAGE_GENERATION"
+        result = await asyncio.to_thread(manager.generate_image, payload)
+        if result["state"] == "FAILED":
+            raise WorkerError(str(result["error"]), 500)
+        if result["state"] == "CANCELLED":
+            raise WorkerError("La génération a été annulée.", 409)
+        return result
+
+    async def multi_image_to_video(
+        request: GenerateVideoRequest, _auth: None = Depends(authorize)
+    ) -> dict[str, object]:
+        payload = request.model_dump()
+        payload["capability"] = "MULTI_IMAGE_TO_VIDEO"
+        result = await asyncio.to_thread(manager.generate_image, payload)
+        if result["state"] == "FAILED":
+            raise WorkerError(str(result["error"]), 500)
+        if result["state"] == "CANCELLED":
+            raise WorkerError("La génération a été annulée.", 409)
+        return result
+
+    async def start_end_image_to_video(
+        request: GenerateVideoRequest, _auth: None = Depends(authorize)
+    ) -> dict[str, object]:
+        payload = request.model_dump()
+        payload["capability"] = "START_END_IMAGE_TO_VIDEO"
+        result = await asyncio.to_thread(manager.generate_image, payload)
+        if result["state"] == "FAILED":
+            raise WorkerError(str(result["error"]), 500)
+        if result["state"] == "CANCELLED":
+            raise WorkerError("La génération a été annulée.", 409)
+        return result
+
+    async def keyframes_to_video(
+        request: GenerateVideoRequest, _auth: None = Depends(authorize)
+    ) -> dict[str, object]:
+        payload = request.model_dump()
+        payload["capability"] = "KEYFRAMES_TO_VIDEO"
+        result = await asyncio.to_thread(manager.generate_image, payload)
+        if result["state"] == "FAILED":
+            raise WorkerError(str(result["error"]), 500)
+        if result["state"] == "CANCELLED":
+            raise WorkerError("La génération a été annulée.", 409)
+        return result
+
+    async def video_inpainting(
+        request: GenerateVideoRequest, _auth: None = Depends(authorize)
+    ) -> dict[str, object]:
+        payload = request.model_dump()
+        payload["capability"] = "VIDEO_INPAINTING"
+        result = await asyncio.to_thread(manager.generate_image, payload)
+        if result["state"] == "FAILED":
+            raise WorkerError(str(result["error"]), 500)
+        if result["state"] == "CANCELLED":
+            raise WorkerError("La génération a été annulée.", 409)
+        return result
+
+    async def video_upscale(
+        request: GenerateVideoRequest, _auth: None = Depends(authorize)
+    ) -> dict[str, object]:
+        payload = request.model_dump()
+        payload["capability"] = "VIDEO_UPSCALE"
+        result = await asyncio.to_thread(manager.generate_image, payload)
         if result["state"] == "FAILED":
             raise WorkerError(str(result["error"]), 500)
         if result["state"] == "CANCELLED":
@@ -169,9 +309,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return result
 
     application.post("/v1/generate/image-to-image")(image_to_image)
+    application.post("/v1/generate/inpainting")(inpainting)
+    application.post("/v1/generate/outpainting")(outpainting)
+    application.post("/v1/generate/image-variation")(image_variation)
+    application.post("/v1/generate/image-upscale")(image_upscale)
+    application.post("/v1/generate/controlled-image-generation")(controlled_image_generation)
     application.post("/v1/generate/text-to-video")(text_to_video)
     application.post("/v1/generate/image-to-video")(image_to_video)
+    application.post("/v1/generate/multi-image-to-video")(multi_image_to_video)
+    application.post("/v1/generate/start-end-image-to-video")(start_end_image_to_video)
+    application.post("/v1/generate/keyframes-to-video")(keyframes_to_video)
     application.post("/v1/generate/video-to-video")(video_to_video)
+    application.post("/v1/generate/video-inpainting")(video_inpainting)
+    application.post("/v1/generate/video-upscale")(video_upscale)
 
     @application.post("/v1/jobs/cancel")
     async def cancel_job(

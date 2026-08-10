@@ -47,9 +47,19 @@ pub enum ModelCapability {
     Vision,
     TextToImage,
     ImageToImage,
+    Inpainting,
+    Outpainting,
+    ImageVariation,
+    ImageUpscale,
+    ControlledImageGeneration,
     TextToVideo,
     ImageToVideo,
+    MultiImageToVideo,
+    StartEndImageToVideo,
+    KeyframesToVideo,
     VideoToVideo,
+    VideoInpainting,
+    VideoUpscale,
     Audio,
     TextToSpeech,
     SpeechToText,
@@ -64,15 +74,25 @@ impl ModelCapability {
     /// `TEXT_TO_VIDEO`. Centraliser ce mapping garde donc les explications
     /// humaines cohérentes avec les valeurs réellement consommées par le
     /// frontend.
-    fn api_name(&self) -> &'static str {
+    pub(crate) fn api_name(&self) -> &'static str {
         match self {
             Self::Chat => "CHAT",
             Self::Vision => "VISION",
             Self::TextToImage => "TEXT_TO_IMAGE",
             Self::ImageToImage => "IMAGE_TO_IMAGE",
+            Self::Inpainting => "INPAINTING",
+            Self::Outpainting => "OUTPAINTING",
+            Self::ImageVariation => "IMAGE_VARIATION",
+            Self::ImageUpscale => "IMAGE_UPSCALE",
+            Self::ControlledImageGeneration => "CONTROLLED_IMAGE_GENERATION",
             Self::TextToVideo => "TEXT_TO_VIDEO",
             Self::ImageToVideo => "IMAGE_TO_VIDEO",
+            Self::MultiImageToVideo => "MULTI_IMAGE_TO_VIDEO",
+            Self::StartEndImageToVideo => "START_END_IMAGE_TO_VIDEO",
+            Self::KeyframesToVideo => "KEYFRAMES_TO_VIDEO",
             Self::VideoToVideo => "VIDEO_TO_VIDEO",
+            Self::VideoInpainting => "VIDEO_INPAINTING",
+            Self::VideoUpscale => "VIDEO_UPSCALE",
             Self::Audio => "AUDIO",
             Self::TextToSpeech => "TEXT_TO_SPEECH",
             Self::SpeechToText => "SPEECH_TO_TEXT",
@@ -968,9 +988,23 @@ fn normalize_capabilities(pipeline: &str, tags: &[String]) -> Vec<ModelCapabilit
             | "document-question-answering" => Some(ModelCapability::Vision),
             "text-to-image" => Some(ModelCapability::TextToImage),
             "image-to-image" => Some(ModelCapability::ImageToImage),
+            "inpainting" | "image-inpainting" => Some(ModelCapability::Inpainting),
+            "outpainting" | "image-outpainting" => Some(ModelCapability::Outpainting),
+            "image-variation" | "variation" => Some(ModelCapability::ImageVariation),
+            "super-resolution" | "upscale" | "image-upscale" => {
+                Some(ModelCapability::ImageUpscale)
+            }
+            "controlnet" | "controlled-image-generation" => {
+                Some(ModelCapability::ControlledImageGeneration)
+            }
             "text-to-video" => Some(ModelCapability::TextToVideo),
             "image-to-video" => Some(ModelCapability::ImageToVideo),
+            "multi-image-to-video" => Some(ModelCapability::MultiImageToVideo),
+            "start-end-image-to-video" => Some(ModelCapability::StartEndImageToVideo),
+            "keyframes-to-video" => Some(ModelCapability::KeyframesToVideo),
             "video-to-video" => Some(ModelCapability::VideoToVideo),
+            "video-inpainting" => Some(ModelCapability::VideoInpainting),
+            "video-upscale" | "video-super-resolution" => Some(ModelCapability::VideoUpscale),
             "text-to-speech" | "text-to-audio" => Some(ModelCapability::TextToSpeech),
             "automatic-speech-recognition" | "speech-to-text" => {
                 Some(ModelCapability::SpeechToText)
@@ -990,14 +1024,40 @@ fn normalize_capabilities(pipeline: &str, tags: &[String]) -> Vec<ModelCapabilit
     if values.is_empty() {
         values.insert(ModelCapability::CapabilityUnknown);
     }
+    if values.contains(&ModelCapability::ImageToImage) {
+        values.insert(ModelCapability::Inpainting);
+        values.insert(ModelCapability::Outpainting);
+        values.insert(ModelCapability::ImageVariation);
+        values.insert(ModelCapability::ImageUpscale);
+        values.insert(ModelCapability::ControlledImageGeneration);
+    }
+    if values.contains(&ModelCapability::ImageToVideo) {
+        values.insert(ModelCapability::MultiImageToVideo);
+        values.insert(ModelCapability::StartEndImageToVideo);
+        values.insert(ModelCapability::KeyframesToVideo);
+    }
+    if values.contains(&ModelCapability::VideoToVideo) {
+        values.insert(ModelCapability::VideoInpainting);
+        values.insert(ModelCapability::VideoUpscale);
+    }
     let order = [
         ModelCapability::Chat,
         ModelCapability::Vision,
         ModelCapability::TextToImage,
         ModelCapability::ImageToImage,
+        ModelCapability::Inpainting,
+        ModelCapability::Outpainting,
+        ModelCapability::ImageVariation,
+        ModelCapability::ImageUpscale,
+        ModelCapability::ControlledImageGeneration,
         ModelCapability::TextToVideo,
         ModelCapability::ImageToVideo,
+        ModelCapability::MultiImageToVideo,
+        ModelCapability::StartEndImageToVideo,
+        ModelCapability::KeyframesToVideo,
         ModelCapability::VideoToVideo,
+        ModelCapability::VideoInpainting,
+        ModelCapability::VideoUpscale,
         ModelCapability::Audio,
         ModelCapability::TextToSpeech,
         ModelCapability::SpeechToText,
@@ -1015,14 +1075,25 @@ fn primary_kind(capabilities: &[ModelCapability]) -> ModelKind {
             capability,
             ModelCapability::TextToVideo
                 | ModelCapability::ImageToVideo
+                | ModelCapability::MultiImageToVideo
+                | ModelCapability::StartEndImageToVideo
+                | ModelCapability::KeyframesToVideo
                 | ModelCapability::VideoToVideo
+                | ModelCapability::VideoInpainting
+                | ModelCapability::VideoUpscale
         )
     }) {
         ModelKind::Video
     } else if capabilities.iter().any(|capability| {
         matches!(
             capability,
-            ModelCapability::TextToImage | ModelCapability::ImageToImage
+            ModelCapability::TextToImage
+                | ModelCapability::ImageToImage
+                | ModelCapability::Inpainting
+                | ModelCapability::Outpainting
+                | ModelCapability::ImageVariation
+                | ModelCapability::ImageUpscale
+                | ModelCapability::ControlledImageGeneration
         )
     }) {
         ModelKind::Image
@@ -1104,27 +1175,24 @@ fn runtime_match(
     let has_diffusers_index = files
         .iter()
         .any(|file| file.path.rsplit('/').next() == Some("model_index.json"));
-    let explicitly_non_t2i_class = architecture.is_some_and(|class_name| {
-        ["Video", "ImageToImage", "Inpaint", "Upscale"]
-            .iter()
-            .any(|marker| class_name.contains(marker))
-    });
-    if capabilities.contains(&ModelCapability::TextToImage)
-        && library == "diffusers"
-        && has_safetensors
-        && has_diffusers_index
-        && !explicitly_non_t2i_class
-    {
-        let detected =
-            architecture.unwrap_or("classe résolue depuis model_index.json au chargement");
-        return (
-            Some("Diffusers AutoPipelineForText2Image".into()),
-            true,
-            format!(
-                "Pipeline TEXT_TO_IMAGE Diffusers exécutable par AutoPipelineForText2Image ({detected})."
-            ),
-            vec![ModelCapability::TextToImage],
-        );
+    if library == "diffusers" && has_safetensors && has_diffusers_index {
+        let runtime_capabilities = infer_runtime_capabilities(capabilities, architecture, files);
+        if !runtime_capabilities.is_empty() {
+            let detected = architecture.unwrap_or("classe résolue depuis model_index.json au chargement");
+            let labels = runtime_capabilities
+                .iter()
+                .map(ModelCapability::api_name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return (
+                Some("Diffusers PipelineRegistry".into()),
+                true,
+                format!(
+                    "Pipeline Diffusers exécutable par le runtime dynamique VidioAI ({detected}) : {labels}."
+                ),
+                runtime_capabilities,
+            );
+        }
     }
     if capabilities.contains(&ModelCapability::Chat)
         && library == "transformers"
@@ -1147,10 +1215,10 @@ fn runtime_match(
             .collect::<Vec<_>>()
             .join(", ");
         return (
-            Some("Diffusers (pipeline non implémenté)".into()),
+            Some("Diffusers (incomplet)".into()),
             false,
             format!(
-                "Matériel évalué séparément ; le Worker actuel n'implémente pas encore ce pipeline Diffusers ({requested})."
+                "Manifest Diffusers détecté, mais incomplet pour une exécution sûre (fichiers requis absents ou classe non reconnue) : {requested}."
             ),
             Vec::new(),
         );
@@ -1168,6 +1236,129 @@ fn runtime_match(
         ),
         Vec::new(),
     )
+}
+
+fn infer_runtime_capabilities(
+    advertised: &[ModelCapability],
+    architecture: Option<&str>,
+    files: &[RepositoryFile],
+) -> Vec<ModelCapability> {
+    let mut values = HashSet::new();
+    let class_name = architecture.unwrap_or_default().to_ascii_lowercase();
+    let has_mask_files = files
+        .iter()
+        .map(|file| file.path.to_ascii_lowercase())
+        .any(|path| path.contains("mask"));
+
+    if advertised.contains(&ModelCapability::TextToImage) || class_name.contains("text2image") {
+        values.insert(ModelCapability::TextToImage);
+    }
+    if advertised.contains(&ModelCapability::ImageToImage)
+        || class_name.contains("img2img")
+        || class_name.contains("image2image")
+    {
+        values.insert(ModelCapability::ImageToImage);
+    }
+    if advertised.contains(&ModelCapability::TextToVideo) || class_name.contains("text2video") {
+        values.insert(ModelCapability::TextToVideo);
+    }
+    if advertised.contains(&ModelCapability::ImageToVideo)
+        || class_name.contains("image2video")
+        || class_name.contains("img2vid")
+    {
+        values.insert(ModelCapability::ImageToVideo);
+    }
+    if advertised.contains(&ModelCapability::VideoToVideo)
+        || class_name.contains("video2video")
+        || class_name.contains("vid2vid")
+    {
+        values.insert(ModelCapability::VideoToVideo);
+    }
+
+    if values.contains(&ModelCapability::ImageToImage)
+        || advertised.contains(&ModelCapability::Inpainting)
+        || class_name.contains("inpaint")
+        || has_mask_files
+    {
+        values.insert(ModelCapability::Inpainting);
+    }
+    if values.contains(&ModelCapability::ImageToImage)
+        || advertised.contains(&ModelCapability::Outpainting)
+        || class_name.contains("outpaint")
+    {
+        values.insert(ModelCapability::Outpainting);
+    }
+    if values.contains(&ModelCapability::ImageToImage)
+        || advertised.contains(&ModelCapability::ImageVariation)
+        || class_name.contains("variation")
+    {
+        values.insert(ModelCapability::ImageVariation);
+    }
+    if values.contains(&ModelCapability::ImageToImage)
+        || advertised.contains(&ModelCapability::ImageUpscale)
+        || class_name.contains("upscale")
+    {
+        values.insert(ModelCapability::ImageUpscale);
+    }
+    if values.contains(&ModelCapability::ImageToImage)
+        || advertised.contains(&ModelCapability::ControlledImageGeneration)
+        || class_name.contains("control")
+    {
+        values.insert(ModelCapability::ControlledImageGeneration);
+    }
+
+    if values.contains(&ModelCapability::ImageToVideo)
+        || advertised.contains(&ModelCapability::MultiImageToVideo)
+    {
+        values.insert(ModelCapability::MultiImageToVideo);
+    }
+    if values.contains(&ModelCapability::ImageToVideo)
+        || advertised.contains(&ModelCapability::StartEndImageToVideo)
+        || class_name.contains("ltx")
+    {
+        values.insert(ModelCapability::StartEndImageToVideo);
+    }
+    if values.contains(&ModelCapability::ImageToVideo)
+        || advertised.contains(&ModelCapability::KeyframesToVideo)
+        || class_name.contains("cogvideo")
+    {
+        values.insert(ModelCapability::KeyframesToVideo);
+    }
+
+    if values.contains(&ModelCapability::VideoToVideo)
+        || advertised.contains(&ModelCapability::VideoInpainting)
+        || (class_name.contains("video") && class_name.contains("inpaint"))
+    {
+        values.insert(ModelCapability::VideoInpainting);
+    }
+    if values.contains(&ModelCapability::VideoToVideo)
+        || advertised.contains(&ModelCapability::VideoUpscale)
+        || (class_name.contains("video") && class_name.contains("upscale"))
+    {
+        values.insert(ModelCapability::VideoUpscale);
+    }
+
+    let order = [
+        ModelCapability::TextToImage,
+        ModelCapability::ImageToImage,
+        ModelCapability::Inpainting,
+        ModelCapability::Outpainting,
+        ModelCapability::ImageVariation,
+        ModelCapability::ImageUpscale,
+        ModelCapability::ControlledImageGeneration,
+        ModelCapability::TextToVideo,
+        ModelCapability::ImageToVideo,
+        ModelCapability::MultiImageToVideo,
+        ModelCapability::StartEndImageToVideo,
+        ModelCapability::KeyframesToVideo,
+        ModelCapability::VideoToVideo,
+        ModelCapability::VideoInpainting,
+        ModelCapability::VideoUpscale,
+    ];
+    order
+        .into_iter()
+        .filter(|capability| values.contains(capability))
+        .collect()
 }
 
 fn estimated_variant(size: Option<u64>, hardware: &HardwareEstimate) -> Vec<ModelVariant> {
@@ -1196,10 +1387,14 @@ fn requested_pipelines(query: &CatalogQuery) -> Vec<&'static str> {
             "CHAT" => vec!["text-generation"],
             "VISION" => vec!["image-text-to-text", "visual-question-answering"],
             "TEXT_TO_IMAGE" => vec!["text-to-image"],
-            "IMAGE_TO_IMAGE" => vec!["image-to-image"],
+            "IMAGE_TO_IMAGE" | "INPAINTING" | "OUTPAINTING" | "IMAGE_VARIATION"
+            | "IMAGE_UPSCALE" | "CONTROLLED_IMAGE_GENERATION" => vec!["image-to-image"],
             "TEXT_TO_VIDEO" => vec!["text-to-video"],
-            "IMAGE_TO_VIDEO" => vec!["image-to-video"],
-            "VIDEO_TO_VIDEO" => vec!["video-to-video"],
+            "IMAGE_TO_VIDEO" | "MULTI_IMAGE_TO_VIDEO" | "START_END_IMAGE_TO_VIDEO"
+            | "KEYFRAMES_TO_VIDEO" => vec!["image-to-video"],
+            "VIDEO_TO_VIDEO" | "VIDEO_INPAINTING" | "VIDEO_UPSCALE" => {
+                vec!["video-to-video"]
+            }
             "AUDIO" => vec!["text-to-speech", "automatic-speech-recognition"],
             "TEXT_TO_SPEECH" => vec!["text-to-speech"],
             "SPEECH_TO_TEXT" => vec!["automatic-speech-recognition"],
@@ -1472,11 +1667,11 @@ mod tests {
             model.runtime_capabilities,
             vec![ModelCapability::TextToImage]
         );
-        assert!(model.runtime_reason.contains("AutoPipelineForText2Image"));
+        assert!(model.runtime_reason.contains("runtime dynamique"));
     }
 
     #[test]
-    fn diffusers_video_is_hardware_estimable_but_not_runtime_supported() {
+    fn diffusers_video_is_runtime_supported_when_manifest_is_complete() {
         let raw: HfRawModel = serde_json::from_value(json!({
             "id": "stabilityai/stable-video-diffusion-img2vid",
             "pipeline_tag": "image-to-video",
@@ -1492,9 +1687,10 @@ mod tests {
         .unwrap();
         let model = normalize_model(raw);
         assert!(model.quality_valid);
-        assert!(!model.runtime_supported);
-        assert!(model.runtime_capabilities.is_empty());
-        assert!(model.runtime_reason.contains("pas encore"));
+        assert!(model.runtime_supported);
+        assert!(model.runtime_capabilities.contains(&ModelCapability::ImageToVideo));
+        assert!(model.runtime_capabilities.contains(&ModelCapability::MultiImageToVideo));
+        assert!(model.runtime_reason.contains("runtime dynamique"));
     }
 
     #[test]

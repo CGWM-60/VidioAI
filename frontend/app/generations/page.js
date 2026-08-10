@@ -12,9 +12,14 @@ import { apiFetch, assetUrl, closeWebSocketSafely, eventsUrl } from "../lib/api"
 import styles from "../studio.module.css";
 
 const MODES = [
-  { id: "TEXT_TO_VIDEO", label: "Texte → Vidéo", icon: BsStars, capability: "TEXT_TO_VIDEO", accepts: "" },
-  { id: "IMAGE_TO_VIDEO", label: "Image → Vidéo", icon: BsImage, capability: "IMAGE_TO_VIDEO", accepts: "image/png,image/jpeg,image/webp" },
-  { id: "VIDEO_TO_VIDEO", label: "Vidéo → Vidéo", icon: BsFilm, capability: "VIDEO_TO_VIDEO", accepts: "video/mp4" },
+  { id: "TEXT_TO_VIDEO", label: "Texte → Vidéo", icon: BsStars, capability: "TEXT_TO_VIDEO", mode: "TEXT_TO_VIDEO", inputKind: "none", accepts: "" },
+  { id: "IMAGE_TO_VIDEO", label: "Image → Vidéo", icon: BsImage, capability: "IMAGE_TO_VIDEO", mode: "IMAGE_TO_VIDEO", inputKind: "image", accepts: "image/png,image/jpeg,image/webp" },
+  { id: "MULTI_IMAGE_TO_VIDEO", label: "Multi-images → Vidéo", icon: BsImage, capability: "MULTI_IMAGE_TO_VIDEO", mode: "IMAGE_TO_VIDEO", inputKind: "image", accepts: "image/png,image/jpeg,image/webp" },
+  { id: "START_END_IMAGE_TO_VIDEO", label: "Start/End → Vidéo", icon: FaArrowsAlt, capability: "START_END_IMAGE_TO_VIDEO", mode: "IMAGE_TO_VIDEO", inputKind: "image", accepts: "image/png,image/jpeg,image/webp" },
+  { id: "KEYFRAMES_TO_VIDEO", label: "Keyframes → Vidéo", icon: BsImage, capability: "KEYFRAMES_TO_VIDEO", mode: "IMAGE_TO_VIDEO", inputKind: "image", accepts: "image/png,image/jpeg,image/webp" },
+  { id: "VIDEO_TO_VIDEO", label: "Vidéo → Vidéo", icon: BsFilm, capability: "VIDEO_TO_VIDEO", mode: "VIDEO_TO_VIDEO", inputKind: "video", accepts: "video/mp4" },
+  { id: "VIDEO_INPAINTING", label: "Inpainting vidéo", icon: BsFilm, capability: "VIDEO_INPAINTING", mode: "VIDEO_TO_VIDEO", inputKind: "video", accepts: "video/mp4" },
+  { id: "VIDEO_UPSCALE", label: "Upscale vidéo", icon: BsFilm, capability: "VIDEO_UPSCALE", mode: "VIDEO_TO_VIDEO", inputKind: "video", accepts: "video/mp4" },
 ];
 const DEFAULT_INPUT_PROFILE = {
   min_input_images: 1,
@@ -44,19 +49,19 @@ function GenerationsContent() {
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState("");
 
-  const activeMode = MODES.find((item) => item.id === mode);
+  const activeMode = MODES.find((item) => item.id === mode) || MODES[0];
   const generationId = generation?.id;
   const generationStatus = generation?.status;
   const compatibleModels = useMemo(() => models.filter((model) => (
     model.capabilities.includes(activeMode.capability)
   )), [activeMode.capability, models]);
   const effectiveInputProfile = useMemo(() => {
-    if (mode !== "IMAGE_TO_VIDEO") {
+    if (activeMode.inputKind !== "image") {
       return DEFAULT_INPUT_PROFILE;
     }
     const selectedModel = models.find((model) => model.id === modelId);
     return selectedModel?.input_profile || DEFAULT_INPUT_PROFILE;
-  }, [mode, modelId, models]);
+  }, [activeMode.inputKind, modelId, models]);
   const visibleInputImages = useMemo(() => inputImages.slice(0, effectiveInputProfile.max_input_images), [effectiveInputProfile.max_input_images, inputImages]);
 
   const refreshHistory = useCallback(async () => {
@@ -128,7 +133,7 @@ function GenerationsContent() {
         body.append("file", file);
         assets.push(await apiFetch("/api/assets", { method: "POST", body }));
       }
-      if (mode === "IMAGE_TO_VIDEO") {
+      if (activeMode.inputKind === "image") {
         const nextImages = [...inputImages];
         for (const asset of assets) {
           if (nextImages.length >= effectiveInputProfile.max_input_images) break;
@@ -149,17 +154,19 @@ function GenerationsContent() {
 
   async function submitGeneration() {
     setError("");
-    if (mode !== "TEXT_TO_VIDEO" && !inputAsset) {
+    if (activeMode.inputKind !== "none" && !inputAsset && !visibleInputImages.length) {
       setError("Ajoutez le média de départ avant de lancer la génération.");
       return;
     }
     try {
       const payload = {
-        mode,
+        mode: activeMode.mode,
+        capability: activeMode.capability,
         prompt,
+        negative_prompt: null,
         model_id: modelId,
-        input_asset_id: mode === "IMAGE_TO_VIDEO" && visibleInputImages.length ? visibleInputImages[0].asset_id : inputAsset?.id,
-        input_images: mode === "IMAGE_TO_VIDEO" ? visibleInputImages : [],
+        input_asset_id: activeMode.inputKind === "image" && visibleInputImages.length ? visibleInputImages[0].asset_id : inputAsset?.id,
+        input_images: activeMode.inputKind === "image" ? visibleInputImages : [],
         duration_seconds: Number(duration),
         resolution,
         audio,
@@ -222,10 +229,10 @@ function GenerationsContent() {
             })}
           </div>
 
-          {mode !== "TEXT_TO_VIDEO" && (
+          {activeMode.inputKind !== "none" && (
             <div className={styles.videoSourceBlock}>
-              <div className={styles.sectionTitle}><strong>{sourceIsVideo ? "Vidéo de départ" : mode === "IMAGE_TO_VIDEO" ? "Images de départ" : "Image de départ"}</strong><span>{mode === "IMAGE_TO_VIDEO" ? `${visibleInputImages.length}/${effectiveInputProfile.max_input_images}` : "Asset persistant"}</span></div>
-              {mode === "IMAGE_TO_VIDEO" ? (
+              <div className={styles.sectionTitle}><strong>{sourceIsVideo ? "Vidéo de départ" : activeMode.inputKind === "image" ? "Images de départ" : "Image de départ"}</strong><span>{activeMode.inputKind === "image" ? `${visibleInputImages.length}/${effectiveInputProfile.max_input_images}` : "Asset persistant"}</span></div>
+              {activeMode.inputKind === "image" ? (
                 <div className={styles.imageStack}>
                   {visibleInputImages.length ? visibleInputImages.map((item, index) => (
                     <div key={`${item.asset_id}-${index}`} className={styles.imageStackCard}>
@@ -265,7 +272,7 @@ function GenerationsContent() {
                   ) : (
                     <button type="button" className={styles.videoUpload} onClick={() => fileInputRef.current?.click()}>
                       <BsUpload /><strong>{uploading ? "Import en cours…" : "Glissez-déposez ou cliquez pour parcourir"}</strong>
-                      <span>{mode === "IMAGE_TO_VIDEO" ? "PNG, JPEG ou WebP · 25 Mo max" : "MP4 · 512 Mo max"}</span>
+                      <span>{activeMode.inputKind === "image" ? "PNG, JPEG ou WebP · 25 Mo max" : "MP4 · 512 Mo max"}</span>
                     </button>
                   )}
                   <input ref={fileInputRef} hidden type="file" accept={activeMode.accepts} onChange={uploadFile} />

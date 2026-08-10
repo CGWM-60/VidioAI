@@ -50,6 +50,9 @@ class GenerateImageRequest(BaseModel):
     strength: float | None = Field(default=None, ge=0.0, le=1.0)
     capability: str | None = Field(default=None, max_length=32)
     seed: int | None = Field(default=None, ge=0)
+    input_path: str | None = Field(default=None, max_length=2048)
+    mask_path: str | None = Field(default=None, max_length=2048)
+    control_path: str | None = Field(default=None, max_length=2048)
 
 
 class GenerateVideoRequest(BaseModel):
@@ -67,6 +70,9 @@ class GenerateVideoRequest(BaseModel):
     frames: int | None = Field(default=None, ge=1, le=180)
     capability: str | None = Field(default=None, max_length=32)
     seed: int | None = Field(default=None, ge=0)
+    input_path: str | None = Field(default=None, max_length=2048)
+    mask_path: str | None = Field(default=None, max_length=2048)
+    input_images: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class UnsupportedGenerationRequest(BaseModel):

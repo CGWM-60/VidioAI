@@ -508,10 +508,16 @@ pub struct Generation {
     pub id: Uuid,
     pub kind: AssetKind,
     pub mode: GenerationMode,
+    #[serde(default)]
+    pub capability: Option<ModelCapability>,
     pub prompt: String,
     pub negative_prompt: Option<String>,
     pub model_id: String,
     pub input_asset_id: Option<Uuid>,
+    #[serde(default)]
+    pub mask_asset_id: Option<Uuid>,
+    #[serde(default)]
+    pub control_asset_id: Option<Uuid>,
     #[serde(default)]
     pub input_images: Vec<GenerationInputImage>,
     pub output_asset_id: Option<Uuid>,
@@ -540,16 +546,23 @@ pub struct GenerationInputImage {
 #[derive(Debug, Deserialize)]
 pub struct GenerateImageRequest {
     pub mode: GenerationMode,
+    #[serde(default)]
+    pub capability: Option<ModelCapability>,
     pub prompt: String,
     pub negative_prompt: Option<String>,
     pub model_id: Option<String>,
     pub input_asset_id: Option<Uuid>,
+    pub mask_asset_id: Option<Uuid>,
+    pub control_asset_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct GenerateVideoRequest {
     pub mode: GenerationMode,
+    #[serde(default)]
+    pub capability: Option<ModelCapability>,
     pub prompt: String,
+    pub negative_prompt: Option<String>,
     pub model_id: Option<String>,
     pub input_asset_id: Option<Uuid>,
     #[serde(default)]
@@ -1039,9 +1052,19 @@ async fn route_model(
         ModelCapability::Vision => "VISION",
         ModelCapability::TextToImage => "TEXT_TO_IMAGE",
         ModelCapability::ImageToImage => "IMAGE_TO_IMAGE",
+        ModelCapability::Inpainting => "INPAINTING",
+        ModelCapability::Outpainting => "OUTPAINTING",
+        ModelCapability::ImageVariation => "IMAGE_VARIATION",
+        ModelCapability::ImageUpscale => "IMAGE_UPSCALE",
+        ModelCapability::ControlledImageGeneration => "CONTROLLED_IMAGE_GENERATION",
         ModelCapability::TextToVideo => "TEXT_TO_VIDEO",
         ModelCapability::ImageToVideo => "IMAGE_TO_VIDEO",
+        ModelCapability::MultiImageToVideo => "MULTI_IMAGE_TO_VIDEO",
+        ModelCapability::StartEndImageToVideo => "START_END_IMAGE_TO_VIDEO",
+        ModelCapability::KeyframesToVideo => "KEYFRAMES_TO_VIDEO",
         ModelCapability::VideoToVideo => "VIDEO_TO_VIDEO",
+        ModelCapability::VideoInpainting => "VIDEO_INPAINTING",
+        ModelCapability::VideoUpscale => "VIDEO_UPSCALE",
         ModelCapability::Audio => "AUDIO",
         ModelCapability::TextToSpeech => "TEXT_TO_SPEECH",
         ModelCapability::SpeechToText => "SPEECH_TO_TEXT",
@@ -1984,16 +2007,37 @@ fn model_input_profile(entry: &CatalogEntry) -> ModelInputProfile {
     )
     .to_ascii_lowercase();
 
-    if haystack.contains("ltx") || haystack.contains("ltx-video") {
+    let supports_start_end = entry
+        .runtime_capabilities
+        .contains(&ModelCapability::StartEndImageToVideo)
+        || haystack.contains("ltx")
+        || haystack.contains("ltx-video");
+    let supports_multi_reference = entry
+        .runtime_capabilities
+        .contains(&ModelCapability::MultiImageToVideo)
+        || entry
+            .runtime_capabilities
+            .contains(&ModelCapability::KeyframesToVideo)
+        || haystack.contains("cogvideo")
+        || haystack.contains("cogvideox");
+
+    if supports_start_end {
         ModelInputProfile {
             min_input_images: 1,
             max_input_images: 2,
-            supported_image_roles: vec!["start_frame".into(), "end_frame".into()],
+            supported_image_roles: vec![
+                "start".into(),
+                "end".into(),
+                "start_frame".into(),
+                "end_frame".into(),
+            ],
             supports_start_end_frames: true,
-            supports_reference_images: false,
-            supports_keyframes: false,
+            supports_reference_images: supports_multi_reference,
+            supports_keyframes: entry
+                .runtime_capabilities
+                .contains(&ModelCapability::KeyframesToVideo),
         }
-    } else if haystack.contains("cogvideo") || haystack.contains("cogvideox") {
+    } else if supports_multi_reference {
         ModelInputProfile {
             min_input_images: 1,
             max_input_images: 8,
@@ -3283,6 +3327,50 @@ impl AiEngine for CanvasEngine {
     }
 }
 
+fn image_endpoint(capability: &ModelCapability) -> &'static str {
+    match capability {
+        ModelCapability::TextToImage => "/v1/generate/text-to-image",
+        ModelCapability::ImageToImage => "/v1/generate/image-to-image",
+        ModelCapability::Inpainting => "/v1/generate/inpainting",
+        ModelCapability::Outpainting => "/v1/generate/outpainting",
+        ModelCapability::ImageVariation => "/v1/generate/image-variation",
+        ModelCapability::ImageUpscale => "/v1/generate/image-upscale",
+        ModelCapability::ControlledImageGeneration => "/v1/generate/controlled-image-generation",
+        _ => "/v1/generate/image-to-image",
+    }
+}
+
+fn image_capability_mode_default(mode: &GenerationMode) -> Option<ModelCapability> {
+    match mode {
+        GenerationMode::TextToImage => Some(ModelCapability::TextToImage),
+        GenerationMode::ImageToImage => Some(ModelCapability::ImageToImage),
+        _ => None,
+    }
+}
+
+fn video_capability_mode_default(mode: &GenerationMode) -> Option<ModelCapability> {
+    match mode {
+        GenerationMode::TextToVideo => Some(ModelCapability::TextToVideo),
+        GenerationMode::ImageToVideo => Some(ModelCapability::ImageToVideo),
+        GenerationMode::VideoToVideo => Some(ModelCapability::VideoToVideo),
+        GenerationMode::TextToImage | GenerationMode::ImageToImage => None,
+    }
+}
+
+fn video_endpoint(capability: &ModelCapability) -> &'static str {
+    match capability {
+        ModelCapability::TextToVideo => "/v1/generate/text-to-video",
+        ModelCapability::ImageToVideo => "/v1/generate/image-to-video",
+        ModelCapability::MultiImageToVideo => "/v1/generate/multi-image-to-video",
+        ModelCapability::StartEndImageToVideo => "/v1/generate/start-end-image-to-video",
+        ModelCapability::KeyframesToVideo => "/v1/generate/keyframes-to-video",
+        ModelCapability::VideoToVideo => "/v1/generate/video-to-video",
+        ModelCapability::VideoInpainting => "/v1/generate/video-inpainting",
+        ModelCapability::VideoUpscale => "/v1/generate/video-upscale",
+        _ => "/v1/generate/video-to-video",
+    }
+}
+
 async fn generate_image(
     State(state): State<Arc<AppState>>,
     Json(request): Json<GenerateImageRequest>,
@@ -3314,6 +3402,12 @@ async fn generate_image(
             "Les moteurs procéduraux sont désactivés pour la génération d'image GPU_PRODUCTION.",
         ));
     }
+    let requested_capability = request
+        .capability
+        .clone()
+        .or_else(|| image_capability_mode_default(&request.mode))
+        .ok_or_else(|| ApiError::bad_request("Capacité image invalide."))?;
+
     let expected_capability = match request.mode {
         GenerationMode::TextToImage => ModelCapability::TextToImage,
         GenerationMode::ImageToImage => ModelCapability::ImageToImage,
@@ -3323,7 +3417,31 @@ async fn generate_image(
             ));
         }
     };
-    if !entry.capabilities.contains(&expected_capability) {
+    if request.mode == GenerationMode::TextToImage
+        && requested_capability != ModelCapability::TextToImage
+    {
+        return Err(ApiError::bad_request(
+            "TEXT_TO_IMAGE est la seule capacité autorisée pour ce mode.",
+        ));
+    }
+    if request.mode == GenerationMode::ImageToImage
+        && !matches!(
+            requested_capability,
+            ModelCapability::ImageToImage
+                | ModelCapability::Inpainting
+                | ModelCapability::Outpainting
+                | ModelCapability::ImageVariation
+                | ModelCapability::ImageUpscale
+                | ModelCapability::ControlledImageGeneration
+        )
+    {
+        return Err(ApiError::bad_request(
+            "Capacité IMAGE_TO_IMAGE invalide pour ce mode.",
+        ));
+    }
+    if !entry.capabilities.contains(&expected_capability)
+        || !entry.capabilities.contains(&requested_capability)
+    {
         return Err(ApiError::conflict(
             "Ce modèle ne supporte pas ce mode de génération.",
         ));
@@ -3342,10 +3460,13 @@ async fn generate_image(
         id: Uuid::new_v4(),
         kind: AssetKind::Image,
         mode: request.mode,
+        capability: Some(requested_capability),
         prompt: prompt.to_string(),
         negative_prompt: request.negative_prompt,
         model_id,
         input_asset_id: request.input_asset_id,
+        mask_asset_id: request.mask_asset_id,
+        control_asset_id: request.control_asset_id,
         input_images: vec![],
         output_asset_id: None,
         status: GenerationStatus::Queued,
@@ -3461,13 +3582,22 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
             GenerationMode::TextToImage if !procedural => {
                 let worker = state.worker.as_ref().ok_or("Worker GPU absent")?;
                 let relative = PathBuf::from("generations").join(format!("{}.png", generation.id));
+                let capability = generation
+                    .capability
+                    .clone()
+                    .unwrap_or(ModelCapability::TextToImage);
                 let worker_result = worker
-                    .generate_text_to_image(
+                    .generate_image(
+                        image_endpoint(&capability),
                         &job_id.to_string(),
                         &storage_id(&generation.model_id),
                         &generation.prompt,
                         generation.negative_prompt.as_deref(),
                         &relative,
+                        None,
+                        None,
+                        None,
+                        Some(capability.api_name()),
                     )
                     .await?;
                 if worker_result.job_id != job_id.to_string()
@@ -3511,14 +3641,74 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
                     .work_dir
                     .join(format!("{}.input-{}.bin", generation.id, timestamp));
                 std::fs::write(&input_path, &input).map_err(|error| error.to_string())?;
+                let mut temporary_paths = vec![input_path.clone()];
+                let mask_path = if let Some(asset_id) = generation.mask_asset_id {
+                    let (asset, path) = read_asset_manifest(&state, asset_id)
+                        .await
+                        .map_err(|error| error.message)?;
+                    if asset.kind != AssetKind::Image {
+                        return Err("Le masque/contrôle doit être une image.".into());
+                    }
+                    let bytes = fs::read(path).await.map_err(|error| error.to_string())?;
+                    let output = state
+                        .settings
+                        .get()
+                        .await
+                        .work_dir
+                        .join(format!("{}.mask-{}.png", generation.id, timestamp));
+                    fs::write(&output, bytes)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    Some(output)
+                } else {
+                    None
+                };
+                if let Some(path) = &mask_path {
+                    temporary_paths.push(path.clone());
+                }
+                let control_path = if let Some(asset_id) = generation.control_asset_id {
+                    let (asset, path) = read_asset_manifest(&state, asset_id)
+                        .await
+                        .map_err(|error| error.message)?;
+                    if asset.kind != AssetKind::Image {
+                        return Err("Le masque/contrôle doit être une image.".into());
+                    }
+                    let bytes = fs::read(path).await.map_err(|error| error.to_string())?;
+                    let output = state
+                        .settings
+                        .get()
+                        .await
+                        .work_dir
+                        .join(format!("{}.control-{}.png", generation.id, timestamp));
+                    fs::write(&output, bytes)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    Some(output)
+                } else {
+                    None
+                };
+                if let Some(path) = &control_path {
+                    temporary_paths.push(path.clone());
+                }
+                let capability = generation
+                    .capability
+                    .clone()
+                    .unwrap_or(ModelCapability::ImageToImage);
                 let worker_result = worker
-                    .generate_image_to_image(
+                    .generate_image(
+                        image_endpoint(&capability),
                         &job_id.to_string(),
                         &storage_id(&generation.model_id),
                         &generation.prompt,
                         generation.negative_prompt.as_deref(),
                         &relative,
-                        &input_path.to_string_lossy(),
+                        Some(&input_path.to_string_lossy()),
+                        mask_path.as_ref().map(|path| path.to_string_lossy()).as_deref(),
+                        control_path
+                            .as_ref()
+                            .map(|path| path.to_string_lossy())
+                            .as_deref(),
+                        Some(capability.api_name()),
                     )
                     .await?;
                 if worker_result.job_id != job_id.to_string()
@@ -3535,7 +3725,9 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
                     format!("Sortie worker introuvable sur le volume partagé: {error}")
                 })?;
                 let _ = fs::remove_file(path).await;
-                let _ = fs::remove_file(&input_path).await;
+                for path in temporary_paths {
+                    let _ = fs::remove_file(path).await;
+                }
                 content
             }
             GenerationMode::ImageToImage => {
@@ -3668,6 +3860,11 @@ async fn generate_video(
     }
 
     let mode = request.mode.clone();
+    let requested_capability = request
+        .capability
+        .clone()
+        .or_else(|| video_capability_mode_default(&mode))
+        .ok_or_else(|| ApiError::bad_request("Capacité vidéo invalide."))?;
     let expected = match mode {
         GenerationMode::TextToVideo => ModelCapability::TextToVideo,
         GenerationMode::ImageToVideo => ModelCapability::ImageToVideo,
@@ -3678,7 +3875,38 @@ async fn generate_video(
         .model_id
         .unwrap_or_else(|| "vidio-motion-local".into());
     let entry = resolve_model(&state, &model_id).await?;
-    if !entry.capabilities.contains(&expected) {
+    if mode == GenerationMode::TextToVideo && requested_capability != ModelCapability::TextToVideo
+    {
+        return Err(ApiError::bad_request(
+            "TEXT_TO_VIDEO est la seule capacité autorisée pour ce mode.",
+        ));
+    }
+    if mode == GenerationMode::ImageToVideo
+        && !matches!(
+            requested_capability,
+            ModelCapability::ImageToVideo
+                | ModelCapability::MultiImageToVideo
+                | ModelCapability::StartEndImageToVideo
+                | ModelCapability::KeyframesToVideo
+        )
+    {
+        return Err(ApiError::bad_request(
+            "Capacité IMAGE_TO_VIDEO invalide pour ce mode.",
+        ));
+    }
+    if mode == GenerationMode::VideoToVideo
+        && !matches!(
+            requested_capability,
+            ModelCapability::VideoToVideo
+                | ModelCapability::VideoInpainting
+                | ModelCapability::VideoUpscale
+        )
+    {
+        return Err(ApiError::bad_request(
+            "Capacité VIDEO_TO_VIDEO invalide pour ce mode.",
+        ));
+    }
+    if !entry.capabilities.contains(&expected) || !entry.capabilities.contains(&requested_capability) {
         return Err(ApiError::conflict(
             "Ce modèle ne supporte pas le mode vidéo choisi.",
         ));
@@ -3740,10 +3968,13 @@ async fn generate_video(
         id: Uuid::new_v4(),
         kind: AssetKind::Video,
         mode,
+        capability: Some(requested_capability),
         prompt: prompt.to_string(),
-        negative_prompt: None,
+        negative_prompt: request.negative_prompt,
         model_id,
         input_asset_id: request.input_asset_id,
+        mask_asset_id: None,
+        control_asset_id: None,
         input_images: input_images.clone(),
         output_asset_id: None,
         status: GenerationStatus::Queued,
@@ -3807,6 +4038,164 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
     };
 
     let result: Result<Asset, String> = async {
+        let procedural = generation.model_id == "vidio-motion-local";
+        if !procedural {
+            let worker = state.worker.as_ref().ok_or("Worker GPU absent")?;
+            let capability = generation
+                .capability
+                .clone()
+                .or_else(|| video_capability_mode_default(&generation.mode))
+                .ok_or("Capacité vidéo invalide")?;
+            let endpoint = video_endpoint(&capability);
+            let relative = PathBuf::from("generations").join(format!("{}.mp4", generation.id));
+
+            let mut temporary_inputs = Vec::new();
+            let mut video_input_path: Option<String> = None;
+            let mut input_images_payload = Vec::new();
+
+            match generation.mode {
+                GenerationMode::TextToVideo => {}
+                GenerationMode::ImageToVideo => {
+                    let mut ordered = generation.input_images.clone();
+                    ordered.sort_by_key(|item| item.order);
+                    for (index, item) in ordered.iter().enumerate() {
+                        let (asset, source_path) = read_asset_manifest(&state, item.asset_id)
+                            .await
+                            .map_err(|error| error.message)?;
+                        if asset.kind != AssetKind::Image {
+                            return Err("Le type de l'asset source ne correspond pas au mode.".into());
+                        }
+                        let bytes = fs::read(&source_path).await.map_err(|error| error.to_string())?;
+                        let temporary_path = temporary_dir.join(format!("input-image-{index}.png"));
+                        fs::write(&temporary_path, bytes).await.map_err(|error| error.to_string())?;
+                        temporary_inputs.push(temporary_path.clone());
+                        if index == 0 {
+                            video_input_path = Some(temporary_path.to_string_lossy().to_string());
+                        }
+                        input_images_payload.push(json!({
+                            "order": item.order,
+                            "role": item.role,
+                            "source": temporary_path.to_string_lossy(),
+                        }));
+                    }
+                    if input_images_payload.is_empty()
+                        && let Some(asset_id) = generation.input_asset_id
+                    {
+                        let (asset, source_path) = read_asset_manifest(&state, asset_id)
+                            .await
+                            .map_err(|error| error.message)?;
+                        if asset.kind != AssetKind::Image {
+                            return Err("Le type de l'asset source ne correspond pas au mode.".into());
+                        }
+                        let bytes = fs::read(&source_path).await.map_err(|error| error.to_string())?;
+                        let temporary_path = temporary_dir.join("input-image-0.png");
+                        fs::write(&temporary_path, bytes).await.map_err(|error| error.to_string())?;
+                        temporary_inputs.push(temporary_path.clone());
+                        video_input_path = Some(temporary_path.to_string_lossy().to_string());
+                        input_images_payload.push(json!({
+                            "order": 0,
+                            "role": "start_frame",
+                            "source": temporary_path.to_string_lossy(),
+                        }));
+                    }
+                }
+                GenerationMode::VideoToVideo => {
+                    let id = generation.input_asset_id.ok_or("Asset source absent")?;
+                    let (asset, source_path) = read_asset_manifest(&state, id)
+                        .await
+                        .map_err(|error| error.message)?;
+                    if asset.kind != AssetKind::Video {
+                        return Err("Le type de l'asset source ne correspond pas au mode.".into());
+                    }
+                    let bytes = fs::read(&source_path).await.map_err(|error| error.to_string())?;
+                    let temporary_path = temporary_dir.join("input-video.mp4");
+                    fs::write(&temporary_path, bytes).await.map_err(|error| error.to_string())?;
+                    temporary_inputs.push(temporary_path.clone());
+                    video_input_path = Some(temporary_path.to_string_lossy().to_string());
+                }
+                GenerationMode::TextToImage | GenerationMode::ImageToImage => {
+                    return Err("Mode incompatible avec la génération vidéo.".into());
+                }
+            }
+
+            generation.progress = 35;
+            generation.updated_at = unix_now();
+            update_generation(&state, generation.clone()).await;
+            state
+                .update_job(
+                    job_id,
+                    JobStatus::Running,
+                    "generating",
+                    35,
+                    "Inférence vidéo par le runtime Worker",
+                )
+                .await;
+
+            let worker_result = worker
+                .generate_video(
+                    endpoint,
+                    &job_id.to_string(),
+                    &storage_id(&generation.model_id),
+                    &generation.prompt,
+                    generation.negative_prompt.as_deref(),
+                    &relative,
+                    video_input_path.as_deref(),
+                    if input_images_payload.is_empty() {
+                        None
+                    } else {
+                        Some(serde_json::Value::Array(input_images_payload))
+                    },
+                    None,
+                    Some(capability.api_name()),
+                )
+                .await?;
+
+            for path in temporary_inputs {
+                let _ = fs::remove_file(path).await;
+            }
+
+            if worker_result.job_id != job_id.to_string()
+                || worker_result.state != "COMPLETED"
+                || worker_result.output_relative_path != relative.to_string_lossy()
+            {
+                return Err("Le worker a renvoyé un résultat incohérent.".into());
+            }
+
+            let shared_output = state.settings.get().await.work_dir.join(&relative);
+            let bytes = fs::read(&shared_output).await.map_err(|error| {
+                format!("Sortie worker introuvable sur le volume partagé: {error}")
+            })?;
+            let _ = fs::remove_file(shared_output).await;
+            fs::write(&output_path, &bytes)
+                .await
+                .map_err(|error| format!("Copie sortie worker impossible : {error}"))?;
+
+            let mut asset = save_asset(
+                &state,
+                &bytes,
+                format!("generation-{}.mp4", generation.id),
+                "video/mp4".into(),
+                AssetKind::Video,
+                Some((width, height)),
+                "mp4",
+            )
+            .await
+            .map_err(|error| error.message)?;
+            if let Some((asset_width, asset_height, asset_duration, fps)) =
+                probe_video(&output_path).await
+            {
+                asset.width = Some(asset_width);
+                asset.height = Some(asset_height);
+                asset.duration_seconds = Some(asset_duration);
+                asset.fps = Some(fps);
+                persist_asset_manifest(&state, &asset)
+                    .await
+                    .map_err(|error| error.message)?;
+            }
+            publish_generation_asset(&state, generation.id, &asset).await?;
+            return Ok(asset);
+        }
+
         let source_path = if generation.mode == GenerationMode::TextToVideo {
             let worker = state.worker.as_ref().ok_or("Worker GPU absent")?;
             let relative = PathBuf::from("generations").join(format!("{}.png", generation.id));
@@ -3819,6 +4208,9 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
                     None,
                     &relative,
                     None,
+                    None,
+                    None,
+                    Some("TEXT_TO_VIDEO"),
                 )
                 .await?;
             if worker_result.job_id != job_id.to_string()

@@ -16,10 +16,27 @@ import styles from "../studio.module.css";
 const CAPABILITY_LABELS = {
   TEXT_TO_IMAGE: "Texte → Image",
   IMAGE_TO_IMAGE: "Image → Image",
+  INPAINTING: "Inpainting",
+  OUTPAINTING: "Outpainting",
+  IMAGE_VARIATION: "Variation d’image",
+  IMAGE_UPSCALE: "Upscale image",
+  CONTROLLED_IMAGE_GENERATION: "Génération contrôlée",
 };
+
+const IMAGE_MODES = [
+  { id: "TEXT_TO_IMAGE", label: "Texte → Image", needsSource: false },
+  { id: "IMAGE_TO_IMAGE", label: "Image → Image", needsSource: true },
+  { id: "INPAINTING", label: "Inpainting", needsSource: true },
+  { id: "OUTPAINTING", label: "Outpainting", needsSource: true },
+  { id: "IMAGE_VARIATION", label: "Variation", needsSource: true },
+  { id: "IMAGE_UPSCALE", label: "Upscale", needsSource: true },
+  { id: "CONTROLLED_IMAGE_GENERATION", label: "Contrôle", needsSource: true },
+];
 
 export default function ImagesPage() {
   const fileInput = useRef(null);
+  const maskInput = useRef(null);
+  const controlInput = useRef(null);
   const [mode, setMode] = useState("TEXT_TO_IMAGE");
   const [models, setModels] = useState([]);
   // UNKNOWN est volontairement conservateur : tant que le backend n'a pas
@@ -33,7 +50,10 @@ export default function ImagesPage() {
   const [generation, setGeneration] = useState(null);
   const [busy, setBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [maskAsset, setMaskAsset] = useState(null);
+  const [controlAsset, setControlAsset] = useState(null);
   const [error, setError] = useState("");
+  const activeMode = IMAGE_MODES.find((item) => item.id === mode) || IMAGE_MODES[0];
 
   // Seuls les modèles image réellement installés et compatibles apparaissent.
   //
@@ -94,16 +114,32 @@ export default function ImagesPage() {
     finally { setUploading(false); }
   }
 
+  async function uploadExtra(file, setter) {
+    if (!file) return;
+    setUploading(true); setError("");
+    try {
+      const form = new FormData(); form.append("file", file);
+      setter(await apiFetch("/api/assets", { method: "POST", body: form }));
+    } catch (requestError) { setError(requestError.message); setter(null); }
+    finally { setUploading(false); }
+  }
+
   async function submit(event) {
     event.preventDefault();
-    if (mode === "IMAGE_TO_IMAGE" && !sourceAsset) { setError("Ajoutez d’abord une image source valide."); return; }
+    if (activeMode.needsSource && !sourceAsset) { setError("Ajoutez d’abord une image source valide."); return; }
     setBusy(true); setError(""); setGeneration(null);
     try {
       const created = await apiFetch("/api/images/generate", {
         method: "POST",
         body: JSON.stringify({
-          mode, prompt, negative_prompt: negativePrompt || null,
-          model_id: selectedModelId, input_asset_id: mode === "IMAGE_TO_IMAGE" ? sourceAsset.id : null,
+          mode: activeMode.needsSource ? "IMAGE_TO_IMAGE" : "TEXT_TO_IMAGE",
+          capability: mode,
+          prompt,
+          negative_prompt: negativePrompt || null,
+          model_id: selectedModelId,
+          input_asset_id: activeMode.needsSource ? sourceAsset.id : null,
+          mask_asset_id: ["INPAINTING", "OUTPAINTING"].includes(mode) ? maskAsset?.id || null : null,
+          control_asset_id: mode === "CONTROLLED_IMAGE_GENERATION" ? controlAsset?.id || null : null,
         }),
       });
       setGeneration(created);
@@ -121,11 +157,14 @@ export default function ImagesPage() {
       <div className={styles.imageStudio}>
         <form className={styles.generatorPanel} onSubmit={submit}>
           <div className={styles.modeTabs}>
-            <button type="button" className={mode === "TEXT_TO_IMAGE" ? styles.activeTab : ""} onClick={() => setMode("TEXT_TO_IMAGE")}><span>T</span> Texte → Image</button>
-            <button type="button" className={mode === "IMAGE_TO_IMAGE" ? styles.activeTab : ""} onClick={() => setMode("IMAGE_TO_IMAGE")}><BsImage /> Image → Image</button>
+            {IMAGE_MODES.map((item) => (
+              <button key={item.id} type="button" className={mode === item.id ? styles.activeTab : ""} onClick={() => setMode(item.id)}>
+                {item.id === "TEXT_TO_IMAGE" ? <span>T</span> : <BsImage />} {item.label}
+              </button>
+            ))}
           </div>
 
-          {mode === "IMAGE_TO_IMAGE" && (
+          {activeMode.needsSource && (
             <div className={styles.formGroup}>
               <label>Image de référence <small>(obligatoire)</small></label>
               <input ref={fileInput} hidden type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => upload(event.target.files?.[0])} />
@@ -133,6 +172,28 @@ export default function ImagesPage() {
                 {sourcePreview ? <Image unoptimized width={1024} height={1024} src={sourcePreview} alt="Aperçu de l’image source" /> : <><BsCloudUpload /><strong>Glissez-déposez une image ici</strong><span>ou cliquez pour parcourir</span></>}
                 {uploading && <em>Validation et enregistrement…</em>}
                 {sourceAsset && <em><BsCheckCircleFill /> Asset {sourceAsset.id.slice(0, 8)} enregistré</em>}
+              </button>
+            </div>
+          )}
+
+          {["INPAINTING", "OUTPAINTING"].includes(mode) && (
+            <div className={styles.formGroup}>
+              <label>Masque (optionnel)</label>
+              <input ref={maskInput} hidden type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => uploadExtra(event.target.files?.[0], setMaskAsset)} />
+              <button type="button" className={styles.uploadZone} onClick={() => maskInput.current?.click()}>
+                <strong>{maskAsset ? "Masque prêt" : "Ajouter un masque"}</strong>
+                <span>{maskAsset ? `Asset ${maskAsset.id.slice(0, 8)}` : "Zones à modifier"}</span>
+              </button>
+            </div>
+          )}
+
+          {mode === "CONTROLLED_IMAGE_GENERATION" && (
+            <div className={styles.formGroup}>
+              <label>Image de contrôle (optionnel)</label>
+              <input ref={controlInput} hidden type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => uploadExtra(event.target.files?.[0], setControlAsset)} />
+              <button type="button" className={styles.uploadZone} onClick={() => controlInput.current?.click()}>
+                <strong>{controlAsset ? "Contrôle prêt" : "Ajouter une image de contrôle"}</strong>
+                <span>{controlAsset ? `Asset ${controlAsset.id.slice(0, 8)}` : "Pose/croquis/contrainte"}</span>
               </button>
             </div>
           )}
@@ -147,7 +208,7 @@ export default function ImagesPage() {
             <div><strong>1:1</strong><small>Ratio</small></div>
             <div><strong>1024p</strong><small>Qualité</small></div>
           </div>
-          <button className={styles.generateButton} disabled={busy || uploading || !selectedModelId || prompt.trim().length < 3}><BsStars /> {busy ? "Génération en cours…" : "Générer l’image"}</button>
+          <button className={styles.generateButton} disabled={busy || uploading || !selectedModelId || prompt.trim().length < 3}><BsStars /> {busy ? "Génération en cours…" : `Lancer ${CAPABILITY_LABELS[mode] || "la génération"}`}</button>
           <p className={styles.costNote}>Exécution locale · aucun crédit externe utilisé</p>
         </form>
 

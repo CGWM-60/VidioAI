@@ -74,8 +74,107 @@ class RuntimeManager:
     def _model_root(self, model_id: str) -> Path:
         return self.settings.models_dir / self._safe_segment(model_id)
 
+    @staticmethod
+    def _capability_order() -> list[str]:
+        return [
+            "TEXT_TO_IMAGE",
+            "IMAGE_TO_IMAGE",
+            "INPAINTING",
+            "OUTPAINTING",
+            "IMAGE_VARIATION",
+            "IMAGE_UPSCALE",
+            "CONTROLLED_IMAGE_GENERATION",
+            "TEXT_TO_VIDEO",
+            "IMAGE_TO_VIDEO",
+            "MULTI_IMAGE_TO_VIDEO",
+            "START_END_IMAGE_TO_VIDEO",
+            "KEYFRAMES_TO_VIDEO",
+            "VIDEO_TO_VIDEO",
+            "VIDEO_INPAINTING",
+            "VIDEO_UPSCALE",
+        ]
+
     def _active_pointer(self, model_id: str) -> Path:
         return self._model_root(model_id) / "active.json"
+
+    @staticmethod
+    def _load_image(path: str | Path) -> Any:
+        from PIL import Image
+
+        image = Image.open(Path(path))
+        try:
+            return image.convert("RGB")
+        finally:
+            image.close()
+
+    @staticmethod
+    def _load_first_video_frame(path: str | Path, workspace: Path) -> Any:
+        frame_path = workspace / f"frame-{uuid.uuid4()}.png"
+        command = [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            str(path),
+            "-frames:v",
+            "1",
+            str(frame_path),
+        ]
+        try:
+            subprocess.run(command, capture_output=True, text=True, timeout=20, check=True)
+        except subprocess.SubprocessError as error:
+            raise WorkerError(f"Décodage vidéo impossible: {error}", 422) from error
+        try:
+            return RuntimeManager._load_image(frame_path)
+        finally:
+            frame_path.unlink(missing_ok=True)
+
+    def _resolve_generation_inputs(self, request: dict[str, Any]) -> dict[str, Any]:
+        prepared = dict(request)
+        capability = str(prepared.get("capability") or "").upper()
+        input_path = prepared.get("input_path")
+        if isinstance(input_path, str) and input_path.strip():
+            candidate = Path(input_path)
+            if not candidate.is_file():
+                raise WorkerError("Le fichier d'entrée est introuvable.", 422)
+            if capability in {"VIDEO_TO_VIDEO", "VIDEO_INPAINTING", "VIDEO_UPSCALE"}:
+                prepared["input_video"] = str(candidate)
+                prepared["input_frames"] = [
+                    self._load_first_video_frame(candidate, self.settings.work_dir)
+                ]
+            else:
+                prepared["input_image"] = self._load_image(candidate)
+
+        mask_path = prepared.get("mask_path")
+        if isinstance(mask_path, str) and mask_path.strip():
+            candidate = Path(mask_path)
+            if not candidate.is_file():
+                raise WorkerError("Le masque fourni est introuvable.", 422)
+            prepared["mask_image"] = self._load_image(candidate)
+
+        control_path = prepared.get("control_path")
+        if isinstance(control_path, str) and control_path.strip():
+            candidate = Path(control_path)
+            if not candidate.is_file():
+                raise WorkerError("L'image de contrôle est introuvable.", 422)
+            prepared["control_image"] = self._load_image(candidate)
+
+        resolved_images = []
+        for item in prepared.get("input_images") or []:
+            if not isinstance(item, dict):
+                continue
+            source = item.get("source") or item.get("path") or item.get("input_path")
+            if not isinstance(source, str) or not source.strip():
+                continue
+            candidate = Path(source)
+            if not candidate.is_file():
+                raise WorkerError("Une image d'entrée référencée est introuvable.", 422)
+            resolved_images.append(self._load_image(candidate))
+        if resolved_images:
+            prepared["resolved_input_images"] = resolved_images
+
+        return prepared
 
     def _active_snapshot(self, model_id: str) -> tuple[Path, dict[str, Any]]:
         pointer = self._active_pointer(model_id)
@@ -464,7 +563,7 @@ class RuntimeManager:
 
         metadata = inspect_model_metadata(snapshot)
         capability = None
-        for candidate in ["IMAGE_TO_IMAGE", "TEXT_TO_IMAGE", "TEXT_TO_VIDEO", "IMAGE_TO_VIDEO", "VIDEO_TO_VIDEO"]:
+        for candidate in self._capability_order():
             adapter = self._registry.select_for_capability(metadata, candidate)
             if adapter is not None:
                 capability = candidate
@@ -626,6 +725,7 @@ class RuntimeManager:
         adapter = self._registry.select_for_capability(loaded.metadata or {}, requested_capability)
         if adapter is None:
             raise WorkerError("Aucun adapter compatible ne peut générer cette capacité.", 422)
+        prepared_request = self._resolve_generation_inputs(request)
 
         with self._lock:
             cancel_event = self._cancel_events.get(job_id)
@@ -648,7 +748,7 @@ class RuntimeManager:
         if request.get("seed") is not None:
             generator.manual_seed(request["seed"])
         runtime = {"device": loaded.device, "generator": generator, "callback": callback}
-        output = adapter.generate(loaded.pipeline, runtime, request)
+        output = adapter.generate(loaded.pipeline, runtime, prepared_request)
         if cancel_event.is_set():
             raise InterruptedError("Job annulé.")
 

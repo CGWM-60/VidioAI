@@ -72,9 +72,19 @@ def test_capabilities_endpoint_lists_all_modalities(tmp_path: Path) -> None:
     assert set(payload["supported"]) == {
         "TEXT_TO_IMAGE",
         "IMAGE_TO_IMAGE",
+        "INPAINTING",
+        "OUTPAINTING",
+        "IMAGE_VARIATION",
+        "IMAGE_UPSCALE",
+        "CONTROLLED_IMAGE_GENERATION",
         "TEXT_TO_VIDEO",
         "IMAGE_TO_VIDEO",
+        "MULTI_IMAGE_TO_VIDEO",
+        "START_END_IMAGE_TO_VIDEO",
+        "KEYFRAMES_TO_VIDEO",
         "VIDEO_TO_VIDEO",
+        "VIDEO_INPAINTING",
+        "VIDEO_UPSCALE",
     }
 
 
@@ -121,7 +131,7 @@ def test_pipeline_registry_selects_an_adapter_from_metadata(tmp_path: Path) -> N
     registry = PipelineRegistry()
     adapter = registry.select_for_capability(metadata, "IMAGE_TO_VIDEO")
     assert adapter is not None
-    assert adapter.capabilities() == ["IMAGE_TO_VIDEO"]
+    assert "IMAGE_TO_VIDEO" in adapter.capabilities()
 
 
 def test_i2v_adapter_defaults_to_single_image_for_unknown_models() -> None:
@@ -139,7 +149,12 @@ def test_i2v_adapter_supports_start_and_end_frames_for_ltx_models() -> None:
     profile = adapter.input_profile(metadata)
     assert profile["min_input_images"] == 1
     assert profile["max_input_images"] == 2
-    assert profile["supported_image_roles"] == ["start_frame", "end_frame"]
+    assert set(profile["supported_image_roles"]) == {
+        "start",
+        "end",
+        "start_frame",
+        "end_frame",
+    }
     assert profile["supports_start_end_frames"] is True
 
 

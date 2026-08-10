@@ -20,8 +20,13 @@ const FILTERS = [
 
 const CAPABILITY_LABELS = {
   CHAT: "Chat", TEXT_TO_IMAGE: "Texte → Image", IMAGE_TO_IMAGE: "Image → Image",
+  INPAINTING: "Inpainting", OUTPAINTING: "Outpainting", IMAGE_VARIATION: "Variation d’image",
+  IMAGE_UPSCALE: "Upscale image", CONTROLLED_IMAGE_GENERATION: "Génération contrôlée",
   TEXT_TO_VIDEO: "Texte → Vidéo", IMAGE_TO_VIDEO: "Image → Vidéo",
-  VIDEO_TO_VIDEO: "Vidéo → Vidéo", AUDIO: "Audio", VISION: "Vision",
+  MULTI_IMAGE_TO_VIDEO: "Multi-images → Vidéo", START_END_IMAGE_TO_VIDEO: "Start/End → Vidéo",
+  KEYFRAMES_TO_VIDEO: "Keyframes → Vidéo", VIDEO_TO_VIDEO: "Vidéo → Vidéo",
+  VIDEO_INPAINTING: "Inpainting vidéo", VIDEO_UPSCALE: "Upscale vidéo",
+  AUDIO: "Audio", VISION: "Vision",
 };
 
 function ModelArtwork({ kind }) {
@@ -175,7 +180,7 @@ export default function ModelsPage() {
               <div className={styles.modelActions}>
                 {!model.installed ? (
                   <button className={styles.primaryButton} title={!model.runtime_supported ? model.runtime_reason : model.gated && !model.access_authorized ? "Accès Hugging Face requis" : ""} disabled={!model.installable || busyId === model.id} onClick={() => startInstall(model)}>
-                    <BsCloudDownload /> {busyId === model.id ? "Préparation…" : model.gated && !model.access_authorized ? "Accès requis" : model.runtime_supported ? "Installer" : "Pipeline non implémenté"}
+                    <BsCloudDownload /> {busyId === model.id ? "Préparation…" : model.gated && !model.access_authorized ? "Accès requis" : model.runtime_supported ? "Installer" : "Runtime non compatible"}
                   </button>
                 ) : <span className={styles.readyBadge}>Prêt</span>}
                 <Link href={`/models/detail?model_id=${encodeURIComponent(model.id)}`}>Détails <BsArrowRight /></Link>
