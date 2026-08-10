@@ -92,6 +92,11 @@ jobs:
     needs: [backend, frontend, worker]
     runs-on: ubuntu-latest
 
+    env:
+      HOST_AGENT_TOKEN: ${{ secrets.HOST_AGENT_TOKEN }}
+      VIDIOAI_WORKER_TOKEN: ${{ secrets.VIDIOAI_WORKER_TOKEN }}
+      VIDIOAI_ADMIN_TOKEN: ${{ secrets.VIDIOAI_ADMIN_TOKEN }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -103,8 +108,6 @@ jobs:
         env:
           VIDIOAI_REGISTRY: example.invalid/vidioai
           VIDIOAI_VERSION: ci-test
-          VIDIOAI_WORKER_TOKEN: ci-worker-token-at-least-32-characters
-          VIDIOAI_ADMIN_TOKEN: ci-admin-token-at-least-32-characters
           AWS_ACCESS_KEY_ID: ci
           AWS_SECRET_ACCESS_KEY: ci-secret
           AWS_S3_BUCKET: ci-bucket
