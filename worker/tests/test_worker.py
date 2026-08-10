@@ -1176,8 +1176,16 @@ def test_install_model_fails_with_insufficient_disk_space(tmp_path: Path, monkey
 def test_install_model_fails_with_cache_not_writable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager = RuntimeManager(settings(tmp_path))
 
+    # Le runner GitHub contient souvent "github" dans les chemins, ce qui
+    # rend les tests par sous-chaîne fragiles ("hub" ⊂ "github").
+    # On cible explicitement le chemin cache attendu pour garder un test
+    # déterministe quel que soit l'environnement CI.
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    expected_cache_dir = manager.settings.hf_home / "hub"
+
     def fake_writable(path: Path) -> bool:
-        return "hub" not in str(path)
+        return Path(path) != expected_cache_dir
 
     monkeypatch.setattr(manager, "_is_writable_directory", fake_writable)
 
