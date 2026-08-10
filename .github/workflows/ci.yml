@@ -15,11 +15,22 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Install protobuf compiler
+      - name: Install backend system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+
+          sudo apt-get install -y \
+            protobuf-compiler \
+            libdrm-dev \
+            pkg-config
+
           protoc --version
+
+          echo "Checking DRM libraries..."
+          ldconfig -p | grep libdrm || true
+
+          echo "Checking development libraries..."
+          find /usr/lib -name 'libdrm.so' -o -name 'libdrm_amdgpu.so'
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -33,8 +44,6 @@ jobs:
 
       - run: cargo test
         working-directory: backend
-
-
   frontend:
     runs-on: ubuntu-latest
 

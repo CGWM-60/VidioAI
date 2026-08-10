@@ -62,9 +62,12 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
+
           sudo apt-get install -y \
             jq \
-            protobuf-compiler
+            protobuf-compiler \
+            libdrm-dev \
+            pkg-config
 
           python -m pip install --upgrade pip
           python -m pip install awscli
@@ -72,6 +75,9 @@ jobs:
           jq --version
           aws --version
           protoc --version
+
+          echo "Checking DRM libraries..."
+          ldconfig -p | grep libdrm || true
 
       # --------------------------------------------------------
       # 6. Docker Buildx
