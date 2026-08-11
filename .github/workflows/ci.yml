@@ -130,8 +130,10 @@ jobs:
 
       - name: Validate the final Worker image contract
         run: |
-          WORKER_IMAGE=$(docker compose --profile gpu images -q worker)
+          WORKER_IMAGE=$(docker compose --profile gpu config --format json \
+            | jq -r '.services.worker.image // empty')
           test -n "${WORKER_IMAGE}"
+          docker image inspect "${WORKER_IMAGE}" >/dev/null
           bash deploy/scripts/test-worker-image.sh "${WORKER_IMAGE}"
 
       - name: Validate production compose

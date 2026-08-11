@@ -78,6 +78,10 @@ services:
 
 
   worker:
+    # Un tag explicite permet à la CI de retrouver l'image construite sans
+    # dépendre de l'existence préalable d'un conteneur Compose.
+    image: ${VIDIOAI_WORKER_IMAGE:-vidioai-worker:local}
+
     build:
       context: ./worker
 
