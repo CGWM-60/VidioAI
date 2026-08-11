@@ -5,6 +5,7 @@ import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useState } from "react";
 import { BsArrowLeft, BsCheck2, BsCloudDownload, BsCpu, BsPlay, BsStop } from "react-icons/bs";
 import { apiFetch } from "../../lib/api";
+import { MODEL_PREFLIGHT_TIMEOUT_MS } from "../catalog-state.mjs";
 import styles from "../../studio.module.css";
 
 function formatMemory(bytes) {
@@ -71,6 +72,8 @@ function ModelDetailsContent() {
     try {
       const job = await apiFetch("/api/models/install", {
         method: "POST",
+        timeoutMs: MODEL_PREFLIGHT_TIMEOUT_MS,
+        timeoutCode: "MODEL_PREFLIGHT_TIMEOUT",
         body: JSON.stringify({ model_id: model.id, revision: model.revision }),
       });
       router.push(`/models/install?model_id=${encodeURIComponent(model.id)}&job=${job.id}`);

@@ -8,6 +8,7 @@ import {
   BsCpu, BsFilter, BsImage, BsSearch, BsStars,
 } from "react-icons/bs";
 import { apiFetch } from "../lib/api";
+import { accessStatus, CATALOG_TIMEOUT_MS, MODEL_PREFLIGHT_TIMEOUT_MS } from "./catalog-state.mjs";
 import styles from "../studio.module.css";
 
 // Les filtres décrivent uniquement des catégories d'interface. Les modèles et
@@ -87,7 +88,10 @@ export default function ModelsPage() {
       if (["CHAT", "IMAGE", "VIDEO", "VISION", "AUDIO"].includes(filter)) parameters.set("category", filter);
       if (filter === "installed") parameters.set("installed", "true");
       if (filter === "compatible") parameters.set("compatible", "true");
-      const response = await apiFetch(`/api/models?${parameters}`, { timeoutMs: 15000, timeoutCode: "CATALOG_TIMEOUT" });
+      // Le backend borne déjà ses appels HF et peut ensuite interroger le Worker
+      // local pour enrichir les cartes. Le navigateur ne doit pas annuler cette
+      // requête avant le timeout amont ni empêcher l'écriture du cache.
+      const response = await apiFetch(`/api/models?${parameters}`, { timeoutMs: CATALOG_TIMEOUT_MS, timeoutCode: "CATALOG_TIMEOUT" });
       // La forme tableau reste tolérée durant un rolling deploy backend/frontend.
       setModels(Array.isArray(response) ? response : response.items);
       setMeta(Array.isArray(response) ? { has_more: false, stale: false, total: response.length } : response);
@@ -121,6 +125,8 @@ export default function ModelsPage() {
     try {
       const job = await apiFetch("/api/models/install", {
         method: "POST",
+        timeoutMs: MODEL_PREFLIGHT_TIMEOUT_MS,
+        timeoutCode: "MODEL_PREFLIGHT_TIMEOUT",
         body: JSON.stringify({ model_id: model.id, revision: model.revision }),
       });
       router.push(`/models/install?model_id=${encodeURIComponent(model.id)}&job=${job.id}`);
@@ -152,7 +158,7 @@ export default function ModelsPage() {
       </div>
 
       {error && <div className={styles.errorBanner} role="alert"><strong>CATALOG_ERROR</strong> · {error} <button className={styles.secondaryButton} onClick={() => void loadModels()}>Réessayer</button></div>}
-      {meta.stale && <div className={styles.warningBanner}>Hugging Face est momentanément indisponible : affichage du cache du {meta.last_sync ? new Date(meta.last_sync * 1000).toLocaleString("fr-FR") : "dernier accès"}.</div>}
+      {meta.stale && <div className={styles.warningBanner}>{meta.last_sync ? `Hugging Face est momentanément indisponible : affichage du cache du ${new Date(meta.last_sync * 1000).toLocaleString("fr-FR")}.` : "Hugging Face est momentanément indisponible : les moteurs locaux restent disponibles."}</div>}
       {loading ? <div className={styles.stateCard}>Chargement du catalogue réel…</div> : (
         <div className={styles.modelList}>
           {models.map((model) => (
@@ -177,6 +183,7 @@ export default function ModelsPage() {
                   <span className={model.hardware_compatible ? styles.checkGood : styles.checkBad}>{model.hardware_compatible ? "✓" : "✕"} Matériel</span>
                   <span className={runtimeStatus(model) === "SUPPORTED" ? styles.checkGood : runtimeStatus(model) === "UNKNOWN" ? styles.warningBanner : styles.checkBad}>{runtimeStatus(model) === "SUPPORTED" ? "✓ Pipeline runtime" : runtimeStatus(model) === "UNKNOWN" ? "? Validation après téléchargement" : "✕ Pipeline runtime"}</span>
                   <span className={model.source_available ? styles.checkGood : styles.checkBad}>{model.source_available ? "✓" : "✕"} Source</span>
+                  <span className={accessStatus(model) === "AUTHORIZED" ? styles.checkGood : accessStatus(model) === "UNVERIFIED" ? styles.warningBanner : styles.checkBad}>{accessStatus(model) === "AUTHORIZED" ? "✓ Accès HF" : accessStatus(model) === "UNVERIFIED" ? "? Accès vérifié à l’installation" : "✕ Accès HF"}</span>
                 </div>
                 {runtimeStatus(model) !== "SUPPORTED" && <small className={styles.runtimeReason}>{model.runtime_reason}</small>}
                 {model.repository_url && <a className={styles.repositoryLink} href={model.repository_url} target="_blank" rel="noreferrer">Hugging Face · {model.repository}</a>}
@@ -187,8 +194,8 @@ export default function ModelsPage() {
               </div>
               <div className={styles.modelActions}>
                 {!model.installed ? (
-                  <button className={styles.primaryButton} title={!model.runtime_supported ? model.runtime_reason : model.gated && !model.access_authorized ? "Accès Hugging Face requis" : ""} disabled={!model.installable || busyId === model.id} onClick={() => startInstall(model)}>
-                    <BsCloudDownload /> {busyId === model.id ? "Préparation…" : model.gated && !model.access_authorized ? "Accès requis" : runtimeStatus(model) === "SUPPORTED" ? "Installer" : runtimeStatus(model) === "UNKNOWN" ? "Valider et installer" : "Runtime non compatible"}
+                  <button className={styles.primaryButton} title={!model.runtime_supported ? model.runtime_reason : accessStatus(model) === "ACCESS_REQUIRED" ? "Accès Hugging Face requis" : accessStatus(model) === "UNVERIFIED" ? "L’accès HF sera vérifié avant le téléchargement" : ""} disabled={!model.installable || busyId === model.id} onClick={() => startInstall(model)}>
+                    <BsCloudDownload /> {busyId === model.id ? "Préparation…" : accessStatus(model) === "ACCESS_REQUIRED" ? "Accès requis" : accessStatus(model) === "UNVERIFIED" ? "Vérifier et installer" : runtimeStatus(model) === "SUPPORTED" ? "Installer" : runtimeStatus(model) === "UNKNOWN" ? "Valider et installer" : "Runtime non compatible"}
                   </button>
                 ) : <span className={styles.readyBadge}>{model.runtime_ready ? "Prêt" : "Installé"}</span>}
                 <Link href={`/models/detail?model_id=${encodeURIComponent(model.id)}`}>Détails <BsArrowRight /></Link>

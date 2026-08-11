@@ -44,8 +44,8 @@ use crate::hardware_estimator::{
 };
 use crate::host_agent::{HostAgentClient, HostSnapshot, ResourceSource, resolve_system};
 use crate::huggingface_catalog::{
-    CatalogModel as CatalogEntry, CatalogQuery, HuggingFaceCatalogService, ModelCapability,
-    ModelKind, ModelVariant, RepositoryFile, local_runtime_models, storage_id,
+    CatalogModel as CatalogEntry, CatalogQuery, CatalogResult, HuggingFaceCatalogService,
+    ModelCapability, ModelKind, ModelVariant, RepositoryFile, local_runtime_models, storage_id,
 };
 use crate::job_store::JobStore;
 use crate::object_storage::{ObjectStorage, S3Storage};
@@ -364,6 +364,7 @@ pub struct ModelView {
     pub compatibility_checks: Vec<CompatibilityCheck>,
     pub accessibility: String,
     pub access_authorized: bool,
+    pub access_checked: bool,
     pub gated: bool,
     pub private: bool,
     pub author: Option<String>,
@@ -2250,7 +2251,9 @@ async fn model_view_with_machine(
     };
 
     let runtime_detail = runtime_reason.clone();
-    let access_ok = entry.access_authorized;
+    // Les résultats de liste HF ne prouvent ni l'autorisation ni son absence.
+    // Ils restent installables jusqu'au fetch exact effectué par resolve_model.
+    let access_ok = entry.access_authorized || !entry.access_checked;
     let compatibility_checks = vec![
         CompatibilityCheck {
             key: "source",
@@ -2268,6 +2271,9 @@ async fn model_view_with_machine(
             ok: access_ok,
             detail: if entry.access_authorized && (entry.gated || entry.private) {
                 "HF_TOKEN autorisé : les fichiers de configuration sont accessibles.".into()
+            } else if !entry.access_checked && (entry.gated || entry.private) {
+                "Accès gated/privé non vérifié dans la liste ; contrôle exact avant téléchargement."
+                    .into()
             } else if entry.gated {
                 "Repository gated : HF_TOKEN doit disposer de l'autorisation.".into()
             } else if entry.private {
@@ -2361,6 +2367,7 @@ async fn model_view_with_machine(
         compatibility_checks,
         accessibility: entry.accessibility.clone(),
         access_authorized: entry.access_authorized,
+        access_checked: entry.access_checked,
         gated: entry.gated,
         private: entry.private,
         author: entry.author.clone(),
@@ -2444,11 +2451,23 @@ async fn get_models(
     State(state): State<Arc<AppState>>,
     Query(query): Query<CatalogQuery>,
 ) -> Result<Json<ModelListResponse>, ApiError> {
-    let result = state
-        .catalog
-        .search(&query, false)
-        .await
-        .map_err(ApiError::unavailable)?;
+    let (result, source) = match state.catalog.search(&query, false).await {
+        Ok(result) => (result, "huggingface"),
+        Err(error) => {
+            // Le catalogue distant ne doit jamais rendre les moteurs locaux
+            // inutilisables. Le détail/l'installation continueront à retourner
+            // une erreur précise lorsqu'un repository HF est réellement requis.
+            eprintln!("Catalogue Hugging Face en mode local dégradé : {error}");
+            (
+                CatalogResult {
+                    models: Vec::new(),
+                    stale: true,
+                    last_sync: None,
+                },
+                "local-fallback",
+            )
+        }
+    };
     let mut entries = local_runtime_models();
     entries.extend(result.models);
     let machine = model_machine_context(&state).await;
@@ -2508,7 +2527,7 @@ async fn get_models(
         total,
         stale: result.stale,
         last_sync: result.last_sync,
-        source: "huggingface",
+        source,
     }))
 }
 
@@ -2592,7 +2611,7 @@ async fn start_model_install(
     if view.installed && !view.update_available {
         return Err(ApiError::conflict("Ce modèle est déjà installé."));
     }
-    if (entry.gated || entry.private) && !entry.access_authorized {
+    if (entry.gated || entry.private) && entry.access_checked && !entry.access_authorized {
         return Err(ApiError::unauthorized(
             "Ce modèle nécessite un accès Hugging Face autorisé via HF_TOKEN.",
         ));

@@ -30,7 +30,7 @@ const GIB: u64 = 1024 * 1024 * 1024;
 // Toute modification d'un champ calculé (comme `runtime_reason`) doit invalider
 // les anciennes entrées, sinon l'interface continuerait à afficher un diagnostic
 // obsolète après la mise à jour du binaire.
-const CACHE_SCHEMA_VERSION: u32 = 6;
+const CACHE_SCHEMA_VERSION: u32 = 7;
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -164,6 +164,11 @@ pub struct CatalogModel {
     /// l'autorisation nécessaire sans jamais exposer le token.
     #[serde(default)]
     pub access_authorized: bool,
+    /// Distingue un refus réel d'un résultat de liste qui n'a pas encore testé
+    /// l'accès aux fichiers. La vérification définitive a lieu sur la fiche
+    /// exacte avant toute installation.
+    #[serde(default)]
+    pub access_checked: bool,
     pub source_available: bool,
     pub quality_valid: bool,
     pub runtime_name: Option<String>,
@@ -369,11 +374,14 @@ impl HuggingFaceCatalogService {
         if !force
             && let Some(value) = &cached
             && !value.invalidated
-            && unix_now().saturating_sub(value.saved_at) <= self.ttl_seconds
         {
+            let fresh = unix_now().saturating_sub(value.saved_at) <= self.ttl_seconds;
+            // Une valeur expirée reste immédiatement utilisable. La mise à jour
+            // explicite invalide la clé puis effectue l'appel HF ; une simple
+            // navigation ne doit jamais se bloquer sur le réseau distant.
             return Ok(CatalogResult {
                 models: value.models.clone(),
-                stale: false,
+                stale: !fresh,
                 last_sync: Some(value.saved_at),
             });
         }
@@ -481,9 +489,13 @@ impl HuggingFaceCatalogService {
             raw_models.extend(self.fetch_list(query, None, requested).await?);
         } else {
             // Une catégorie VidioAI peut agréger plusieurs pipeline_tag HF. Les
-            // doublons sont supprimés après ces appels bornés et paginés.
-            for pipeline in pipelines {
-                raw_models.extend(self.fetch_list(query, Some(pipeline), requested).await?);
+            // recherches sont indépendantes : les exécuter en série multipliait
+            // le timeout par trois pour VIDEO et AUDIO.
+            let searches = pipelines
+                .into_iter()
+                .map(|pipeline| self.fetch_list(query, Some(pipeline), requested));
+            for models in futures_util::future::join_all(searches).await {
+                raw_models.extend(models?);
             }
         }
 
@@ -571,6 +583,7 @@ impl HuggingFaceCatalogService {
                 // fiche détaillée complète donc les configurations légères sans
                 // télécharger les poids.
                 raw.access_authorized = self.enrich_configuration(repository, &mut raw).await;
+                raw.access_checked = true;
                 Ok(normalize_model(raw))
             }
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
@@ -671,6 +684,8 @@ struct HfRawModel {
     gated: Value,
     #[serde(skip)]
     access_authorized: bool,
+    #[serde(skip)]
+    access_checked: bool,
     #[serde(default)]
     disabled: bool,
     sha: Option<String>,
@@ -839,8 +854,11 @@ fn normalize_model(raw: HfRawModel) -> CatalogModel {
         architecture.as_deref(),
     );
     let access_authorized = (!gated && !raw.private) || raw.access_authorized;
+    let access_checked = (!gated && !raw.private) || raw.access_checked;
     let accessibility = if access_authorized && (raw.private || gated) {
         "AUTHORIZED"
+    } else if !access_checked && (raw.private || gated) {
+        "UNVERIFIED"
     } else if raw.private {
         "PRIVATE"
     } else if gated {
@@ -849,7 +867,7 @@ fn normalize_model(raw: HfRawModel) -> CatalogModel {
         "PUBLIC"
     }
     .to_owned();
-    let installable = runtime_supported && quality_valid && access_authorized;
+    let installable = runtime_supported && quality_valid && (access_authorized || !access_checked);
     let hardware = HardwareEstimator::estimate(&HardwareMetadata {
         pipeline_tag: raw.pipeline_tag.clone(),
         library_name: raw.library_name.clone(),
@@ -918,6 +936,7 @@ fn normalize_model(raw: HfRawModel) -> CatalogModel {
         disabled: raw.disabled,
         accessibility,
         access_authorized,
+        access_checked,
         source_available: true,
         quality_valid,
         runtime_name,
@@ -960,6 +979,7 @@ fn access_required_placeholder(repository: &str) -> CatalogModel {
         disabled: false,
         accessibility: "ACCESS_REQUIRED".into(),
         access_authorized: false,
+        access_checked: true,
         source_available: true,
         quality_valid: false,
         runtime_name: None,
@@ -1488,6 +1508,7 @@ pub fn local_runtime_models() -> Vec<CatalogModel> {
             disabled: false,
             accessibility: "LOCAL".into(),
             access_authorized: true,
+            access_checked: true,
             source_available: true,
             quality_valid: true,
             runtime_name: Some("Vidio Canvas".into()),
@@ -1575,6 +1596,7 @@ pub fn local_runtime_models() -> Vec<CatalogModel> {
             disabled: false,
             accessibility: "LOCAL".into(),
             access_authorized: true,
+            access_checked: true,
             source_available: true,
             quality_valid: true,
             runtime_name: Some("FFmpeg".into()),
@@ -1767,6 +1789,58 @@ mod tests {
                 .runtime_capabilities
                 .contains(&ModelCapability::TextToVideo)
         );
+    }
+
+    #[test]
+    fn gated_list_entry_remains_installable_until_access_is_checked() {
+        let raw: HfRawModel = serde_json::from_value(json!({
+            "id": "black-forest-labs/FLUX.1-dev",
+            "pipeline_tag": "text-to-image",
+            "library_name": "diffusers",
+            "gated": "auto",
+            "sha": "abc",
+            "siblings": [
+                {"rfilename": "model_index.json"},
+                {"rfilename": "transformer/diffusion_pytorch_model.safetensors", "size": 42}
+            ],
+            "config": {"diffusers": {"_class_name": "FluxPipeline"}}
+        }))
+        .unwrap();
+
+        let model = normalize_model(raw);
+        assert!(model.gated);
+        assert!(!model.access_checked);
+        assert!(!model.access_authorized);
+        assert_eq!(model.accessibility, "UNVERIFIED");
+        assert!(model.installable);
+    }
+
+    #[test]
+    fn exact_gated_access_check_distinguishes_authorized_and_denied() {
+        let raw_json = json!({
+            "id": "black-forest-labs/FLUX.1-dev",
+            "pipeline_tag": "text-to-image",
+            "library_name": "diffusers",
+            "gated": "auto",
+            "sha": "abc",
+            "siblings": [
+                {"rfilename": "model_index.json"},
+                {"rfilename": "transformer/diffusion_pytorch_model.safetensors", "size": 42}
+            ],
+            "config": {"diffusers": {"_class_name": "FluxPipeline"}}
+        });
+        let mut authorized: HfRawModel = serde_json::from_value(raw_json.clone()).unwrap();
+        authorized.access_checked = true;
+        authorized.access_authorized = true;
+        let authorized = normalize_model(authorized);
+        assert_eq!(authorized.accessibility, "AUTHORIZED");
+        assert!(authorized.installable);
+
+        let mut denied: HfRawModel = serde_json::from_value(raw_json).unwrap();
+        denied.access_checked = true;
+        let denied = normalize_model(denied);
+        assert_eq!(denied.accessibility, "ACCESS_REQUIRED");
+        assert!(!denied.installable);
     }
 
     #[test]
