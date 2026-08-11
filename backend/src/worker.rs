@@ -61,6 +61,8 @@ pub struct WorkerModelStatus {
     pub error: Option<String>,
     #[serde(default)]
     pub benchmark: Option<WorkerBenchmarkObservation>,
+    #[serde(default)]
+    pub runtime_dependencies: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -5,7 +5,8 @@ import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { BsArrowLeft, BsCheck2, BsCircle, BsInfoCircle } from "react-icons/bs";
 import { apiFetch, closeWebSocketSafely, eventsUrl } from "../../../lib/api";
-import { INSTALL_STEPS, installationView } from "../../install/state.mjs";
+import { ProgressBar } from "../../../components/ui";
+import { dependencyView, INSTALL_STEPS, installationView, transferView } from "../../install/state.mjs";
 import styles from "../../../studio.module.css";
 
 /** Suit le job par WebSocket après un unique GET d'amorçage. */
@@ -23,6 +24,8 @@ function InstallContent() {
   const hasJob = Boolean(job);
   const view = installationView(job);
   const { terminal, failureCode, complete } = view;
+  const transfer = transferView(job);
+  const dependency = dependencyView(job);
 
   const loadInitialState = useCallback(async () => {
     if (!jobId) { setError("Identifiant de job absent."); return; }
@@ -47,7 +50,7 @@ function InstallContent() {
     const socket = new WebSocket(eventsUrl());
     socket.onmessage = (message) => {
       const envelope = JSON.parse(message.data);
-      if (envelope.event.startsWith("model.install") && envelope.data.id === jobId) setJob(envelope.data);
+      if ((envelope.event.startsWith("model.install") || envelope.event.startsWith("model.cache") || envelope.event.startsWith("model.dependency")) && envelope.data.id === jobId) setJob(envelope.data);
     };
     socket.onerror = () => {
       if (!intentionalClose) setError("Le canal temps réel est momentanément indisponible.");
@@ -64,6 +67,21 @@ function InstallContent() {
       const nextJob = await apiFetch("/api/models/install", {
         method: "POST",
         body: JSON.stringify({ model_id: model.id, revision: model.revision }),
+      });
+      router.push(`/models/install?model_id=${encodeURIComponent(model.id)}&job=${nextJob.id}`);
+    } catch (requestError) {
+      setError(requestError.message);
+      setRetrying(false);
+    }
+  }
+
+  async function retryCache() {
+    if (!model?.id) return;
+    setRetrying(true);
+    try {
+      const nextJob = await apiFetch("/api/models/cache", {
+        method: "POST",
+        body: JSON.stringify({ model_id: model.id }),
       });
       router.push(`/models/install?model_id=${encodeURIComponent(model.id)}&job=${nextJob.id}`);
     } catch (requestError) {
@@ -92,10 +110,27 @@ function InstallContent() {
             <div className={styles.progressRing} style={{ "--progress": `${(job?.progress || 0) * 3.6}deg` }}><strong>{job?.progress || 0}<small>%</small></strong></div>
             <h2>{complete ? "Installation terminée" : job?.status === "failed" ? `Installation échouée à ${job?.progress || 0}%` : "Installation en cours…"}</h2>
             <p>{job?.message || "Préparation du worker…"}</p>
+            {dependency && (
+              <div className={styles.dependencyProgress}>
+                <strong>{dependency.package || dependency.import_name}</strong>
+                <span>{dependency.version || "version contrôlée"} · {dependency.status}</span>
+              </div>
+            )}
+            {transfer && (
+              <div className={styles.transferProgress}>
+                <ProgressBar value={transfer.percent} label="Cache S3" showValue />
+                <strong>{transfer.current_file || "Validation du manifeste"}</strong>
+                <span>{transfer.transferredLabel} / {transfer.totalLabel}</span>
+                <span>Débit : {transfer.rateLabel}</span>
+                <span>Restant estimé : {transfer.etaLabel}</span>
+                {transfer.files_skipped > 0 && <span>{transfer.files_skipped} fichier(s) déjà présent(s) dans le cache S3</span>}
+              </div>
+            )}
             {job?.status === "failed" && failureCode && (
               <p className={styles.failureCode}>Code: {failureCode}</p>
             )}
             {complete && <Link className={styles.primaryButton} href={`/models/detail?model_id=${encodeURIComponent(modelId)}`}>Ouvrir et charger le modèle</Link>}
+            {complete && view.canRetryCache && <button className={styles.secondaryButton} disabled={retrying} onClick={retryCache}>{retrying ? "Relance…" : "Réessayer la sauvegarde S3"}</button>}
             {job?.status === "failed" && (
               <div className={styles.installFailureActions}>
                 <button className={styles.primaryButton} disabled={retrying} onClick={retryInstall}>

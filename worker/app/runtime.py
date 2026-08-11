@@ -33,6 +33,8 @@ from .adapters.registry import PipelineRegistry
 from .capability_resolver import CapabilityResolver
 from .normalizers import InputNormalizer, NormalizationError, OutputNormalizer, VIDEO_CAPABILITIES
 from .pipeline_resolver import PipelineResolutionError, PipelineResolver
+from .dependency_installer import DependencyInstaller
+from .dependency_resolver import DependencyResolutionError, DependencyResolver
 from .model_profile import ModelRuntimeProfile
 from .resolution_resolver import ResolutionResolver
 from .config import Settings
@@ -95,6 +97,10 @@ class RuntimeManager:
         self._runtime_error: str | None = None
         self._registry = PipelineRegistry()
         self._pipeline_resolver = PipelineResolver()
+        self._dependency_resolver = DependencyResolver()
+        self._dependency_installer = DependencyInstaller(
+            self.settings.runtime_dependencies_path
+        )
         self._resolution_resolver = ResolutionResolver()
         self._input_normalizer = InputNormalizer(self.settings.work_dir)
         self._output_normalizer = OutputNormalizer(self.settings.work_dir)
@@ -349,6 +355,81 @@ class RuntimeManager:
         metadata = self._metadata_with_capabilities(metadata)
         return metadata, manifest
 
+    def _prepare_dependencies(
+        self,
+        snapshot: Path,
+        metadata: dict[str, Any] | None = None,
+        model_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for spec in self._dependency_resolver.requirements_from_snapshot(
+            snapshot, metadata
+        ):
+            before = self._dependency_installer.status(
+                spec.import_name, required_by="quantization_config"
+            )
+            if model_id is not None:
+                pending = {
+                    **before,
+                    "status": before["status"],
+                }
+                with self._lock:
+                    self._model_states[model_id].update(
+                        state=ModelState.RESOLVING_DEPENDENCIES,
+                        runtime_dependencies=[pending],
+                    )
+
+            def report_dependency(status: str) -> None:
+                if model_id is None:
+                    return
+                state = {
+                    "DOWNLOADING": ModelState.DOWNLOADING_DEPENDENCY,
+                    "INSTALLING": ModelState.INSTALLING_DEPENDENCIES,
+                }.get(status, ModelState.RESOLVING_DEPENDENCIES)
+                with self._lock:
+                    self._model_states[model_id].update(
+                        state=state,
+                        runtime_dependencies=[{**before, "status": status}],
+                    )
+
+            installed = self._dependency_installer.ensure(
+                spec.import_name,
+                required_by="quantization_config",
+                progress=report_dependency,
+            )
+            records.append(installed)
+            if model_id is not None:
+                with self._lock:
+                    self._model_states[model_id].update(
+                        state=ModelState.RESOLVING_DEPENDENCIES,
+                        runtime_dependencies=list(records),
+                    )
+        return records
+
+    @staticmethod
+    def _merge_dependency_records(
+        *groups: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        merged: dict[str, dict[str, Any]] = {}
+        for group in groups:
+            for record in group:
+                import_name = str(record.get("import_name") or "")
+                if import_name:
+                    merged[import_name] = record
+        return [merged[key] for key in sorted(merged)]
+
+    @staticmethod
+    def _persist_runtime_dependencies(
+        snapshot: Path, manifest: dict[str, Any], records: list[dict[str, Any]]
+    ) -> None:
+        if not records:
+            return
+        manifest = {**manifest, "runtime_dependencies": records}
+        path = snapshot / "vidioai-model.json"
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        os.replace(temporary, path)
+
     @staticmethod
     def _metadata_runtime_supported(metadata: dict[str, Any]) -> bool:
         return bool(
@@ -586,6 +667,7 @@ class RuntimeManager:
         revision: str,
         local_dir: Path,
         token: str | None,
+        model_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Ne recupere que les JSON legers avant les poids du snapshot."""
         try:
@@ -640,7 +722,17 @@ class RuntimeManager:
                 422,
                 code="UNSUPPORTED_LIBRARY",
             )
-        resolution = self._pipeline_resolver.resolve_class(metadata)
+        resolution, repaired_dependencies = self._dependency_resolver.load_with_repair(
+            lambda: self._pipeline_resolver.resolve_class(metadata),
+            self._dependency_installer,
+        )
+        metadata["runtime_dependencies"] = repaired_dependencies
+        if model_id is not None and repaired_dependencies:
+            with self._lock:
+                self._model_states[model_id].update(
+                    state=ModelState.RESOLVING_DEPENDENCIES,
+                    runtime_dependencies=repaired_dependencies,
+                )
         if not resolution.runtime_supported:
             if resolution.class_name:
                 raise WorkerError(
@@ -753,7 +845,14 @@ class RuntimeManager:
     @staticmethod
     def runtime_versions() -> dict[str, str | None]:
         versions: dict[str, str | None] = {}
-        for package in ("torch", "diffusers", "transformers", "huggingface_hub", "accelerate"):
+        for package in (
+            "torch",
+            "diffusers",
+            "transformers",
+            "huggingface_hub",
+            "accelerate",
+            "bitsandbytes",
+        ):
             distribution = "huggingface-hub" if package == "huggingface_hub" else package
             try:
                 versions[package] = importlib.metadata.version(distribution)
@@ -918,6 +1017,7 @@ class RuntimeManager:
         capabilities: list[str],
     ) -> dict[str, Any]:
         validation = self.validate_snapshot(snapshot)
+        runtime_dependencies = self._prepare_dependencies(snapshot)
         metadata, manifest = self._effective_snapshot_metadata(snapshot, capabilities)
         resolved_capability = self._resolve_supported_capability(
             metadata,
@@ -946,8 +1046,15 @@ class RuntimeManager:
             "loaded": False,
             "ready": False,
             "state": ModelState.INSTALLED,
+            "runtime_dependencies": self._merge_dependency_records(
+                list(manifest.get("runtime_dependencies") or []),
+                runtime_dependencies,
+            ),
             **validation,
         }
+        self._persist_runtime_dependencies(
+            snapshot, cached, cached["runtime_dependencies"]
+        )
         with self._lock:
             self._model_states[model_id] = cached
         return cached
@@ -1030,6 +1137,7 @@ class RuntimeManager:
                 resolved_revision,
                 temporary,
                 hf_token,
+                model_id,
             )
             if preflight_metadata is not None:
                 preflight_capabilities = preflight_metadata.get("capabilities") or []
@@ -1116,6 +1224,20 @@ class RuntimeManager:
                 self._model_states[model_id]["state"] = ModelState.VALIDATING
             validation = self.validate_snapshot(temporary)
 
+            self._log_model_state(
+                model_id, "VALIDATING", "RESOLVING_DEPENDENCIES"
+            )
+            with self._lock:
+                self._model_states[model_id][
+                    "state"
+                ] = ModelState.RESOLVING_DEPENDENCIES
+            runtime_dependencies = self._merge_dependency_records(
+                list(
+                    (preflight_metadata or {}).get("runtime_dependencies") or []
+                ),
+                self._prepare_dependencies(temporary, model_id=model_id),
+            )
+
             metadata = inspect_model_metadata(temporary)
             metadata = self._metadata_with_capabilities(metadata)
             resolved_capability = self._resolve_supported_capability(
@@ -1147,6 +1269,7 @@ class RuntimeManager:
                 "loaded": False,
                 "ready": False,
                 "state": ModelState.INSTALLED,
+                "runtime_dependencies": runtime_dependencies,
                 "installed_at": int(time.time()),
                 **validation,
             }
@@ -1171,8 +1294,34 @@ class RuntimeManager:
 
             with self._lock:
                 self._model_states[model_id] = manifest
-            self._log_model_state(model_id, "VALIDATING", "INSTALLED")
+            self._log_model_state(model_id, "RESOLVING_DEPENDENCIES", "INSTALLED")
             return manifest
+
+        except DependencyResolutionError as error:
+            status_code = (
+                422
+                if error.code
+                in {
+                    "DEPENDENCY_NOT_ALLOWED",
+                    "DEPENDENCY_VERSION_CONFLICT",
+                    "DEPENDENCY_PLATFORM_UNSUPPORTED",
+                }
+                else 502
+            )
+            worker_error = WorkerError(
+                str(error),
+                status_code,
+                code=error.code,
+                retryable=error.code == "DEPENDENCY_INSTALL_FAILED",
+            )
+            self._mark_failed(
+                model_id,
+                error=worker_error,
+                downloaded=weights_download_started
+                and self._directory_has_files(temporary),
+                validated=True,
+            )
+            raise worker_error from error
 
         except WorkerError as error:
             self._log_model_state(model_id, "VALIDATING", "FAILED", reason=error.code)
@@ -1253,6 +1402,9 @@ class RuntimeManager:
             current = self._model_states.get(model_id)
             if current is not None and current.get("state") in {
                 ModelState.DOWNLOADING,
+                ModelState.RESOLVING_DEPENDENCIES,
+                ModelState.DOWNLOADING_DEPENDENCY,
+                ModelState.INSTALLING_DEPENDENCIES,
                 ModelState.FAILED,
                 ModelState.RUNTIME_UNAVAILABLE,
                 ModelState.INCOMPATIBLE,
@@ -1546,16 +1698,32 @@ class RuntimeManager:
             torch.cuda.reset_peak_memory_stats()
 
         try:
-            pipeline = self._load_pipeline(
-                snapshot=snapshot,
-                metadata=metadata,
-                capability=capability,
-                adapter=adapter,
-                device=device,
-                dtype=dtype,
+            pipeline, repaired_dependencies = self._dependency_resolver.load_with_repair(
+                lambda: self._load_pipeline(
+                    snapshot=snapshot,
+                    metadata=metadata,
+                    capability=capability,
+                    adapter=adapter,
+                    device=device,
+                    dtype=dtype,
+                ),
+                self._dependency_installer,
+            )
+            runtime_dependencies = self._merge_dependency_records(
+                list(manifest.get("runtime_dependencies") or []),
+                repaired_dependencies,
+            )
+            self._persist_runtime_dependencies(
+                snapshot, manifest, runtime_dependencies
             )
         except Exception as error:
-            code = error.code if isinstance(error, PipelineResolutionError) else "LOAD_FAILED"
+            code = (
+                error.code
+                if isinstance(
+                    error, (PipelineResolutionError, DependencyResolutionError)
+                )
+                else "LOAD_FAILED"
+            )
             self._log_model_state(model_id, "LOADING", "FAILED", reason=code)
             status = {
                 "model_id": model_id,
@@ -1572,13 +1740,27 @@ class RuntimeManager:
                 "error": f"Chargement Diffusers impossible: {type(error).__name__}: {error}",
                 "error_code": code,
             }
-            if isinstance(error, PipelineResolutionError) and error.dependency:
+            if isinstance(
+                error, (PipelineResolutionError, DependencyResolutionError)
+            ) and error.dependency:
                 status["dependency"] = error.dependency
             with self._lock:
                 self._model_states[model_id] = status
             raise WorkerError(
                 status["error"],
-                422 if code in {"DIFFUSERS_VERSION_TOO_OLD", "REMOTE_CODE_REQUIRED", "MISSING_DEPENDENCY", "PIPELINE_CLASS_NOT_AVAILABLE", "INVALID_MODEL_SNAPSHOT"} else 503,
+                422
+                if code
+                in {
+                    "DIFFUSERS_VERSION_TOO_OLD",
+                    "REMOTE_CODE_REQUIRED",
+                    "MISSING_DEPENDENCY",
+                    "DEPENDENCY_NOT_ALLOWED",
+                    "DEPENDENCY_VERSION_CONFLICT",
+                    "DEPENDENCY_PLATFORM_UNSUPPORTED",
+                    "PIPELINE_CLASS_NOT_AVAILABLE",
+                    "INVALID_MODEL_SNAPSHOT",
+                }
+                else 503,
                 code=code,
                 retryable=False,
             ) from error
@@ -1647,6 +1829,7 @@ class RuntimeManager:
             "repository": pointer["repository"],
             "revision": pointer["revision"],
             "benchmark": load_benchmark,
+            "runtime_dependencies": runtime_dependencies,
         }
         with self._lock:
             self._loaded[model_id] = loaded

@@ -28,6 +28,7 @@ class Settings:
     minimum_weights_bytes: int
     default_model_id: str
     default_repository: str
+    runtime_deps_dir: Path | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -35,6 +36,9 @@ class Settings:
         # Les valeurs locales restent dans le projet courant. En conteneur,
         # Docker fournit explicitement /models, /work et /outputs.
         data_dir = Path(os.getenv("VIDIOAI_DATA_DIR", str(Path.cwd() / "data")))
+        hf_home = Path(
+            os.getenv("HF_HOME", str(data_dir / "models" / "huggingface"))
+        )
         return cls(
             app_env=app_env,
             gpu_required=_bool_env("GPU_REQUIRED", app_env == "GPU_PRODUCTION"),
@@ -45,8 +49,12 @@ class Settings:
             outputs_dir=Path(
                 os.getenv("VIDIOAI_OUTPUTS_DIR", str(data_dir / "outputs"))
             ),
-            hf_home=Path(
-                os.getenv("HF_HOME", str(data_dir / "models" / "huggingface"))
+            hf_home=hf_home,
+            runtime_deps_dir=Path(
+                os.getenv(
+                    "VIDIOAI_RUNTIME_DEPS_DIR",
+                    str(hf_home.parent / "runtime-deps"),
+                )
             ),
             worker_token=os.getenv("VIDIOAI_WORKER_TOKEN") or None,
             minimum_weights_bytes=int(
@@ -66,8 +74,13 @@ class Settings:
             self.work_dir,
             self.outputs_dir,
             self.hf_home,
+            self.runtime_dependencies_path,
         ):
             directory.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def runtime_dependencies_path(self) -> Path:
+        return self.runtime_deps_dir or self.hf_home.parent / "runtime-deps"
 
     def configuration_errors(self) -> list[str]:
         errors: list[str] = []

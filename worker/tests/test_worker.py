@@ -1083,7 +1083,9 @@ def test_install_model_never_sends_empty_bearer_token(
             observed["api_token"] = token
 
         def model_info(self, repository: str, revision: str = "main") -> SimpleNamespace:
-            return SimpleNamespace(sha="commit-sha")
+            return SimpleNamespace(
+                sha="commit-sha", siblings=[SimpleNamespace(size=1024)]
+            )
 
     def fake_snapshot_download(**kwargs) -> None:
         observed["download_token"] = kwargs.get("token")
@@ -1124,7 +1126,9 @@ def test_install_model_public_repository_works_without_token(
             observed["api_token"] = token
 
         def model_info(self, repository: str, revision: str = "main") -> SimpleNamespace:
-            return SimpleNamespace(sha="commit-sha")
+            return SimpleNamespace(
+                sha="commit-sha", siblings=[SimpleNamespace(size=1024)]
+            )
 
     def fake_snapshot_download(**kwargs) -> None:
         observed["download_token"] = kwargs.get("token")
@@ -1207,7 +1211,9 @@ def test_install_model_public_repository_works_with_token(
             observed["api_token"] = token
 
         def model_info(self, repository: str, revision: str = "main") -> SimpleNamespace:
-            return SimpleNamespace(sha="commit-sha")
+            return SimpleNamespace(
+                sha="commit-sha", siblings=[SimpleNamespace(size=1024)]
+            )
 
     def fake_snapshot_download(**kwargs) -> None:
         observed["download_token"] = kwargs.get("token")

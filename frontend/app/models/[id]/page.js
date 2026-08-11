@@ -80,6 +80,17 @@ function ModelDetailsContent() {
     } catch (requestError) { setError(requestError.message); setRuntimeBusy(false); }
   }
 
+  async function retryCache() {
+    setRuntimeBusy(true);
+    try {
+      const job = await apiFetch("/api/models/cache", {
+        method: "POST",
+        body: JSON.stringify({ model_id: model.id }),
+      });
+      router.push(`/models/install?model_id=${encodeURIComponent(model.id)}&job=${job.id}`);
+    } catch (requestError) { setError(requestError.message); setRuntimeBusy(false); }
+  }
+
   if (error && !model) return <div className={styles.page}><div className={styles.errorBanner}>{error}</div></div>;
   if (!model) return <div className={styles.page}><div className={styles.stateCard}>Chargement du modèle…</div></div>;
 
@@ -104,6 +115,20 @@ function ModelDetailsContent() {
         <h2>Capacités</h2>
         <div className={styles.capabilityCards}>{model.capabilities.map((item) => <span key={item}><BsCheck2 /> {item.replaceAll("_", " ")}</span>)}</div>
       </section>
+      {model.runtime_dependencies?.length > 0 && <section className={styles.largePanel}>
+        <h2>Dépendances runtime</h2>
+        <div className={styles.dependencyList}>{model.runtime_dependencies.map((dependency) => (
+          <div key={dependency.import_name}>
+            <strong>✓ {dependency.package} {dependency.version}</strong>
+            <span>{dependency.status} · {dependency.source} · requis par {dependency.required_by}</span>
+          </div>
+        ))}</div>
+      </section>}
+      {model.cache_status === "CACHE_FAILED" && <section className={styles.largePanel}>
+        <h2>Cache S3 à reprendre</h2>
+        <p>Le modèle reste installé localement. {model.cache_error}</p>
+        <button className={styles.secondaryButton} disabled={runtimeBusy} onClick={retryCache}>Réessayer la sauvegarde S3</button>
+      </section>}
       <section className={styles.largePanel}>
         <h2>Pourquoi ce modèle est-il utilisable ou non ?</h2>
         {runtimeStatus(model) === "UNKNOWN" && <div className={styles.warningBanner}>Compatibilité runtime inconnue avant téléchargement : le snapshot peut être installé puis chargé pour une validation locale réelle.</div>}

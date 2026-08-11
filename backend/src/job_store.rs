@@ -149,6 +149,10 @@ mod tests {
             stage: "generating".into(),
             progress: 42,
             message: "active".into(),
+            transfer: None,
+            dependency: None,
+            cache_status: None,
+            cache_error: None,
             created_at: 1,
             updated_at: 2,
         };
@@ -178,6 +182,10 @@ mod tests {
             stage: "queued".into(),
             progress: 0,
             message: "queued".into(),
+            transfer: None,
+            dependency: None,
+            cache_status: None,
+            cache_error: None,
             created_at: 1,
             updated_at: 1,
         };

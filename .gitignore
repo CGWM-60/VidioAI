@@ -8,6 +8,9 @@ backend/target/
 host-agent/target/
 frontend/.next/
 frontend/node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
 
 # Secrets d'exploitation.
 .env

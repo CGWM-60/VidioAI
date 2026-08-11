@@ -104,6 +104,7 @@ services:
       XDG_CACHE_HOME: /data/cache/xdg
       TMPDIR: /data/worker-work
       VIDIOAI_MODELS_DIR: /models
+      VIDIOAI_RUNTIME_DEPS_DIR: /data/cache/runtime-deps
       VIDIOAI_WORK_DIR: /data/worker-work
       VIDIOAI_OUTPUTS_DIR: /data/work
 

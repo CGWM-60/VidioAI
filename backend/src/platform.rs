@@ -32,7 +32,7 @@ use std::{
 use tokio::{
     fs,
     process::Command,
-    sync::{RwLock, broadcast},
+    sync::{RwLock, broadcast, mpsc},
     time::{Duration, sleep},
 };
 use uuid::Uuid;
@@ -48,7 +48,9 @@ use crate::huggingface_catalog::{
     ModelCapability, ModelKind, ModelVariant, RepositoryFile, local_runtime_models, storage_id,
 };
 use crate::job_store::JobStore;
-use crate::object_storage::{ObjectStorage, S3Storage};
+use crate::object_storage::{
+    ObjectStorage, S3Storage, UploadProgress, UploadProgressCallback, model_s3_prefix,
+};
 use crate::worker::{WorkerBenchmarkObservation, WorkerClient, WorkerReady, WorkerResources};
 
 /// Taille maximale d'un asset reçu. La limite protège le processus avant même
@@ -322,6 +324,9 @@ pub struct ModelView {
     pub capabilities: Vec<ModelCapability>,
     pub variants: Vec<ModelVariant>,
     pub installed: bool,
+    pub cache_status: String,
+    pub cache_error: Option<String>,
+    pub runtime_dependencies: Vec<serde_json::Value>,
     /// `true` uniquement lorsqu'un runtime exploitable a été validé. Un simple
     /// manifeste Hugging Face ne doit jamais être présenté comme un modèle prêt.
     pub runtime_ready: bool,
@@ -405,6 +410,7 @@ pub struct CompatibilityCheck {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum JobKind {
     InstallModel,
+    CacheModel,
     GenerateImage,
     GenerateVideo,
 }
@@ -434,6 +440,14 @@ pub struct Job {
     pub stage: String,
     pub progress: u8,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer: Option<UploadProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_error: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -898,6 +912,7 @@ impl AppState {
             (JobKind::InstallModel, JobStatus::Completed) => "model.install.completed",
             (JobKind::InstallModel, JobStatus::Failed) => "model.install.failed",
             (JobKind::InstallModel, _) => "model.install.progress",
+            (JobKind::CacheModel, _) => "model.cache.progress",
             _ => "job.updated",
         };
         if let Err(error) = self.job_store.upsert(&updated).await {
@@ -905,6 +920,85 @@ impl AppState {
         }
         self.emit(event, &updated);
         self.emit("queue.updated", &self.queue().await);
+    }
+
+    async fn update_cache_progress(&self, id: Uuid, transfer: UploadProgress) {
+        let percent = transfer.percent();
+        let overall = (90.0 + percent * 0.09).round().clamp(90.0, 99.0) as u8;
+        let file = transfer
+            .current_file
+            .as_deref()
+            .unwrap_or("validation du cache");
+        let updated = {
+            let mut jobs = self.jobs.write().await;
+            let Some(job) = jobs.get_mut(&id) else { return };
+            job.status = JobStatus::Running;
+            job.stage = "saving_cache".into();
+            job.progress = overall;
+            job.message = format!(
+                "Sauvegarde dans le cache S3 · {file} · {:.2}% · {} fichier(s) déjà présent(s)",
+                percent, transfer.files_skipped
+            );
+            job.transfer = Some(transfer);
+            job.cache_status = Some("CACHE_UPLOADING".into());
+            job.cache_error = None;
+            job.updated_at = unix_now();
+            job.clone()
+        };
+        if let Err(error) = self.job_store.upsert(&updated).await {
+            eprintln!("Persistance du job {} impossible : {error}", updated.id);
+        }
+        self.emit("model.cache.progress", &updated);
+        self.emit("model.install.progress", &updated);
+        self.emit("queue.updated", &self.queue().await);
+    }
+
+    async fn update_cache_status(&self, id: Uuid, status: &str, error: Option<String>) {
+        let updated = {
+            let mut jobs = self.jobs.write().await;
+            let Some(job) = jobs.get_mut(&id) else { return };
+            job.cache_status = Some(status.into());
+            job.cache_error = error;
+            job.updated_at = unix_now();
+            job.clone()
+        };
+        let _ = self.job_store.upsert(&updated).await;
+        self.emit("model.cache.progress", &updated);
+    }
+
+    async fn update_dependency_progress(
+        &self,
+        id: Uuid,
+        worker_state: &str,
+        dependencies: &[serde_json::Value],
+    ) {
+        let dependency = dependencies.first().cloned();
+        let label = dependency
+            .as_ref()
+            .and_then(|value| value.get("package"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("dépendances runtime");
+        let updated = {
+            let mut jobs = self.jobs.write().await;
+            let Some(job) = jobs.get_mut(&id) else { return };
+            job.status = JobStatus::Running;
+            let (stage, progress, action) = match worker_state {
+                "DOWNLOADING_DEPENDENCY" => {
+                    ("installing_dependencies", 85, "téléchargement en cours")
+                }
+                "INSTALLING_DEPENDENCIES" => ("installing_dependencies", 87, "installation"),
+                _ => ("resolving_dependencies", 84, "résolution"),
+            };
+            job.stage = stage.into();
+            job.progress = progress;
+            job.message = format!("Préparation du runtime · {label} — {action}");
+            job.dependency = dependency;
+            job.updated_at = unix_now();
+            job.clone()
+        };
+        let _ = self.job_store.upsert(&updated).await;
+        self.emit("model.dependency.progress", &updated);
+        self.emit("model.install.progress", &updated);
     }
 
     async fn insert_job(&self, job: Job) -> Result<(), ApiError> {
@@ -975,6 +1069,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(get_model_from_query).delete(delete_model_from_query),
         )
         .route("/models/install", post(install_model_from_body))
+        .route("/models/cache", post(cache_model_from_body))
         .route("/models/load", post(load_model_from_body))
         .route("/models/unload", post(unload_model_from_body))
         // Compatibilité conservée pour les anciens clients et les IDs locaux
@@ -2177,6 +2272,29 @@ async fn model_view_with_machine(
             .as_ref()
             .is_some_and(|status| downloaded && status.installed && status.weights_valid)
     };
+    let runtime_dependencies = worker_status
+        .as_ref()
+        .map(|status| status.runtime_dependencies.clone())
+        .unwrap_or_default();
+    let cache_job = state
+        .jobs
+        .read()
+        .await
+        .values()
+        .filter(|job| job.target_id == entry.id && job.cache_status.is_some())
+        .max_by_key(|job| job.updated_at)
+        .cloned();
+    let cache_status = cache_job
+        .as_ref()
+        .and_then(|job| job.cache_status.clone())
+        .unwrap_or_else(|| {
+            if state.object_storage.enabled() && installed {
+                "CACHE_UNKNOWN".into()
+            } else {
+                "CACHE_DISABLED".into()
+            }
+        });
+    let cache_error = cache_job.and_then(|job| job.cache_error);
     let runtime_ready = entry.local || worker_status.as_ref().is_some_and(worker_reports_ready);
     let available_ram = machine.available_ram_bytes;
     let available_vram = machine.available_vram_bytes;
@@ -2328,6 +2446,9 @@ async fn model_view_with_machine(
         capabilities: entry.capabilities.clone(),
         variants: entry.variants.clone(),
         installed,
+        cache_status,
+        cache_error,
+        runtime_dependencies,
         runtime_ready,
         installation_state,
         compatible,
@@ -2635,6 +2756,14 @@ async fn start_model_install(
         stage: "checking".into(),
         progress: 0,
         message: "Vérification du modèle".into(),
+        transfer: None,
+        dependency: None,
+        cache_status: if state.object_storage.enabled() {
+            Some("CACHE_PENDING".into())
+        } else {
+            None
+        },
+        cache_error: None,
         created_at: unix_now(),
         updated_at: unix_now(),
     };
@@ -2643,6 +2772,118 @@ async fn start_model_install(
     let worker_job = job.clone();
     tokio::spawn(async move {
         run_install(worker_state, worker_job, entry).await;
+    });
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+/// Relance exclusivement la publication L2 -> L3 d'un snapshot déjà installé.
+/// Aucun appel Hugging Face et aucun téléchargement de poids n'est effectué.
+async fn cache_model_from_body(
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<ModelActionInput>,
+) -> Result<(StatusCode, Json<Job>), ApiError> {
+    state.ensure_accepting_jobs().await?;
+    if !state.object_storage.enabled() {
+        return Err(ApiError::conflict("Le cache S3 est désactivé."));
+    }
+    let entry = resolve_model(&state, &input.model_id).await?;
+    if entry.local {
+        return Err(ApiError::conflict(
+            "Les moteurs procéduraux ne possèdent pas de snapshot à publier.",
+        ));
+    }
+    let worker = state
+        .worker
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Le worker GPU n'est pas configuré."))?;
+    let status = worker
+        .model_status(&entry.storage_id)
+        .await
+        .map_err(ApiError::unavailable)?;
+    if !status.installed || !status.weights_valid {
+        return Err(ApiError::conflict(
+            "Le snapshot local doit être installé et validé avant sa sauvegarde S3.",
+        ));
+    }
+    let revision = status
+        .revision
+        .clone()
+        .unwrap_or_else(|| entry.revision.clone());
+    let snapshot_root = state
+        .settings
+        .get()
+        .await
+        .models_dir
+        .join(&entry.storage_id)
+        .join(&revision);
+    if !matches!(fs::metadata(&snapshot_root).await, Ok(metadata) if metadata.is_dir()) {
+        return Err(ApiError::conflict("Le snapshot local validé est absent."));
+    }
+    let job = Job {
+        id: Uuid::new_v4(),
+        kind: JobKind::CacheModel,
+        target_id: entry.id.clone(),
+        status: JobStatus::Queued,
+        stage: "saving_cache".into(),
+        progress: 90,
+        message: "Sauvegarde dans le cache S3".into(),
+        transfer: None,
+        dependency: None,
+        cache_status: Some("CACHE_PENDING".into()),
+        cache_error: None,
+        created_at: unix_now(),
+        updated_at: unix_now(),
+    };
+    state.insert_job(job.clone()).await?;
+    let task_state = state.clone();
+    let task_job = job.clone();
+    tokio::spawn(async move {
+        match upload_model_cache(
+            task_state.clone(),
+            task_job.id,
+            &entry.repository,
+            &revision,
+            &snapshot_root,
+        )
+        .await
+        {
+            Ok(()) => {
+                task_state
+                    .update_cache_status(task_job.id, "CACHE_READY", None)
+                    .await;
+                task_state
+                    .update_job(
+                        task_job.id,
+                        JobStatus::Completed,
+                        "installed",
+                        100,
+                        "Cache S3 validé; aucun téléchargement Hugging Face n'a été relancé",
+                    )
+                    .await;
+            }
+            Err(error) => {
+                task_state
+                    .update_cache_status(task_job.id, "CACHE_FAILED", Some(error.clone()))
+                    .await;
+                let progress = task_state
+                    .jobs
+                    .read()
+                    .await
+                    .get(&task_job.id)
+                    .map(|job| job.progress)
+                    .unwrap_or(90)
+                    .min(99);
+                task_state
+                    .update_job(
+                        task_job.id,
+                        JobStatus::Failed,
+                        "saving_cache",
+                        progress,
+                        &format!("CACHE_FAILED retryable: {error}"),
+                    )
+                    .await;
+            }
+        }
     });
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
@@ -2679,10 +2920,80 @@ async fn staged_download_bytes(models_dir: &FilePath, storage_id: &str) -> u64 {
     bytes
 }
 
+async fn restore_model_cache(
+    state: &AppState,
+    entry: &CatalogEntry,
+    model_root: &FilePath,
+) -> Result<bool, String> {
+    let snapshot_root = model_root.join(&entry.revision);
+    let restored = state
+        .object_storage
+        .restore_snapshot(&entry.repository, &entry.revision, &snapshot_root)
+        .await?;
+    if !restored {
+        return Ok(false);
+    }
+    fs::create_dir_all(model_root)
+        .await
+        .map_err(|error| error.to_string())?;
+    let pointer = model_root.join("active.json");
+    let temporary = model_root.join("active.json.tmp");
+    fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(&json!({
+            "model_id": entry.storage_id,
+            "repository": entry.repository,
+            "revision": entry.revision,
+        }))
+        .map_err(|error| error.to_string())?,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    fs::rename(temporary, pointer)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+async fn upload_model_cache(
+    state: Arc<AppState>,
+    job_id: Uuid,
+    repository: &str,
+    revision: &str,
+    snapshot_root: &FilePath,
+) -> Result<(), String> {
+    // Valide l'identité avant de démarrer le moindre transfert.
+    model_s3_prefix(repository, revision)?;
+    let (sender, mut receiver) = mpsc::unbounded_channel::<UploadProgress>();
+    let callback: UploadProgressCallback = Arc::new(move |progress| {
+        let _ = sender.send(progress);
+    });
+    let mut upload = Box::pin(state.object_storage.upload_snapshot(
+        repository,
+        revision,
+        snapshot_root,
+        Some(callback),
+    ));
+    let result = loop {
+        tokio::select! {
+            result = &mut upload => break result,
+            progress = receiver.recv() => {
+                if let Some(progress) = progress {
+                    state.update_cache_progress(job_id, progress).await;
+                }
+            }
+        }
+    };
+    while let Ok(progress) = receiver.try_recv() {
+        state.update_cache_progress(job_id, progress).await;
+    }
+    result.map(|_| ())
+}
+
 /// Worker d'installation : téléchargement en flux, progression mesurée sur le
 /// staging, vérification par SHA-256, installation atomique et état READY.
 async fn run_install(state: Arc<AppState>, job: Job, entry: CatalogEntry) {
-    let result: Result<(), String> = async {
+    let result: Result<Option<String>, String> = async {
         let worker = state.worker.as_ref().ok_or_else(|| {
             "VIDIOAI_WORKER_URL est obligatoire pour installer des poids IA.".to_owned()
         })?;
@@ -2697,14 +3008,10 @@ async fn run_install(state: Arc<AppState>, job: Job, entry: CatalogEntry) {
             .await;
         let settings = state.settings.get().await;
         let model_root = settings.models_dir.join(&entry.storage_id);
-        let object_prefix = format!("models/{}/{}", entry.repository, entry.revision);
         if state.object_storage.enabled() {
             // L1 est la VRAM du worker, L2 le volume scratch `models_dir`, L3 le
-            // préfixe S3. Un échec de restauration n'empêche pas HF de remplir L2.
-            let _ = state
-                .object_storage
-                .download_prefix(&object_prefix, &model_root)
-                .await;
+            // préfixe S3 validé par manifeste. Un échec n'empêche pas HF de remplir L2.
+            let _ = restore_model_cache(&state, &entry, &model_root).await;
         }
         state
             .update_job(
@@ -2763,6 +3070,20 @@ async fn run_install(state: Arc<AppState>, job: Job, entry: CatalogEntry) {
                             &message,
                         ).await;
                     }
+                    if let Ok(status) = worker.model_status(&entry.storage_id).await
+                        && matches!(
+                            status.state.as_str(),
+                            "RESOLVING_DEPENDENCIES"
+                                | "DOWNLOADING_DEPENDENCY"
+                                | "INSTALLING_DEPENDENCIES"
+                        )
+                    {
+                        state.update_dependency_progress(
+                            job.id,
+                            &status.state,
+                            &status.runtime_dependencies,
+                        ).await;
+                    }
                 }
             }
         };
@@ -2778,35 +3099,77 @@ async fn run_install(state: Arc<AppState>, job: Job, entry: CatalogEntry) {
                 "Snapshot et poids validés; aucun chargement GPU pendant l'installation",
             )
             .await;
+        state
+            .update_job(
+                job.id,
+                JobStatus::Running,
+                "resolving_dependencies",
+                84,
+                "Vérification des dépendances runtime déclarées par le snapshot",
+            )
+            .await;
+        if !installed.runtime_dependencies.is_empty() {
+            state
+                .update_dependency_progress(
+                    job.id,
+                    "RESOLVING_DEPENDENCIES",
+                    &installed.runtime_dependencies,
+                )
+                .await;
+        }
+        let resolved_revision = installed
+            .revision
+            .as_deref()
+            .unwrap_or(&entry.revision)
+            .to_owned();
+        let snapshot_root = model_root.join(&resolved_revision);
+        let mut cache_error = None;
         if state.object_storage.enabled() {
             state
                 .update_job(
                     job.id,
                     JobStatus::Running,
                     "saving_cache",
-                    94,
-                    "Publication du snapshot validé vers S3",
+                    90,
+                    "Sauvegarde dans le cache S3",
                 )
                 .await;
-            state
-                .object_storage
-                .upload_prefix(&model_root, &object_prefix)
-                .await?;
+            match upload_model_cache(
+                state.clone(),
+                job.id,
+                &entry.repository,
+                &resolved_revision,
+                &snapshot_root,
+            )
+            .await
+            {
+                Ok(()) => state
+                    .update_cache_status(job.id, "CACHE_READY", None)
+                    .await,
+                Err(error) => {
+                    state
+                        .update_cache_status(job.id, "CACHE_FAILED", Some(error.clone()))
+                        .await;
+                    cache_error = Some(error);
+                }
+            }
         }
-        Ok(())
+        Ok(cache_error)
     }
     .await;
 
     match result {
-        Ok(()) => {
+        Ok(cache_error) => {
+            let message = cache_error.map_or_else(
+                || "Modèle installé; chargement runtime disponible séparément".to_owned(),
+                |error| {
+                    format!(
+                        "Modèle installé localement; CACHE_FAILED retryable: {error}. La sauvegarde S3 peut être relancée séparément"
+                    )
+                },
+            );
             state
-                .update_job(
-                    job.id,
-                    JobStatus::Completed,
-                    "installed",
-                    100,
-                    "Modèle installé; chargement runtime disponible séparément",
-                )
+                .update_job(job.id, JobStatus::Completed, "installed", 100, &message)
                 .await
         }
         Err(error) => {
@@ -3688,6 +4051,10 @@ async fn generate_image(
         stage: "queued".into(),
         progress: 0,
         message: "Génération ajoutée à la file".into(),
+        transfer: None,
+        dependency: None,
+        cache_status: None,
+        cache_error: None,
         created_at: unix_now(),
         updated_at: unix_now(),
     };
@@ -4196,6 +4563,10 @@ async fn generate_video(
         stage: "queued".into(),
         progress: 0,
         message: "Vidéo ajoutée à la file".into(),
+        transfer: None,
+        dependency: None,
+        cache_status: None,
+        cache_error: None,
         created_at: unix_now(),
         updated_at: unix_now(),
     };
@@ -4973,6 +5344,7 @@ mod tests {
             validation_test: false,
             error: None,
             benchmark: None,
+            runtime_dependencies: vec![],
         };
         assert!(!super::worker_reports_ready(&status));
     }
@@ -4991,6 +5363,7 @@ mod tests {
             validation_test: true,
             error: None,
             benchmark: None,
+            runtime_dependencies: vec![],
         };
         assert!(super::worker_reports_ready(&status));
     }
@@ -5009,6 +5382,7 @@ mod tests {
             validation_test: false,
             error: None,
             benchmark: None,
+            runtime_dependencies: vec![],
         };
         assert!(super::worker_reports_ready(&status));
     }

@@ -105,6 +105,7 @@ jobs:
         run: |
           bash -n deploy/scripts/*.sh deploy/scripts/lib/*.sh deploy/tests/*.sh
           bash deploy/tests/test-s3-paths.sh
+          bash deploy/tests/test-build-release-immutability.sh
           bash deploy/tests/test-production-compose-contract.sh
 
 

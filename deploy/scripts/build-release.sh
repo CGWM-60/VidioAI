@@ -8,10 +8,60 @@ source "${PROJECT_DIR}/deploy/scripts/lib/s3-paths.sh"
 VERSION=${1:?Usage: build-release.sh <version-immuable>}
 REGISTRY=${VIDIOAI_REGISTRY:?VIDIOAI_REGISTRY requis}
 PLATFORM=${VIDIOAI_PLATFORM:-linux/amd64}
+RELEASE_DIR="${PROJECT_DIR}/output/release-${VERSION}"
+RELEASE_ARCHIVE="${PROJECT_DIR}/output/vidioai-release-${VERSION}.tar.gz"
+AWS_ENDPOINT_ARGS=()
+if [[ -n "${AWS_ENDPOINT_URL_S3:-}" ]]; then
+  AWS_ENDPOINT_ARGS=(--endpoint-url "${AWS_ENDPOINT_URL_S3}")
+fi
 
 if [[ "${VERSION}" == "latest" || ! "${VERSION}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]+$ ]]; then
   echo "Version immuable invalide: ${VERSION}" >&2
   exit 1
+fi
+
+assert_registry_tag_absent() {
+  local reference=${1:?référence requise}
+  local diagnostic
+  if diagnostic=$(docker buildx imagetools inspect "${reference}" 2>&1); then
+    echo "Release immutable refusée: le tag existe déjà: ${reference}" >&2
+    return 1
+  fi
+  case "${diagnostic}" in
+    *"not found"*|*"manifest unknown"*|*"no such manifest"*) return 0 ;;
+    *)
+      echo "Impossible de prouver que le tag est absent: ${reference}: ${diagnostic}" >&2
+      return 1
+      ;;
+  esac
+}
+
+assert_s3_object_absent() {
+  local uri=${1:?URI S3 requise}
+  local listing
+  if ! listing=$(aws s3 ls "${uri}" "${AWS_ENDPOINT_ARGS[@]}" 2>&1); then
+    echo "Impossible de vérifier l'immuabilité S3 de ${uri}: ${listing}" >&2
+    return 1
+  fi
+  if [[ -n "${listing}" ]]; then
+    echo "Release immutable refusée: l'objet existe déjà: ${uri}" >&2
+    return 1
+  fi
+}
+
+for service in backend frontend worker; do
+  assert_registry_tag_absent "${REGISTRY}/${service}:${VERSION}"
+done
+
+if [[ -e "${RELEASE_DIR}" || -e "${RELEASE_ARCHIVE}" ]]; then
+  echo "Release immutable refusée: un artefact local ${VERSION} existe déjà." >&2
+  exit 1
+fi
+
+if [[ -n "${AWS_S3_BUCKET:-}" ]]; then
+  vidioai_validate_s3_bucket "${AWS_S3_BUCKET}"
+  assert_s3_object_absent "$(vidioai_release_uri "${AWS_S3_BUCKET}" "${VERSION}" deployment.tar.gz)"
+  assert_s3_object_absent "$(vidioai_release_uri "${AWS_S3_BUCKET}" "${VERSION}" release.json)"
 fi
 
 cd "${PROJECT_DIR}"
@@ -27,6 +77,7 @@ npm --prefix frontend run lint
 npm --prefix frontend run build
 bash deploy/scripts/test-worker.sh
 bash deploy/tests/test-s3-paths.sh
+bash deploy/tests/test-build-release-immutability.sh
 bash deploy/tests/test-production-compose-contract.sh
 if [[ "${VIDIOAI_RUN_COMPOSE_TESTS:-true}" == "true" ]]; then
   bash deploy/tests/test-compose-orchestration.sh
@@ -42,13 +93,8 @@ done
 
 bash deploy/scripts/test-worker-image.sh "${REGISTRY}/worker:${VERSION}"
 
-# Aucun tag de la release n'est publié avant que les trois images soient
-# construites et que le contrat de l'image Worker finale soit vert.
-for service in backend frontend worker; do
-  docker push "${REGISTRY}/${service}:${VERSION}"
-done
-
-RELEASE_DIR="${PROJECT_DIR}/output/release-${VERSION}"
+# Préparer tout le bundle Linux avant le premier push réduit la fenêtre où une
+# release de registre existerait sans artefact de déploiement correspondant.
 mkdir -p "${RELEASE_DIR}/deploy/bin" "${RELEASE_DIR}/deploy/nginx" \
   "${RELEASE_DIR}/deploy/scripts/lib" "${RELEASE_DIR}/deploy/systemd"
 cp compose.production.yml .env.production.example "${RELEASE_DIR}/"
@@ -66,6 +112,15 @@ cp deploy/systemd/vidioai-host-agent.service "${RELEASE_DIR}/deploy/systemd/"
 cp deploy/scripts/{bootstrap-server,deploy,rollback,smoke-test,shutdown,preflight,gpu-acceptance,test-worker,test-worker-image,validate-compose-scratch,verify-scratch,migrate-scratch}.sh "${RELEASE_DIR}/deploy/scripts/"
 cp deploy/scripts/lib/scratch-storage.sh "${RELEASE_DIR}/deploy/scripts/lib/"
 
+# Aucun tag de la release n'est publié avant que les trois images soient
+# construites et que le contrat de l'image Worker finale soit vert.
+for service in backend frontend worker; do
+  assert_registry_tag_absent "${REGISTRY}/${service}:${VERSION}"
+done
+for service in backend frontend worker; do
+  docker push "${REGISTRY}/${service}:${VERSION}"
+done
+
 # Les digests sont capturés après publication afin que l'audit puisse relier un
 # tag lisible aux couches exactes tirées par Docker.
 jq -n --arg version "${VERSION}" --arg registry "${REGISTRY}" \
@@ -76,16 +131,14 @@ jq -n --arg version "${VERSION}" --arg registry "${REGISTRY}" \
   > "${RELEASE_DIR}/release.json"
 (cd "${RELEASE_DIR}" && sha256sum release.json compose.production.yml .env.production.example \
   deploy/bin/vidioai-host-agent deploy/systemd/vidioai-host-agent.service > SHA256SUMS)
-tar -C "${PROJECT_DIR}/output" -czf "${PROJECT_DIR}/output/vidioai-release-${VERSION}.tar.gz" "release-${VERSION}"
+tar -C "${PROJECT_DIR}/output" -czf "${RELEASE_ARCHIVE}" "release-${VERSION}"
 if [[ -n "${AWS_S3_BUCKET:-}" ]]; then
   vidioai_validate_s3_bucket "${AWS_S3_BUCKET}"
   DEPLOYMENT_URI=$(vidioai_release_uri "${AWS_S3_BUCKET}" "${VERSION}" deployment.tar.gz)
   MANIFEST_URI=$(vidioai_release_uri "${AWS_S3_BUCKET}" "${VERSION}" release.json)
-  AWS_ENDPOINT_ARGS=()
-  if [[ -n "${AWS_ENDPOINT_URL_S3:-}" ]]; then
-    AWS_ENDPOINT_ARGS=(--endpoint-url "${AWS_ENDPOINT_URL_S3}")
-  fi
-  aws s3 cp "${PROJECT_DIR}/output/vidioai-release-${VERSION}.tar.gz" \
+  assert_s3_object_absent "${DEPLOYMENT_URI}"
+  assert_s3_object_absent "${MANIFEST_URI}"
+  aws s3 cp "${RELEASE_ARCHIVE}" \
     "${DEPLOYMENT_URI}" \
     --storage-class "${AWS_S3_STORAGE_CLASS:-STANDARD}" \
     "${AWS_ENDPOINT_ARGS[@]}"

@@ -65,6 +65,7 @@ services:
       # Tous les caches et temporaires lourds pointent vers le Scratch hôte.
       # `/models` ne contient que les snapshots atomiques activés par VidioAI.
       HF_HOME: /cache/huggingface
+      VIDIOAI_RUNTIME_DEPS_DIR: /cache/runtime-deps
       HF_HUB_CACHE: /cache/huggingface/hub
       HUGGINGFACE_HUB_CACHE: /cache/huggingface/hub
       HF_XET_CACHE: /cache/huggingface/xet

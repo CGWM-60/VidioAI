@@ -6,6 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     HF_HOME=/models/huggingface \
+    VIDIOAI_RUNTIME_DEPS_DIR=/cache/runtime-deps \
     VIDIOAI_MODELS_DIR=/models \
     VIDIOAI_WORK_DIR=/work \
     VIDIOAI_OUTPUTS_DIR=/outputs
@@ -50,6 +51,9 @@ RUN python -m pip install \
     --no-cache-dir \
     --requirement requirements.txt
 
+# Le cas NF4 réel est un contrat de l'image, pas seulement un test de l'hôte.
+RUN python -c "import bitsandbytes, torch; from bitsandbytes.nn import Linear4bit; assert bitsandbytes.__version__ == '0.49.2'; assert torch.version.cuda == '12.8'; assert Linear4bit is not None"
+
 # ------------------------------------------------------------
 # Utilisateur non-root
 # ------------------------------------------------------------
@@ -64,6 +68,7 @@ RUN useradd \
         -o worker \
         -g worker \
         /models \
+        /cache \
         /work \
         /outputs
 

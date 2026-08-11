@@ -25,7 +25,10 @@ docker image inspect "${IMAGE}" >/dev/null
 # Python de l'hôte ni requirements-test.txt.
 docker run --rm --entrypoint python "${IMAGE}" -c '
 import importlib.metadata as metadata
+import platform
 import diffusers
+import bitsandbytes
+from bitsandbytes.nn import Linear4bit
 import torch
 import transformers
 from huggingface_hub import HfApi, snapshot_download
@@ -35,6 +38,12 @@ expected = {
     "transformers": "5.14.1",
     "accelerate": "1.14.0",
     "huggingface-hub": "1.24.0",
+    "bitsandbytes": "0.49.2",
+    "sentencepiece": "0.2.2",
+    "einops": "0.8.2",
+    "ftfy": "6.3.1",
+    "imageio": "2.37.4",
+    "imageio-ffmpeg": "0.6.0",
 }
 for package, version in expected.items():
     actual = metadata.version(package)
@@ -50,6 +59,10 @@ for class_name in (
 ):
     assert getattr(diffusers, class_name, None) is not None, class_name
 assert torch.__version__
+assert torch.version.cuda == "12.8", torch.version.cuda
+assert bitsandbytes.__version__ == "0.49.2"
+assert Linear4bit is not None
+assert platform.machine() in {"x86_64", "amd64"}, platform.machine()
 assert transformers.__version__
 assert HfApi is not None and snapshot_download is not None
 print("WORKER_IMPORT_CONTRACT_OK")

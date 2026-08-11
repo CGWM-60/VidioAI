@@ -15,6 +15,12 @@ from app.capability_resolver import CapabilityResolver
 from app.model_profile import ModelRuntimeProfile
 from app.normalizers import InputNormalizer, NormalizationError, OutputNormalizer
 from app.pipeline_resolver import PipelineResolutionError, PipelineResolver
+from app.dependency_resolver import (
+    DependencyRegistry,
+    DependencyResolutionError,
+    DependencyResolver,
+)
+from app.dependency_installer import DependencyInstaller
 from app.resolution_resolver import ResolutionResolver
 from app.config import Settings
 from app.runtime import LoadedModel, RuntimeImports, RuntimeManager
@@ -179,6 +185,154 @@ def test_pipeline_resolver_classifies_missing_dependency() -> None:
         )
     assert caught.value.code == "MISSING_DEPENDENCY"
     assert caught.value.dependency == "sentencepiece"
+
+
+def test_dependency_registry_maps_bitsandbytes_without_remote_input() -> None:
+    spec = DependencyRegistry.resolve("bitsandbytes.nn")
+    assert spec.import_name == "bitsandbytes"
+    assert spec.package == "bitsandbytes"
+    assert spec.version == "0.49.2"
+
+
+def test_dependency_registry_refuses_unknown_distribution() -> None:
+    with pytest.raises(DependencyResolutionError) as caught:
+        DependencyRegistry.resolve("repository_controlled_package")
+    assert caught.value.code == "DEPENDENCY_NOT_ALLOWED"
+
+
+def test_nf4_metadata_anticipates_bitsandbytes() -> None:
+    required = DependencyResolver.requirements_from_payloads(
+        {
+            "quantization_config": {
+                "quant_method": "bitsandbytes",
+                "bnb_4bit_quant_type": "nf4",
+                "load_in_4bit": True,
+            }
+        }
+    )
+    assert [spec.import_name for spec in required] == ["bitsandbytes"]
+
+
+def test_repository_requirements_file_is_never_interpreted(tmp_path: Path) -> None:
+    (tmp_path / "requirements.txt").write_text(
+        "repository-controlled-package==999", encoding="utf-8"
+    )
+    assert DependencyResolver.requirements_from_snapshot(tmp_path) == []
+
+
+def test_dependency_repair_installs_then_retries_pipeline_load() -> None:
+    calls = {"load": 0, "install": 0}
+
+    def loader():
+        calls["load"] += 1
+        if calls["load"] == 1:
+            error = ModuleNotFoundError("No module named 'bitsandbytes'")
+            error.name = "bitsandbytes"
+            raise PipelineResolutionError(
+                "missing", code="MISSING_DEPENDENCY", dependency="bitsandbytes"
+            ) from error
+        return "pipeline"
+
+    class Installer:
+        @staticmethod
+        def ensure(import_name: str, *, required_by: str):
+            calls["install"] += 1
+            return {
+                "import_name": import_name,
+                "status": "INSTALLED",
+                "required_by": required_by,
+            }
+
+    pipeline, records = DependencyResolver().load_with_repair(loader, Installer())
+    assert pipeline == "pipeline"
+    assert calls == {"load": 2, "install": 1}
+    assert records[0]["status"] == "INSTALLED"
+
+
+def test_dependency_repair_stops_when_same_import_repeats() -> None:
+    def loader():
+        raise PipelineResolutionError(
+            "missing", code="MISSING_DEPENDENCY", dependency="bitsandbytes"
+        )
+
+    class Installer:
+        @staticmethod
+        def ensure(import_name: str, *, required_by: str):
+            return {"import_name": import_name, "required_by": required_by}
+
+    with pytest.raises(DependencyResolutionError) as caught:
+        DependencyResolver().load_with_repair(loader, Installer())
+    assert caught.value.code == "DEPENDENCY_INSTALL_FAILED"
+
+
+def test_runtime_fingerprint_separates_dependency_environments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app.dependency_installer as installer_module
+
+    monkeypatch.setattr(installer_module, "runtime_fingerprint", lambda: "runtime-a")
+    first = DependencyInstaller(tmp_path)
+    monkeypatch.setattr(installer_module, "runtime_fingerprint", lambda: "runtime-b")
+    second = DependencyInstaller(tmp_path)
+    assert first.site_packages != second.site_packages
+    assert "runtime-a" in str(first.site_packages)
+    assert "runtime-b" in str(second.site_packages)
+
+
+def test_available_dependency_does_not_run_pip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = DependencyInstaller(
+        tmp_path,
+        runner=lambda *_args, **_kwargs: pytest.fail("pip must not run"),
+    )
+    monkeypatch.setattr(installer, "_import", lambda _spec: True)
+    record = installer.ensure("bitsandbytes")
+    assert record["status"] == "AVAILABLE"
+    assert record["automatic"] is False
+
+
+def test_dependency_install_failure_has_precise_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    def broken_runner(*_args, **_kwargs):
+        raise subprocess.CalledProcessError(1, "pip", stderr="wheel unavailable")
+
+    installer = DependencyInstaller(tmp_path, runner=broken_runner)
+    monkeypatch.setattr(installer, "_import", lambda _spec: False)
+    monkeypatch.setattr("app.dependency_installer.platform.system", lambda: "Linux")
+    with pytest.raises(DependencyResolutionError) as caught:
+        installer.ensure("bitsandbytes")
+    assert caught.value.code == "DEPENDENCY_INSTALL_FAILED"
+    assert "wheel unavailable" in str(caught.value)
+
+
+def test_dependency_install_reports_download_install_and_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    installed = False
+
+    def runner(command, **_kwargs):
+        nonlocal installed
+        calls.append(command[3])
+        if command[3] == "download":
+            destination = Path(command[command.index("--dest") + 1])
+            (destination / "bitsandbytes-0.49.2-py3-none-any.whl").write_bytes(b"wheel")
+        else:
+            installed = True
+
+    installer = DependencyInstaller(tmp_path, runner=runner)
+    monkeypatch.setattr(installer, "_import", lambda _spec: installed)
+    monkeypatch.setattr(installer, "_version", lambda _spec: "0.49.2")
+    monkeypatch.setattr("app.dependency_installer.platform.system", lambda: "Linux")
+    statuses: list[str] = []
+    record = installer.ensure("bitsandbytes", progress=statuses.append)
+    assert calls == ["download", "install"]
+    assert statuses == ["DOWNLOADING", "INSTALLING", "INSTALLED"]
+    assert record["status"] == "INSTALLED"
 
 
 def test_pipeline_resolver_never_enables_remote_code() -> None:
