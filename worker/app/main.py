@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
@@ -17,6 +18,9 @@ from .schemas import (
     InstallModelRequest,
     ModelRequest,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -64,7 +68,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def ready(
         response: Response, _auth: None = Depends(authorize)
     ) -> dict[str, object]:
-        payload = manager.runtime_status()
+        try:
+            payload = manager.runtime_status()
+        except Exception as error:
+            logger.exception("RUNTIME_STATUS_ERROR")
+            payload = {
+                "ready": False,
+                "profile": worker_settings.app_env,
+                "gpu_required": worker_settings.gpu_required,
+                "runtime_available": False,
+                "cuda_available": False,
+                "cuda_version": None,
+                "torch_version": None,
+                "versions": {},
+                "error_code": "RUNTIME_STATUS_ERROR",
+                "scratch_mount_ok": False,
+                "scratch_filesystem": "unavailable",
+                "scratch_total_bytes": 0,
+                "scratch_available_bytes": 0,
+                "errors": [
+                    f"Runtime readiness indisponible: {type(error).__name__}: {error}"
+                ],
+            }
         if not payload["ready"]:
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return payload

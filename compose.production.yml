@@ -32,10 +32,10 @@ services:
       AWS_S3_STORAGE_CLASS: ${AWS_S3_STORAGE_CLASS:-ONEZONE_IA}
     volumes:
       - ${VIDIOAI_STATE_DIR:-/var/lib/vidioai/state}:/state
-      - ${VIDIOAI_SCRATCH_DIR:-/var/lib/vidioai/scratch}/models:/models
+      - ${VIDIOAI_SCRATCH_DIR:?VIDIOAI_SCRATCH_DIR=/scratch/vidioai requis}/models:/models
       - ${VIDIOAI_OUTPUTS_DIR:-/var/lib/vidioai/outputs}:/outputs
-      - ${VIDIOAI_SCRATCH_DIR:-/var/lib/vidioai/scratch}/cache:/cache
-      - ${VIDIOAI_SCRATCH_DIR:-/var/lib/vidioai/scratch}/work:/work
+      - ${VIDIOAI_SCRATCH_DIR:?VIDIOAI_SCRATCH_DIR=/scratch/vidioai requis}/cache:/cache
+      - ${VIDIOAI_SCRATCH_DIR:?VIDIOAI_SCRATCH_DIR=/scratch/vidioai requis}/work:/work
     expose: ["8080"]
     # Docker Engine Linux ne crée pas ce DNS par défaut. `host-gateway` pointe
     # vers la passerelle de l'hôte sans donner de privilèges au conteneur.
@@ -67,6 +67,8 @@ services:
       HF_HOME: /cache/huggingface
       HF_HUB_CACHE: /cache/huggingface/hub
       HUGGINGFACE_HUB_CACHE: /cache/huggingface/hub
+      HF_XET_CACHE: /cache/huggingface/xet
+      HF_ASSETS_CACHE: /cache/huggingface/assets
       TRANSFORMERS_CACHE: /cache/huggingface/transformers
       DIFFUSERS_CACHE: /cache/huggingface/diffusers
       TORCH_HOME: /cache/torch
@@ -74,10 +76,10 @@ services:
       TMPDIR: /worker-work
       HF_TOKEN: ${HF_TOKEN:-}
     volumes:
-      - ${VIDIOAI_SCRATCH_DIR:-/var/lib/vidioai/scratch}/models:/models
-      - ${VIDIOAI_SCRATCH_DIR:-/var/lib/vidioai/scratch}/cache:/cache
-      - ${VIDIOAI_SCRATCH_DIR:-/var/lib/vidioai/scratch}/worker-work:/worker-work
-      - ${VIDIOAI_SCRATCH_DIR:-/var/lib/vidioai/scratch}/work:/work
+      - ${VIDIOAI_SCRATCH_DIR:?VIDIOAI_SCRATCH_DIR=/scratch/vidioai requis}/models:/models
+      - ${VIDIOAI_SCRATCH_DIR:?VIDIOAI_SCRATCH_DIR=/scratch/vidioai requis}/cache:/cache
+      - ${VIDIOAI_SCRATCH_DIR:?VIDIOAI_SCRATCH_DIR=/scratch/vidioai requis}/worker-work:/worker-work
+      - ${VIDIOAI_SCRATCH_DIR:?VIDIOAI_SCRATCH_DIR=/scratch/vidioai requis}/work:/work
     expose: ["8000"]
     gpus: all
     healthcheck:

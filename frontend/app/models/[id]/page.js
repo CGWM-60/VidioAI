@@ -27,6 +27,10 @@ function sourceLabel(hardware) {
   return "Informations matérielles insuffisantes";
 }
 
+function runtimeStatus(model) {
+  return model.runtime_compatibility || (model.runtime_supported ? "SUPPORTED" : "UNSUPPORTED");
+}
+
 /** Page de détail alimentée par la route query-safe `/api/models/by-id`. */
 function ModelDetailsContent() {
   const { id } = useParams();
@@ -99,6 +103,7 @@ function ModelDetailsContent() {
       </section>
       <section className={styles.largePanel}>
         <h2>Pourquoi ce modèle est-il utilisable ou non ?</h2>
+        {runtimeStatus(model) === "UNKNOWN" && <div className={styles.warningBanner}>Compatibilité runtime inconnue avant téléchargement : le snapshot peut être installé puis chargé pour une validation locale réelle.</div>}
         <div className={styles.compatibilityChecks}>
           {model.compatibility_checks.map((check) => (
             <div className={check.ok ? styles.compatibilityOk : styles.compatibilityKo} key={check.key}>
@@ -138,7 +143,7 @@ function ModelDetailsContent() {
       <div className={styles.footerActions}>
         {model.installed && !model.loaded && <button className={styles.primaryButton} disabled={runtimeBusy} onClick={() => changeRuntime("load")}><BsPlay /> Charger le modèle</button>}
         {model.loaded && <button className={styles.secondaryButton} disabled={runtimeBusy} onClick={() => changeRuntime("unload")}><BsStop /> Décharger</button>}
-        {!model.installed && <button className={styles.primaryButton} disabled={!model.installable || runtimeBusy} onClick={startInstall}><BsCloudDownload /> {model.gated && !model.access_authorized ? "Accès Hugging Face requis" : model.runtime_supported ? "Installer cette révision" : "Pipeline non implémenté"}</button>}
+        {!model.installed && <button className={styles.primaryButton} disabled={!model.installable || runtimeBusy} onClick={startInstall}><BsCloudDownload /> {model.gated && !model.access_authorized ? "Accès Hugging Face requis" : runtimeStatus(model) === "SUPPORTED" ? "Installer cette révision" : runtimeStatus(model) === "UNKNOWN" ? "Installer pour valider" : "Pipeline non implémenté"}</button>}
       </div>
     </div>
   );

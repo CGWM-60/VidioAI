@@ -36,7 +36,7 @@ from .pipeline_resolver import PipelineResolutionError, PipelineResolver
 from .model_profile import ModelRuntimeProfile
 from .resolution_resolver import ResolutionResolver
 from .config import Settings
-from .schemas import JobState, ModelState
+from .schemas import CompatibilityStatus, JobState, ModelState
 
 
 class WorkerError(RuntimeError):
@@ -71,6 +71,15 @@ class LoadedModel:
     metadata: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeImports:
+    """Dépendances paresseuses du runtime, avec un contrat stable et lisible."""
+
+    torch: Any
+    hf_api: Any
+    snapshot_download: Any
+
+
 class RuntimeManager:
     """Propriétaire unique des pipelines et des états de jobs du worker."""
 
@@ -82,7 +91,7 @@ class RuntimeManager:
         self._model_states: dict[str, dict[str, Any]] = {}
         self._jobs: dict[str, dict[str, Any]] = {}
         self._cancel_events: dict[str, threading.Event] = {}
-        self._runtime_modules: tuple[Any, Any] | None = None
+        self._runtime_modules: RuntimeImports | None = None
         self._runtime_error: str | None = None
         self._registry = PipelineRegistry()
         self._pipeline_resolver = PipelineResolver()
@@ -170,6 +179,7 @@ class RuntimeManager:
         }
         if self._pipeline_resolver.requires_remote_code(metadata):
             return {
+                "compatibility_status": CompatibilityStatus.UNSUPPORTED,
                 "runtime_supported": False,
                 "runtime_capabilities": [],
                 "pipeline_class": class_name,
@@ -179,6 +189,7 @@ class RuntimeManager:
         library = str(metadata.get("library_name") or "").lower()
         if library not in {"", "diffusers"}:
             return {
+                "compatibility_status": CompatibilityStatus.UNSUPPORTED,
                 "runtime_supported": False,
                 "runtime_capabilities": [],
                 "pipeline_class": class_name,
@@ -189,6 +200,7 @@ class RuntimeManager:
             resolution = self._pipeline_resolver.resolve_class(metadata)
         except PipelineResolutionError as error:
             return {
+                "compatibility_status": CompatibilityStatus.UNSUPPORTED,
                 "runtime_supported": False,
                 "runtime_capabilities": [],
                 "pipeline_class": class_name,
@@ -197,14 +209,16 @@ class RuntimeManager:
                 "dependency": error.dependency,
             }
         capabilities = CapabilityResolver().resolve(metadata, resolution.pipeline_cls)
+        status = CompatibilityStatus.SUPPORTED
         error_code = None
         if not resolution.runtime_supported:
-            error_code = (
-                "DIFFUSERS_VERSION_TOO_OLD"
-                if resolution.class_name
-                else "PIPELINE_CLASS_NOT_AVAILABLE"
-            )
+            if resolution.class_name:
+                status = CompatibilityStatus.UNSUPPORTED
+                error_code = "DIFFUSERS_VERSION_TOO_OLD"
+            else:
+                status = CompatibilityStatus.UNKNOWN
         return {
+            "compatibility_status": status,
             "runtime_supported": resolution.runtime_supported,
             "runtime_capabilities": capabilities,
             "pipeline_class": resolution.class_name,
@@ -335,7 +349,15 @@ class RuntimeManager:
         metadata = self._metadata_with_capabilities(metadata)
         return metadata, manifest
 
-    def _imports(self) -> tuple[Any, Any]:
+    @staticmethod
+    def _metadata_runtime_supported(metadata: dict[str, Any]) -> bool:
+        return bool(
+            metadata.get("runtime_supported") is True
+            or metadata.get("compatibility_status")
+            == CompatibilityStatus.SUPPORTED
+        )
+
+    def _imports(self) -> RuntimeImports:
         """Import paresseux : /health reste disponible même si CUDA est cassé."""
         if self._runtime_modules is not None:
             return self._runtime_modules
@@ -345,7 +367,11 @@ class RuntimeManager:
             import torch
             from huggingface_hub import HfApi, snapshot_download
 
-            self._runtime_modules = (torch, (HfApi, snapshot_download))
+            self._runtime_modules = RuntimeImports(
+                torch=torch,
+                hf_api=HfApi,
+                snapshot_download=snapshot_download,
+            )
             return self._runtime_modules
         except Exception as error:
             self._runtime_error = (
@@ -614,12 +640,17 @@ class RuntimeManager:
             )
         resolution = self._pipeline_resolver.resolve_class(metadata)
         if not resolution.runtime_supported:
-            code = (
-                "DIFFUSERS_VERSION_TOO_OLD"
-                if resolution.class_name
-                else "PIPELINE_CLASS_NOT_AVAILABLE"
+            if resolution.class_name:
+                raise WorkerError(
+                    resolution.runtime_reason,
+                    422,
+                    code="DIFFUSERS_VERSION_TOO_OLD",
+                )
+            metadata["compatibility_status"] = CompatibilityStatus.UNKNOWN
+            metadata["runtime_supported"] = False
+            metadata["runtime_reason"] = (
+                "Métadonnées publiques incomplètes; validation du snapshot requise."
             )
-            raise WorkerError(resolution.runtime_reason, 422, code=code)
         metadata["capabilities"] = CapabilityResolver().resolve(
             metadata,
             resolution.pipeline_cls,
@@ -628,19 +659,30 @@ class RuntimeManager:
 
     def runtime_status(self) -> dict[str, Any]:
         configuration_errors = self.settings.configuration_errors()
+        scratch = self._scratch_status()
+        if self.settings.gpu_required and not scratch["scratch_mount_ok"]:
+            configuration_errors.append(
+                "SCRATCH_FILESYSTEM_INVALID: /models, /cache, /work et /worker-work "
+                "doivent utiliser le Scratch dédié."
+            )
         try:
-            torch, _ = self._imports()
+            torch = self._imports().torch
             runtime_available = True
             cuda_available = bool(torch.cuda.is_available())
             cuda_version = getattr(torch.version, "cuda", None)
             torch_version = getattr(torch, "__version__", None)
-        except WorkerError as error:
+        except Exception as error:
             runtime_available = False
             cuda_available = False
             cuda_version = None
             torch_version = None
-            if str(error) not in configuration_errors:
-                configuration_errors.append(str(error))
+            message = (
+                str(error)
+                if isinstance(error, WorkerError)
+                else f"Runtime IA indisponible: {type(error).__name__}: {error}"
+            )
+            if message not in configuration_errors:
+                configuration_errors.append(message)
 
         ready = (
             not configuration_errors
@@ -656,8 +698,55 @@ class RuntimeManager:
             "cuda_version": cuda_version,
             "torch_version": torch_version,
             "versions": self.runtime_versions(),
+            **scratch,
             "errors": configuration_errors,
         }
+
+    def _scratch_status(self) -> dict[str, Any]:
+        cache_dir = self.settings.hf_home.parent
+        paths = {
+            "models": self.settings.models_dir,
+            "cache": cache_dir,
+            "work": self.settings.outputs_dir,
+            "worker_work": self.settings.work_dir,
+        }
+        try:
+            devices = {name: path.stat().st_dev for name, path in paths.items()}
+            root_device = Path("/").stat().st_dev
+            writable = all(os.access(path, os.W_OK | os.X_OK) for path in paths.values())
+            usage = shutil.disk_usage(self.settings.models_dir)
+            minimum = int(os.getenv("VIDIOAI_MIN_SCRATCH_TOTAL_BYTES", "214748364800"))
+            expected_layout = True
+            if self.settings.gpu_required:
+                expected_layout = {
+                    name: str(path)
+                    for name, path in paths.items()
+                } == {
+                    "models": "/models",
+                    "cache": "/cache",
+                    "work": "/work",
+                    "worker_work": "/worker-work",
+                }
+            mount_ok = (
+                writable
+                and len(set(devices.values())) == 1
+                and devices["models"] != root_device
+                and usage.total >= minimum
+                and expected_layout
+            )
+            return {
+                "scratch_mount_ok": mount_ok,
+                "scratch_filesystem": f"device:{devices['models']}",
+                "scratch_total_bytes": usage.total,
+                "scratch_available_bytes": usage.free,
+            }
+        except (OSError, ValueError) as error:
+            return {
+                "scratch_mount_ok": False,
+                "scratch_filesystem": f"unavailable:{type(error).__name__}",
+                "scratch_total_bytes": 0,
+                "scratch_available_bytes": 0,
+            }
 
     @staticmethod
     def runtime_versions() -> dict[str, str | None]:
@@ -666,7 +755,7 @@ class RuntimeManager:
             distribution = "huggingface-hub" if package == "huggingface_hub" else package
             try:
                 versions[package] = importlib.metadata.version(distribution)
-            except importlib.metadata.PackageNotFoundError:
+            except Exception:
                 versions[package] = None
         return versions
 
@@ -753,8 +842,18 @@ class RuntimeManager:
             parsed_index = json.loads(model_index.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise WorkerError("model_index.json est invalide.", 422) from error
-        if "_class_name" not in parsed_index:
-            raise WorkerError("Le manifest Diffusers ne déclare pas _class_name.", 422)
+        has_diffusers_component = any(
+            isinstance(component, list)
+            and component
+            and str(component[0]).strip().lower() == "diffusers"
+            for key, component in parsed_index.items()
+            if not str(key).startswith("_")
+        )
+        if "_class_name" not in parsed_index and not has_diffusers_component:
+            raise WorkerError(
+                "Le manifest ne déclare ni pipeline ni composant Diffusers.",
+                422,
+            )
 
         weights = sorted(snapshot.rglob("*.safetensors"))
         if not weights:
@@ -820,24 +919,27 @@ class RuntimeManager:
         metadata, manifest = self._effective_snapshot_metadata(snapshot, capabilities)
         resolved_capability = self._resolve_supported_capability(
             metadata,
-            manifest.get("capabilities") or capabilities,
+            manifest.get("requested_capabilities")
+            or manifest.get("capabilities")
+            or capabilities,
         )
         if resolved_capability is None:
             raise self._unsupported_pipeline_error(metadata)
 
-        runtime_capabilities = metadata.get("capabilities") or [resolved_capability]
+        runtime_capabilities = list(metadata.get("capabilities") or [])
         cached = {
             **manifest,
             "model_id": model_id,
             "repository": pointer["repository"],
             "revision": pointer["revision"],
             "capabilities": runtime_capabilities,
+            "requested_capabilities": list(capabilities),
             "downloaded": True,
             "validated": True,
             "installed": True,
             "weights_valid": validation["weights_valid"],
             "runtime_available": self.runtime_status()["runtime_available"],
-            "runtime_compatible": True,
+            "runtime_compatible": self._metadata_runtime_supported(metadata),
             "validation_test": False,
             "loaded": False,
             "ready": False,
@@ -914,8 +1016,9 @@ class RuntimeManager:
         weights_download_started = False
 
         try:
-            _, hub = self._imports()
-            HfApi, snapshot_download = hub
+            runtime_imports = self._imports()
+            HfApi = runtime_imports.hf_api
+            snapshot_download = runtime_imports.snapshot_download
             hf_token = self._hf_token()
             info = HfApi(token=hf_token).model_info(repository, revision=revision)
             resolved_revision = self._safe_segment(info.sha)
@@ -1020,7 +1123,7 @@ class RuntimeManager:
             if resolved_capability is None:
                 raise self._unsupported_pipeline_error(metadata)
 
-            runtime_capabilities = metadata.get("capabilities") or [resolved_capability]
+            runtime_capabilities = list(metadata.get("capabilities") or [])
             destination = self._model_root(model_id) / resolved_revision
             destination.parent.mkdir(parents=True, exist_ok=True)
             if destination.exists():
@@ -1031,12 +1134,13 @@ class RuntimeManager:
                 "repository": repository,
                 "revision": resolved_revision,
                 "capabilities": runtime_capabilities,
+                "requested_capabilities": list(capabilities),
                 "downloaded": True,
                 "validated": True,
                 "installed": True,
                 "weights_valid": True,
                 "runtime_available": self.runtime_status()["runtime_available"],
-                "runtime_compatible": True,
+                "runtime_compatible": self._metadata_runtime_supported(metadata),
                 "validation_test": False,
                 "loaded": False,
                 "ready": False,
@@ -1156,11 +1260,11 @@ class RuntimeManager:
             validation = self.validate_snapshot(snapshot)
             metadata, manifest = self._effective_snapshot_metadata(
                 snapshot,
-                manifest.get("capabilities"),
+                manifest.get("requested_capabilities") or manifest.get("capabilities"),
             )
             resolved_capability = self._resolve_supported_capability(
                 metadata,
-                manifest.get("capabilities"),
+                manifest.get("requested_capabilities") or manifest.get("capabilities"),
             )
             if resolved_capability is None:
                 runtime_error = self._unsupported_pipeline_error(metadata)
@@ -1189,12 +1293,12 @@ class RuntimeManager:
                 "validated": True,
                 "installed": True,
                 "weights_valid": validation["weights_valid"],
-                "runtime_compatible": True,
+                "runtime_compatible": self._metadata_runtime_supported(metadata),
                 "loaded": loaded is not None,
-                "ready": loaded is not None and loaded.validation_test,
+                "ready": loaded is not None and loaded.pipeline is not None,
                 "state": (
                     ModelState.READY
-                    if loaded is not None and loaded.validation_test
+                    if loaded is not None and loaded.pipeline is not None
                     else ModelState.INSTALLED
                 ),
                 "validation_test": loaded is not None and loaded.validation_test,
@@ -1378,7 +1482,7 @@ class RuntimeManager:
                 "loaded": False,
                 "ready": False,
             }
-        torch, _ = self._imports()
+        torch = self._imports().torch
         cuda_available = bool(torch.cuda.is_available())
 
         if self.settings.gpu_required and not cuda_available:
@@ -1401,7 +1505,7 @@ class RuntimeManager:
         metadata, manifest = self._effective_snapshot_metadata(snapshot)
         capability = self._resolve_supported_capability(
             metadata,
-            manifest.get("capabilities"),
+            manifest.get("requested_capabilities") or manifest.get("capabilities"),
         )
         if capability is None:
             runtime_error = self._unsupported_pipeline_error(metadata)
@@ -1439,14 +1543,6 @@ class RuntimeManager:
                 adapter=adapter,
                 device=device,
                 dtype=dtype,
-            )
-            self._validate_loaded_pipeline(
-                adapter=adapter,
-                pipeline=pipeline,
-                metadata=metadata,
-                capability=capability,
-                device=device,
-                torch=torch,
             )
         except Exception as error:
             code = error.code if isinstance(error, PipelineResolutionError) else "LOAD_FAILED"
@@ -1515,7 +1611,7 @@ class RuntimeManager:
             revision=pointer["revision"],
             device=device,
             loaded_at=time.time(),
-            validation_test=True,
+            validation_test=False,
             precision=precision,
             load_benchmark=load_benchmark,
             pipeline=pipeline,
@@ -1531,7 +1627,7 @@ class RuntimeManager:
             "weights_valid": validation["weights_valid"],
             "runtime_available": True,
             "runtime_compatible": True,
-            "validation_test": True,
+            "validation_test": False,
             "loaded": True,
             "ready": True,
             "device": device,
@@ -1556,7 +1652,7 @@ class RuntimeManager:
             del loaded.pipeline
             gc.collect()
             try:
-                torch, _ = self._imports()
+                torch = self._imports().torch
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             except WorkerError:
@@ -1602,7 +1698,7 @@ class RuntimeManager:
             return adapter
 
         snapshot, _ = self._active_snapshot(loaded.model_id)
-        torch, _ = self._imports()
+        torch = self._imports().torch
 
         old_pipeline = loaded.pipeline
         loaded.pipeline = None
@@ -1732,7 +1828,7 @@ class RuntimeManager:
                 )
             return callback_kwargs
 
-        torch, _ = self._imports()
+        torch = self._imports().torch
         generation_started = time.perf_counter()
         if loaded.device == "cuda":
             torch.cuda.reset_peak_memory_stats()
@@ -1826,7 +1922,7 @@ class RuntimeManager:
         model_id = request["model_id"]
         with self._lock:
             loaded = self._loaded.get(model_id)
-            if loaded is None or not loaded.validation_test:
+            if loaded is None or loaded.pipeline is None:
                 raise WorkerError(
                     "Le modèle n'est pas READY.",
                     409,

@@ -63,6 +63,10 @@ function hardwareTooltip(hardware) {
   return "Estimation calculée à partir des poids et de la configuration Hugging Face. La consommation réelle peut varier selon la résolution et les paramètres de génération.";
 }
 
+function runtimeStatus(model) {
+  return model.runtime_compatibility || (model.runtime_supported ? "SUPPORTED" : "UNSUPPORTED");
+}
+
 export default function ModelsPage() {
   const router = useRouter();
   const [models, setModels] = useState([]);
@@ -171,10 +175,10 @@ export default function ModelsPage() {
                 <small className={styles.hardwareSummary} title={hardwareTooltip(model.hardware)}><BsCpu /> {hardwareSummary(model.hardware)} · {model.compatibility_level.toLowerCase().replaceAll("_", " ")}</small>
                 <div className={styles.compactCompatibility}>
                   <span className={model.hardware_compatible ? styles.checkGood : styles.checkBad}>{model.hardware_compatible ? "✓" : "✕"} Matériel</span>
-                  <span className={model.runtime_supported ? styles.checkGood : styles.checkBad}>{model.runtime_supported ? "✓" : "✕"} Pipeline runtime</span>
+                  <span className={runtimeStatus(model) === "SUPPORTED" ? styles.checkGood : runtimeStatus(model) === "UNKNOWN" ? styles.warningBanner : styles.checkBad}>{runtimeStatus(model) === "SUPPORTED" ? "✓ Pipeline runtime" : runtimeStatus(model) === "UNKNOWN" ? "? Validation après téléchargement" : "✕ Pipeline runtime"}</span>
                   <span className={model.source_available ? styles.checkGood : styles.checkBad}>{model.source_available ? "✓" : "✕"} Source</span>
                 </div>
-                {!model.runtime_supported && <small className={styles.runtimeReason}>{model.runtime_reason}</small>}
+                {runtimeStatus(model) !== "SUPPORTED" && <small className={styles.runtimeReason}>{model.runtime_reason}</small>}
                 {model.repository_url && <a className={styles.repositoryLink} href={model.repository_url} target="_blank" rel="noreferrer">Hugging Face · {model.repository}</a>}
               </div>
               <div className={styles.modelSize}>
@@ -184,7 +188,7 @@ export default function ModelsPage() {
               <div className={styles.modelActions}>
                 {!model.installed ? (
                   <button className={styles.primaryButton} title={!model.runtime_supported ? model.runtime_reason : model.gated && !model.access_authorized ? "Accès Hugging Face requis" : ""} disabled={!model.installable || busyId === model.id} onClick={() => startInstall(model)}>
-                    <BsCloudDownload /> {busyId === model.id ? "Préparation…" : model.gated && !model.access_authorized ? "Accès requis" : model.runtime_supported ? "Installer" : "Runtime non compatible"}
+                    <BsCloudDownload /> {busyId === model.id ? "Préparation…" : model.gated && !model.access_authorized ? "Accès requis" : runtimeStatus(model) === "SUPPORTED" ? "Installer" : runtimeStatus(model) === "UNKNOWN" ? "Valider et installer" : "Runtime non compatible"}
                   </button>
                 ) : <span className={styles.readyBadge}>{model.runtime_ready ? "Prêt" : "Installé"}</span>}
                 <Link href={`/models/detail?model_id=${encodeURIComponent(model.id)}`}>Détails <BsArrowRight /></Link>

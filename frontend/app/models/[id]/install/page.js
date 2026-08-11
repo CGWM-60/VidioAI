@@ -5,22 +5,8 @@ import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { BsArrowLeft, BsCheck2, BsCircle, BsInfoCircle } from "react-icons/bs";
 import { apiFetch, closeWebSocketSafely, eventsUrl } from "../../../lib/api";
+import { INSTALL_STEPS, installationView } from "../../install/state.mjs";
 import styles from "../../../studio.module.css";
-
-const STEPS = [
-  ["checking", "Vérification", "Compatibilité et espace disque"],
-  ["restoring_cache", "Cache", "Recherche du snapshot S3"],
-  ["downloading", "Téléchargement", "Octets reçus depuis Hugging Face"],
-  ["validating_runtime", "Runtime", "Poids, chargement CUDA et inférence de test"],
-  ["saving_cache", "Sauvegarde", "Publication du snapshot validé vers S3"],
-  ["ready", "Prêt à l’emploi", "Démarrage du modèle"],
-];
-
-function extractErrorCode(message) {
-  if (!message) return "";
-  const match = String(message).match(/\b([A-Z][A-Z0-9_]{2,})\b/);
-  return match ? match[1] : "";
-}
 
 /** Suit le job par WebSocket après un unique GET d'amorçage. */
 function InstallContent() {
@@ -35,8 +21,8 @@ function InstallContent() {
   const [error, setError] = useState("");
   const [retrying, setRetrying] = useState(false);
   const hasJob = Boolean(job);
-  const terminal = ["completed", "failed", "cancelled"].includes(job?.status);
-  const failureCode = extractErrorCode(job?.message || "");
+  const view = installationView(job);
+  const { terminal, failureCode, complete } = view;
 
   const loadInitialState = useCallback(async () => {
     if (!jobId) { setError("Identifiant de job absent."); return; }
@@ -69,8 +55,7 @@ function InstallContent() {
     return () => { intentionalClose = true; closeWebSocketSafely(socket); };
   }, [jobId, hasJob, terminal]);
 
-  const currentIndex = useMemo(() => Math.max(0, STEPS.findIndex(([stage]) => stage === job?.stage)), [job]);
-  const complete = job?.status === "completed";
+  const currentIndex = useMemo(() => installationView(job).currentIndex, [job]);
 
   async function retryInstall() {
     if (!model?.id) return;
@@ -95,7 +80,7 @@ function InstallContent() {
         <div className={styles.installIntro}><h2>Installation de {model?.name || fallbackModelName}</h2><p>{model?.repository || modelId} · Vous pouvez suivre la progression réelle sans actualiser la page.</p></div>
         <div className={styles.installGrid}>
           <div className={styles.timeline}>
-            {STEPS.map(([stage, label, help], index) => {
+            {INSTALL_STEPS.map(([stage, label, help], index) => {
               const done = complete || index < currentIndex;
               const active = !complete && index === currentIndex;
               return <div className={`${styles.timelineStep} ${active ? styles.timelineActive : ""}`} key={`${stage}-${index}`}>
@@ -110,7 +95,7 @@ function InstallContent() {
             {job?.status === "failed" && failureCode && (
               <p className={styles.failureCode}>Code: {failureCode}</p>
             )}
-            {complete && <Link className={styles.primaryButton} href={`/models/detail?model_id=${encodeURIComponent(modelId)}`}>Ouvrir le modèle</Link>}
+            {complete && <Link className={styles.primaryButton} href={`/models/detail?model_id=${encodeURIComponent(modelId)}`}>Ouvrir et charger le modèle</Link>}
             {job?.status === "failed" && (
               <div className={styles.installFailureActions}>
                 <button className={styles.primaryButton} disabled={retrying} onClick={retryInstall}>
@@ -121,7 +106,7 @@ function InstallContent() {
             )}
           </div>
         </div>
-        <div className={styles.tip}><BsInfoCircle /><div><strong>Astuce</strong><span>Le WebSocket vous notifie dès que le modèle est prêt à l’emploi.</span></div></div>
+        <div className={styles.tip}><BsInfoCircle /><div><strong>Étapes séparées</strong><span>L’installation ne lance ni CUDA ni inférence. Chargez ensuite explicitement le modèle depuis sa fiche.</span></div></div>
       </section>
     </div>
   );

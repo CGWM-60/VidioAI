@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
     "@react-icons/all-files": "https://github.com/react-icons/react-icons/releases/download/v4.7.1/react-icons-all-files-4.7.1.tgz",

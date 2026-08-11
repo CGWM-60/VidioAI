@@ -22,10 +22,12 @@ cargo fmt --manifest-path host-agent/Cargo.toml --all -- --check
 cargo clippy --manifest-path host-agent/Cargo.toml --locked --all-targets -- -D warnings
 cargo test --manifest-path host-agent/Cargo.toml --locked
 npm --prefix frontend ci
+npm --prefix frontend test
 npm --prefix frontend run lint
 npm --prefix frontend run build
 bash deploy/scripts/test-worker.sh
 bash deploy/tests/test-s3-paths.sh
+bash deploy/tests/test-production-compose-contract.sh
 if [[ "${VIDIOAI_RUN_COMPOSE_TESTS:-true}" == "true" ]]; then
   bash deploy/tests/test-compose-orchestration.sh
 fi
@@ -35,12 +37,20 @@ for service in backend frontend worker; do
     --platform "${PLATFORM}" \
     --file "${service}/Dockerfile" \
     --tag "${REGISTRY}/${service}:${VERSION}" \
-    --push "${service}"
+    --load "${service}"
+done
+
+bash deploy/scripts/test-worker-image.sh "${REGISTRY}/worker:${VERSION}"
+
+# Aucun tag de la release n'est publié avant que les trois images soient
+# construites et que le contrat de l'image Worker finale soit vert.
+for service in backend frontend worker; do
+  docker push "${REGISTRY}/${service}:${VERSION}"
 done
 
 RELEASE_DIR="${PROJECT_DIR}/output/release-${VERSION}"
 mkdir -p "${RELEASE_DIR}/deploy/bin" "${RELEASE_DIR}/deploy/nginx" \
-  "${RELEASE_DIR}/deploy/scripts" "${RELEASE_DIR}/deploy/systemd"
+  "${RELEASE_DIR}/deploy/scripts/lib" "${RELEASE_DIR}/deploy/systemd"
 cp compose.production.yml .env.production.example "${RELEASE_DIR}/"
 cp deploy/nginx/default.conf "${RELEASE_DIR}/deploy/nginx/"
 # Le Host Agent doit correspondre à Linux, même lorsque le bundle est préparé
@@ -53,7 +63,8 @@ docker run --rm --platform "${PLATFORM}" \
   -w /src rust:1.96-bookworm \
   sh -c 'cargo build --release --locked && cp /tmp/vidioai-host-agent-target/release/vidioai-host-agent /out/'
 cp deploy/systemd/vidioai-host-agent.service "${RELEASE_DIR}/deploy/systemd/"
-cp deploy/scripts/{bootstrap-server,deploy,rollback,smoke-test,shutdown,preflight,gpu-acceptance,test-worker}.sh "${RELEASE_DIR}/deploy/scripts/"
+cp deploy/scripts/{bootstrap-server,deploy,rollback,smoke-test,shutdown,preflight,gpu-acceptance,test-worker,test-worker-image,validate-compose-scratch,verify-scratch,migrate-scratch}.sh "${RELEASE_DIR}/deploy/scripts/"
+cp deploy/scripts/lib/scratch-storage.sh "${RELEASE_DIR}/deploy/scripts/lib/"
 
 # Les digests sont capturés après publication afin que l'audit puisse relier un
 # tag lisible aux couches exactes tirées par Docker.

@@ -5,7 +5,7 @@ from typing import Any
 
 from ..capability_resolver import CapabilityResolver
 from ..model_profile import ModelRuntimeProfile
-from ..normalizers import assign_alias
+from ..normalizers import NormalizationError, assign_alias
 from ..pipeline_resolver import PipelineResolver
 from .base import RuntimeAdapter
 
@@ -43,7 +43,17 @@ class GenericDiffusersAdapter(RuntimeAdapter):
 
     def supports_model(self, metadata: dict[str, Any]) -> bool:
         try:
-            return PipelineResolver().resolve_class(metadata).runtime_supported
+            resolver = PipelineResolver()
+            resolution = resolver.resolve_class(metadata)
+            if resolution.runtime_supported:
+                return True
+            return bool(
+                resolution.class_name is None
+                and metadata.get("model_index")
+                and str(metadata.get("library_name") or "diffusers").lower()
+                in {"", "diffusers"}
+                and not resolver.requires_remote_code(metadata)
+            )
         except Exception:
             return False
 
@@ -77,17 +87,12 @@ class GenericDiffusersAdapter(RuntimeAdapter):
             ]
             return list(resolved_images), roles
 
-        images = []
-        roles = []
-        for item in request.get("input_images") or []:
-            if not isinstance(item, dict):
-                continue
-            source = item.get("asset_id")
-            if source is None:
-                continue
-            images.append(source)
-            roles.append(str(item.get("role") or "reference").lower())
-        return images, roles
+        if request.get("input_images"):
+            raise NormalizationError(
+                "Les asset IDs doivent être résolus vers des images avant l'appel pipeline.",
+                code="INVALID_INPUT_ASSET",
+            )
+        return [], []
 
     def generate(self, pipeline: Any, runtime: Any, request: dict[str, Any]) -> dict[str, Any]:
         capability = str(request.get("capability") or "TEXT_TO_IMAGE").upper()

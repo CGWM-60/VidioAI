@@ -59,6 +59,9 @@ jobs:
       - run: npm ci
         working-directory: frontend
 
+      - run: npm test
+        working-directory: frontend
+
       - run: npm run lint
         working-directory: frontend
 
@@ -102,6 +105,7 @@ jobs:
         run: |
           bash -n deploy/scripts/*.sh deploy/scripts/lib/*.sh deploy/tests/*.sh
           bash deploy/tests/test-s3-paths.sh
+          bash deploy/tests/test-production-compose-contract.sh
 
 
   containers:
@@ -120,9 +124,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - run: docker compose config
+      - run: docker compose --profile gpu config
 
-      - run: docker compose build
+      - run: docker compose --profile gpu build
+
+      - name: Validate the final Worker image contract
+        run: |
+          WORKER_IMAGE=$(docker compose --profile gpu images -q worker)
+          test -n "${WORKER_IMAGE}"
+          bash deploy/scripts/test-worker-image.sh "${WORKER_IMAGE}"
 
       - name: Validate production compose
         env:
@@ -131,4 +141,5 @@ jobs:
           AWS_ACCESS_KEY_ID: ci
           AWS_SECRET_ACCESS_KEY: ci-secret
           AWS_S3_BUCKET: ci-bucket
+          VIDIOAI_SCRATCH_DIR: /scratch/vidioai
         run: docker compose -f compose.production.yml config --quiet

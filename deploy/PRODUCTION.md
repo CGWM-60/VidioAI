@@ -25,3 +25,23 @@ Le bundle contient aussi `deploy/bin/vidioai-host-agent` compilé pour Linux et
 son unité systemd. `bootstrap-server.sh` installe le binaire hors Docker, génère
 le token interne si nécessaire, démarre le service et valide `/health` puis
 `/system` avant d'autoriser le déploiement Compose.
+
+## Scratch GPU obligatoire
+
+`bootstrap-server.sh` refuse GPU_PRODUCTION si `/scratch` n'est pas un mount
+inscriptible distinct de `/`. Il crée `/scratch/vidioai/{models,cache,work,worker-work}`
+et écrit explicitement `VIDIOAI_SCRATCH_DIR=/scratch/vidioai` dans
+`.env.production`. Le preflight contrôle ensuite le Compose résolu et le
+filesystem réel avant que le Worker puisse démarrer.
+
+Si des données existent encore dans `/var/lib/vidioai/scratch`, le bootstrap les
+copie et les compare sans supprimer la source. La procédure explicite est :
+
+```bash
+sudo ./deploy/scripts/migrate-scratch.sh prepare
+./deploy/scripts/deploy.sh <version>
+sudo ./deploy/scripts/migrate-scratch.sh verify
+# Seulement après vérification et avec confirmation destructive explicite :
+sudo VIDIOAI_CONFIRM_SCRATCH_CLEANUP=DELETE_OLD_SCRATCH \
+  ./deploy/scripts/migrate-scratch.sh cleanup
+```

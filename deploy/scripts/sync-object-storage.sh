@@ -7,7 +7,12 @@ set -Eeuo pipefail
 : "${AWS_ENDPOINT_URL_S3:?AWS_ENDPOINT_URL_S3 requis}"
 MODE=${1:-push}
 SOURCE_OUTPUTS=${VIDIOAI_OUTPUTS_DIR:-/var/lib/vidioai/outputs}
-SOURCE_MODELS=${VIDIOAI_MODELS_DIR:-/var/lib/vidioai/scratch/models}
+: "${VIDIOAI_SCRATCH_DIR:?VIDIOAI_SCRATCH_DIR=/scratch/vidioai requis}"
+[[ "${VIDIOAI_SCRATCH_DIR}" == "/scratch/vidioai" ]] || {
+  echo "Synchronisation modèles refusée hors /scratch/vidioai." >&2
+  exit 1
+}
+SOURCE_MODELS=${VIDIOAI_MODELS_DIR:-${VIDIOAI_SCRATCH_DIR}/models}
 
 command -v aws >/dev/null 2>&1 || { echo "aws-cli est requis." >&2; exit 1; }
 if [[ "${MODE}" == "push" ]]; then

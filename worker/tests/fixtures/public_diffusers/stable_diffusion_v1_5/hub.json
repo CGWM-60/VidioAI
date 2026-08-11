@@ -1,0 +1,15 @@
+{
+  "id": "stable-diffusion-v1-5/stable-diffusion-v1-5",
+  "sha": "451f4fe16113bff5a5d2269ed5ad43b0592e9a14",
+  "pipeline_tag": "text-to-image",
+  "library_name": "diffusers",
+  "tags": [
+    "diffusers",
+    "stable-diffusion",
+    "stable-diffusion-diffusers",
+    "text-to-image",
+    "diffusers:StableDiffusionPipeline"
+  ],
+  "base_models": [],
+  "source": "https://huggingface.co/api/models/stable-diffusion-v1-5/stable-diffusion-v1-5"
+}

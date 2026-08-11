@@ -1,0 +1,16 @@
+{
+  "id": "hunyuanvideo-community/HunyuanVideo",
+  "sha": "e8c2aaa66fe3742a32c11a6766aecbf07c56e773",
+  "pipeline_tag": null,
+  "library_name": "diffusers",
+  "tags": [
+    "diffusers",
+    "safetensors",
+    "base_model:tencent/HunyuanVideo",
+    "base_model:finetune:tencent/HunyuanVideo",
+    "diffusers:HunyuanVideoPipeline",
+    "region:us"
+  ],
+  "base_models": ["tencent/HunyuanVideo"],
+  "source": "https://huggingface.co/api/models/hunyuanvideo-community/HunyuanVideo"
+}

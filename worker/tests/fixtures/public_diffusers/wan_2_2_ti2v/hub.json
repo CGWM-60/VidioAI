@@ -1,0 +1,18 @@
+{
+  "id": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+  "sha": "b8fff7315c768468a5333511427288870b2e9635",
+  "pipeline_tag": "text-to-video",
+  "library_name": "diffusers",
+  "tags": [
+    "diffusers",
+    "safetensors",
+    "text-to-video",
+    "en",
+    "zh",
+    "arxiv:2503.20314",
+    "license:apache-2.0",
+    "diffusers:WanPipeline",
+    "region:us"
+  ],
+  "source": "https://huggingface.co/api/models/Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+}

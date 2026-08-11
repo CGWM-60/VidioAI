@@ -15,7 +15,7 @@ case "${ID}" in
 esac
 
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y acl ca-certificates curl ffmpeg file gnupg jq git openssl pciutils rsync unzip
+DEBIAN_FRONTEND=noninteractive apt-get install -y acl ca-certificates curl ffmpeg file gnupg jq git openssl pciutils rsync unzip util-linux
 
 # Ubuntu Noble ne publie plus nécessairement le paquet `awscli`. L'installeur
 # officiel v2 est autonome et fonctionne aussi bien en x86_64 qu'en aarch64.
@@ -58,19 +58,77 @@ if lspci 2>/dev/null | grep -qi nvidia && ! command -v nvidia-ctk >/dev/null 2>&
   systemctl restart docker
 fi
 
-install -d -m 0750 -o root -g docker /opt/vidioai /var/lib/vidioai/{state,outputs,scratch,backups}
-install -d -m 0770 -o root -g docker /var/lib/vidioai/scratch/{models,cache,work,worker-work}
+PRODUCTION_ENV=${VIDIOAI_ENV_FILE:-/opt/vidioai/.env.production}
+SCRATCH_DIR=/scratch/vidioai
+OLD_SCRATCH_DIR=/var/lib/vidioai/scratch
+
+# Une simple existence de /scratch ne suffit pas : il doit s'agir d'un mount
+# distinct du filesystem racine, sinon les poids retomberaient sur /dev/sda1.
+[[ -d /scratch && -w /scratch ]] || {
+  echo "/scratch est absent ou non inscriptible; bootstrap GPU refusé." >&2
+  exit 1
+}
+SCRATCH_TARGET=$(findmnt -T /scratch -n -o TARGET)
+ROOT_DEVICE=$(stat -c '%d' /)
+SCRATCH_DEVICE=$(stat -c '%d' /scratch)
+SCRATCH_TOTAL_BYTES=$(df -B1 --output=size /scratch | tail -n 1 | tr -d '[:space:]')
+MIN_SCRATCH_TOTAL_BYTES=${VIDIOAI_MIN_SCRATCH_TOTAL_BYTES:-214748364800}
+[[ "${SCRATCH_TARGET}" == "/scratch" || "${SCRATCH_TARGET}" == /scratch/* ]] || {
+  echo "/scratch résout vers ${SCRATCH_TARGET:-inconnu}; mount Scratch distinct requis." >&2
+  exit 1
+}
+[[ "${ROOT_DEVICE}" != "${SCRATCH_DEVICE}" ]] || {
+  echo "/scratch utilise le filesystem racine; stockage modèles refusé." >&2
+  exit 1
+}
+[[ "${SCRATCH_TOTAL_BYTES}" -ge "${MIN_SCRATCH_TOTAL_BYTES}" ]] || {
+  echo "/scratch est trop petit (${SCRATCH_TOTAL_BYTES} octets); minimum ${MIN_SCRATCH_TOTAL_BYTES}." >&2
+  exit 1
+}
+
+install -d -m 0750 -o root -g docker /opt/vidioai /var/lib/vidioai/{state,outputs,backups}
+install -d -m 0770 -o root -g docker "${SCRATCH_DIR}"/{models,cache,work,worker-work}
 # UID 10001 (backend) et 10002 (worker) partagent le Scratch sans exécuter les
 # conteneurs en root. Les ACL par défaut s'appliquent aussi aux nouveaux poids.
-setfacl -Rm u:10001:rwx,u:10002:rwx /var/lib/vidioai/{state,outputs,scratch}
-setfacl -Rdm u:10001:rwx,u:10002:rwx /var/lib/vidioai/{state,outputs,scratch}
+setfacl -Rm u:10001:rwx,u:10002:rwx /var/lib/vidioai/{state,outputs} "${SCRATCH_DIR}"
+setfacl -Rdm u:10001:rwx,u:10002:rwx /var/lib/vidioai/{state,outputs} "${SCRATCH_DIR}"
+
+# Migration automatique sûre : copie et comparaison checksum, jamais de
+# suppression de l'ancien stockage pendant le bootstrap.
+if [[ -d "${OLD_SCRATCH_DIR}" ]] \
+    && find "${OLD_SCRATCH_DIR}" -mindepth 1 -print -quit | grep -q .; then
+  if docker ps --filter label=com.docker.compose.service=worker -q | grep -q .; then
+    echo "Un Worker tourne encore; migration automatique Scratch refusée." >&2
+    exit 1
+  fi
+  rsync -aHAX --numeric-ids "${OLD_SCRATCH_DIR}/" "${SCRATCH_DIR}/"
+  MIGRATION_DIFF=$(rsync -aHAXnci "${OLD_SCRATCH_DIR}/" "${SCRATCH_DIR}/" \
+    --exclude '.vidioai-migration-*')
+  [[ -z "${MIGRATION_DIFF}" ]] || {
+    echo "Migration Scratch copiée mais comparaison checksum en échec; ancien stockage conservé." >&2
+    exit 1
+  }
+  printf 'source=%s\ntarget=%s\nverified_at=%s\n' \
+    "${OLD_SCRATCH_DIR}" "${SCRATCH_DIR}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    >"${SCRATCH_DIR}/.vidioai-migration-verified"
+  echo "Ancien Scratch copié et vérifié; ${OLD_SCRATCH_DIR} est conservé."
+fi
+setfacl -Rm u:10001:rwx,u:10002:rwx "${SCRATCH_DIR}"
+setfacl -Rdm u:10001:rwx,u:10002:rwx "${SCRATCH_DIR}"
+
+install -d -m 0750 -o root -g root "$(dirname "${PRODUCTION_ENV}")"
+touch "${PRODUCTION_ENV}"
+if grep -q '^VIDIOAI_SCRATCH_DIR=' "${PRODUCTION_ENV}"; then
+  sed -i 's#^VIDIOAI_SCRATCH_DIR=.*#VIDIOAI_SCRATCH_DIR=/scratch/vidioai#' "${PRODUCTION_ENV}"
+else
+  printf 'VIDIOAI_SCRATCH_DIR=/scratch/vidioai\n' >>"${PRODUCTION_ENV}"
+fi
 
 # Le binaire natif est livré dans l'archive de release. Il n'est jamais copié
 # dans une image Docker, ce qui garantit que sysinfo et nvidia-smi voient l'hôte.
 HOST_AGENT_BINARY=${HOST_AGENT_BINARY:-/opt/vidioai/deploy/bin/vidioai-host-agent}
 HOST_AGENT_SERVICE=${HOST_AGENT_SERVICE:-/opt/vidioai/deploy/systemd/vidioai-host-agent.service}
 HOST_AGENT_ENV=/etc/vidioai/host-agent.env
-PRODUCTION_ENV=${VIDIOAI_ENV_FILE:-/opt/vidioai/.env.production}
 test -x "${HOST_AGENT_BINARY}" || { echo "Binaire Host Agent absent: ${HOST_AGENT_BINARY}" >&2; exit 1; }
 test -f "${HOST_AGENT_SERVICE}" || { echo "Service systemd absent: ${HOST_AGENT_SERVICE}" >&2; exit 1; }
 
@@ -94,7 +152,6 @@ fi
 # Synchroniser systématiquement le secret choisi, y compris lorsqu'il a été
 # fourni au script. Auparavant ce cas pouvait laisser Compose et systemd avec
 # deux tokens différents et provoquer des 401 intermittents.
-touch "${PRODUCTION_ENV}"
 if grep -q '^HOST_AGENT_TOKEN=' "${PRODUCTION_ENV}"; then
   sed -i "s/^HOST_AGENT_TOKEN=.*/HOST_AGENT_TOKEN=${HOST_AGENT_TOKEN}/" "${PRODUCTION_ENV}"
 else
@@ -135,4 +192,5 @@ if ! command -v nvidia-smi >/dev/null 2>&1; then
 fi
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 docker run --rm --gpus all "${CUDA_TEST_IMAGE:-nvidia/cuda:12.8.1-base-ubuntu24.04}" nvidia-smi >/dev/null
+df -h "${SCRATCH_DIR}"
 echo "Bootstrap terminé. Docker: $(docker --version) · AWS CLI: $(aws --version 2>&1)"

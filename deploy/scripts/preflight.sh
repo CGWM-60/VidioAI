@@ -6,6 +6,7 @@ ENV_FILE=${VIDIOAI_ENV_FILE:-${PROJECT_DIR}/.env.production}
 COMPOSE_FILE=${VIDIOAI_COMPOSE_FILE:-${PROJECT_DIR}/compose.production.yml}
 RELEASE_VERSION=${1:-${VIDIOAI_VERSION:-}}
 SKIP_TESTS=${VIDIOAI_PREFLIGHT_SKIP_TESTS:-false}
+source "${PROJECT_DIR}/deploy/scripts/lib/scratch-storage.sh"
 
 FAILURES=()
 WARNINGS=()
@@ -42,10 +43,17 @@ echo "[preflight] Projet: ${PROJECT_DIR}"
 [[ -f "${PROJECT_DIR}/deploy/scripts/bootstrap-server.sh" ]] || fail "Script bootstrap-server.sh absent"
 [[ -f "${PROJECT_DIR}/deploy/scripts/shutdown.sh" ]] || fail "Script shutdown.sh absent"
 [[ -f "${PROJECT_DIR}/deploy/scripts/gpu-acceptance.sh" ]] || fail "Script gpu-acceptance.sh absent"
+[[ -f "${PROJECT_DIR}/deploy/scripts/validate-compose-scratch.sh" ]] || fail "Script validate-compose-scratch.sh absent"
+[[ -f "${PROJECT_DIR}/deploy/scripts/verify-scratch.sh" ]] || fail "Script verify-scratch.sh absent"
+[[ -f "${PROJECT_DIR}/deploy/scripts/migrate-scratch.sh" ]] || fail "Script migrate-scratch.sh absent"
+[[ -f "${PROJECT_DIR}/deploy/scripts/lib/scratch-storage.sh" ]] || fail "Bibliothèque scratch-storage.sh absente"
 
 if [[ ! -f "${ENV_FILE}" ]]; then
   fail "Fichier d'environnement absent: ${ENV_FILE}"
 else
+  if ! vidioai_require_production_scratch "${ENV_FILE}"; then
+    fail "Contrat VIDIOAI_SCRATCH_DIR invalide."
+  fi
   worker_token=$(env_value "VIDIOAI_WORKER_TOKEN")
   admin_token=$(env_value "VIDIOAI_ADMIN_TOKEN")
   host_agent_token=$(env_value "HOST_AGENT_TOKEN")
@@ -90,6 +98,18 @@ if [[ "${VIDIOAI_PLATFORM:-linux/amd64}" != "linux/amd64" ]]; then
 fi
 
 if command -v docker >/dev/null 2>&1; then
+  if ! VIDIOAI_PROJECT_DIR="${PROJECT_DIR}" \
+      VIDIOAI_ENV_FILE="${ENV_FILE}" \
+      VIDIOAI_COMPOSE_FILE="${COMPOSE_FILE}" \
+      "${PROJECT_DIR}/deploy/scripts/validate-compose-scratch.sh"; then
+    fail "Configuration Compose Scratch invalide."
+  fi
+  if ! VIDIOAI_PROJECT_DIR="${PROJECT_DIR}" \
+      VIDIOAI_ENV_FILE="${ENV_FILE}" \
+      VIDIOAI_COMPOSE_FILE="${COMPOSE_FILE}" \
+      "${PROJECT_DIR}/deploy/scripts/verify-scratch.sh" host; then
+    fail "Filesystem Scratch hôte invalide ou identique au disque système."
+  fi
   if ! docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" config >/dev/null 2>&1; then
     fail "docker compose config échoue pour ${COMPOSE_FILE}."
   fi
@@ -162,6 +182,7 @@ if [[ "${SKIP_TESTS}" != "true" ]]; then
   (cd "${PROJECT_DIR}" && npm --prefix frontend run lint) || fail "Lint frontend en échec."
   (cd "${PROJECT_DIR}" && npm --prefix frontend run build) || fail "Build frontend en échec."
   (cd "${PROJECT_DIR}" && bash deploy/tests/test-s3-paths.sh) || fail "Tests deploy/tests/test-s3-paths.sh en échec."
+  (cd "${PROJECT_DIR}" && bash deploy/tests/test-production-compose-contract.sh) || fail "Contrat Scratch du compose production en échec."
   (cd "${PROJECT_DIR}" && VIDIOAI_COMPOSE_FILE="${PROJECT_DIR}/docker-compose.yml" VIDIOAI_HTTP_PORT=18080 bash deploy/tests/test-compose-orchestration.sh) || fail "Test orchestration compose non-GPU en échec."
 else
   warn "Tests applicatifs ignorés (VIDIOAI_PREFLIGHT_SKIP_TESTS=true)."

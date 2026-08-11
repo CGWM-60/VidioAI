@@ -31,6 +31,12 @@ class JobState(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class CompatibilityStatus(StrEnum):
+    SUPPORTED = "SUPPORTED"
+    UNKNOWN = "UNKNOWN"
+    UNSUPPORTED = "UNSUPPORTED"
+
+
 class InstallModelRequest(BaseModel):
     model_id: str = Field(min_length=2, max_length=128)
     repository: str = Field(min_length=3, max_length=256)

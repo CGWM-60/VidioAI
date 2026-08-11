@@ -2,11 +2,14 @@
 set -Eeuo pipefail
 
 PROJECT_DIR=${VIDIOAI_PROJECT_DIR:-/opt/vidioai}
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ENV_FILE=${VIDIOAI_ENV_FILE:-${PROJECT_DIR}/.env.production}
+source "${SCRIPT_DIR}/lib/scratch-storage.sh"
 cd "${PROJECT_DIR}"
 set -a
 source "${ENV_FILE}"
 set +a
+vidioai_require_production_scratch "${ENV_FILE}"
 
 BASE_URL="http://127.0.0.1:${VIDIOAI_HTTP_PORT:-8080}"
 curl -fsS -X POST -H "Authorization: Bearer ${VIDIOAI_ADMIN_TOKEN}" \
@@ -19,7 +22,8 @@ for ((attempt=1; attempt<=${DRAIN_ATTEMPTS:-90}; attempt++)); do
 done
 curl -fsS -X POST -H "Authorization: Bearer ${VIDIOAI_ADMIN_TOKEN}" \
   "${BASE_URL}/api/admin/stop" >/dev/null
-docker compose -f compose.production.yml --env-file "${ENV_FILE}" down --timeout 90
+VIDIOAI_SCRATCH_DIR="${VIDIOAI_SCRATCH_DIR}" \
+  docker compose -f compose.production.yml --env-file "${ENV_FILE}" down --timeout 90
 if [[ "${VIDIOAI_S3_ENABLED:-false}" == "true" ]]; then
   SNAPSHOT="state/snapshots/$(date -u +%Y%m%dT%H%M%SZ)"
   AWS_ENDPOINT_ARGS=()

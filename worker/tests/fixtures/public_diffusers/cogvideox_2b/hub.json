@@ -1,0 +1,20 @@
+{
+  "id": "zai-org/CogVideoX-2b",
+  "sha": "1137dacfc2c9c012bed6a0793f4ecf2ca8e7ba01",
+  "pipeline_tag": "text-to-video",
+  "library_name": "diffusers",
+  "tags": [
+    "diffusers",
+    "safetensors",
+    "cogvideox",
+    "video-generation",
+    "thudm",
+    "text-to-video",
+    "en",
+    "arxiv:2408.06072",
+    "license:apache-2.0",
+    "diffusers:CogVideoXPipeline",
+    "region:us"
+  ],
+  "source": "https://huggingface.co/api/models/zai-org/CogVideoX-2b"
+}

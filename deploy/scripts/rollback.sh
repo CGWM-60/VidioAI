@@ -2,13 +2,16 @@
 set -Eeuo pipefail
 
 PROJECT_DIR=${VIDIOAI_PROJECT_DIR:-/opt/vidioai}
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ENV_FILE=${VIDIOAI_ENV_FILE:-${PROJECT_DIR}/.env.production}
 COMPOSE_FILE=${VIDIOAI_COMPOSE_FILE:-${PROJECT_DIR}/compose.production.yml}
 WAIT_TIMEOUT=${VIDIOAI_DEPLOY_WAIT_TIMEOUT:-180}
 WAIT_INTERVAL=${VIDIOAI_DEPLOY_WAIT_INTERVAL:-2}
+source "${SCRIPT_DIR}/lib/scratch-storage.sh"
 
 compose() {
-  docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" "$@"
+  VIDIOAI_SCRATCH_DIR="${VIDIOAI_SCRATCH_DIR:?Scratch non configuré}" \
+    docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" "$@"
 }
 
 has_service() {
@@ -65,9 +68,22 @@ test -f .previous-version || { echo "Aucune version précédente connue." >&2; e
 PREVIOUS_VERSION=$(<.previous-version)
 CURRENT_VERSION=$(cat .current-version 2>/dev/null || true)
 [[ -n "${PREVIOUS_VERSION}" && "${PREVIOUS_VERSION}" != "latest" ]] || { echo "Version de rollback invalide." >&2; exit 1; }
+CALLER_SCRATCH_SET=${VIDIOAI_SCRATCH_DIR+x}
+CALLER_SCRATCH_VALUE=${VIDIOAI_SCRATCH_DIR-}
 set -a
 source "${ENV_FILE}"
 set +a
+if [[ -n "${CALLER_SCRATCH_SET}" && "${CALLER_SCRATCH_VALUE}" != "${VIDIOAI_SCRATCH_DIR:-}" ]]; then
+  echo "VIDIOAI_SCRATCH_DIR du shell contredit ${ENV_FILE}; rollback refusé." >&2
+  exit 1
+fi
+vidioai_require_production_scratch "${ENV_FILE}"
+if [[ -z "${VIDIOAI_TEST_STATE_DIR:-}" ]]; then
+  VIDIOAI_PROJECT_DIR="${PROJECT_DIR}" VIDIOAI_ENV_FILE="${ENV_FILE}" \
+    VIDIOAI_COMPOSE_FILE="${COMPOSE_FILE}" "${SCRIPT_DIR}/validate-compose-scratch.sh"
+  VIDIOAI_PROJECT_DIR="${PROJECT_DIR}" VIDIOAI_ENV_FILE="${ENV_FILE}" \
+    VIDIOAI_COMPOSE_FILE="${COMPOSE_FILE}" "${SCRIPT_DIR}/verify-scratch.sh" host
+fi
 curl -fsS -X POST -H "Authorization: Bearer ${VIDIOAI_ADMIN_TOKEN}" \
   "http://127.0.0.1:${VIDIOAI_HTTP_PORT:-8080}/api/admin/drain" >/dev/null || true
 export VIDIOAI_VERSION="${PREVIOUS_VERSION}"
@@ -76,6 +92,10 @@ for service in worker backend frontend proxy; do
   if has_service "${service}"; then
     compose up -d --remove-orphans "${service}"
     wait_for_service "${service}"
+    if [[ "${service}" == "worker" && -z "${VIDIOAI_TEST_STATE_DIR:-}" ]]; then
+      VIDIOAI_PROJECT_DIR="${PROJECT_DIR}" VIDIOAI_ENV_FILE="${ENV_FILE}" \
+        VIDIOAI_COMPOSE_FILE="${COMPOSE_FILE}" "${SCRIPT_DIR}/verify-scratch.sh" worker
+    fi
   fi
 done
 "${PROJECT_DIR}/deploy/scripts/smoke-test.sh" "http://127.0.0.1:${VIDIOAI_HTTP_PORT:-8080}"

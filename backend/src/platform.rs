@@ -49,7 +49,7 @@ use crate::huggingface_catalog::{
 };
 use crate::job_store::JobStore;
 use crate::object_storage::{ObjectStorage, S3Storage};
-use crate::worker::{WorkerBenchmarkObservation, WorkerClient, WorkerResources};
+use crate::worker::{WorkerBenchmarkObservation, WorkerClient, WorkerReady, WorkerResources};
 
 /// Taille maximale d'un asset reçu. La limite protège le processus avant même
 /// que les données ne soient décodées par la crate `image`.
@@ -344,6 +344,9 @@ pub struct ModelView {
     /// capacités du modèle. Les modèles vidéo restent catalogués sans être
     /// présentés comme installables par le runtime T2I actuel.
     pub runtime_supported: bool,
+    /// Décision tri-state du Worker. UNKNOWN autorise une installation de
+    /// validation, mais ne prétend jamais que le runtime est déjà supporté.
+    pub runtime_compatibility: String,
     /// Justification fournie par la matrice pipeline/library/architecture.
     pub runtime_reason: String,
     pub pipeline_class: Option<String>,
@@ -1198,6 +1201,10 @@ struct ReadyStatus {
     ready: bool,
     storage_writable: bool,
     scratch_writable: bool,
+    scratch_mount_ok: bool,
+    scratch_filesystem: Option<String>,
+    scratch_total_bytes: u64,
+    scratch_available_bytes: u64,
     ffmpeg: bool,
     catalog_models: usize,
     message: String,
@@ -1211,6 +1218,16 @@ struct ReadyStatus {
     gpu: bool,
     s3: bool,
     errors: Vec<String>,
+}
+
+fn worker_runtime_flags(status: Option<&WorkerReady>) -> (bool, bool, bool) {
+    status.map_or((false, false, false), |status| {
+        (
+            status.ready,
+            status.runtime_available,
+            status.cuda_available,
+        )
+    })
 }
 
 /// Readiness plus stricte que `/healthcheck` : elle vérifie que l'application
@@ -1282,13 +1299,10 @@ async fn get_ready(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Read
         None => None,
     };
     let worker_required = state.profile == ApplicationProfile::GpuProduction;
-    let worker_ready = worker_status.as_ref().is_some_and(|status| status.ready);
-    let runtime = worker_status
+    let (worker_ready, runtime, gpu) = worker_runtime_flags(worker_status.as_ref());
+    let worker_scratch_mount_ok = worker_status
         .as_ref()
-        .is_some_and(|status| status.runtime_available);
-    let gpu = worker_status
-        .as_ref()
-        .is_some_and(|status| status.cuda_available);
+        .is_some_and(|status| status.scratch_mount_ok);
     let s3 = if state.object_storage.enabled() {
         match state.object_storage.health().await {
             Ok(()) => true,
@@ -1318,6 +1332,9 @@ async fn get_ready(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Read
     if worker_required && !gpu {
         errors.push("CUDA/NVIDIA est obligatoire dans GPU_PRODUCTION.".into());
     }
+    if worker_required && !worker_scratch_mount_ok {
+        errors.push("Le Worker n'atteste pas le filesystem Scratch dédié.".into());
+    }
     if state.profile == ApplicationProfile::GpuProduction && (!host_health || !host_metrics) {
         errors.push("Le Host Agent natif est obligatoire dans GPU_PRODUCTION.".into());
     }
@@ -1344,11 +1361,21 @@ async fn get_ready(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Read
         && s3
         && (state.host_agent.is_none() || (host_health && host_metrics))
         && (state.profile != ApplicationProfile::GpuProduction || host_nvidia)
-        && (!worker_required || (worker_ready && runtime && gpu));
+        && (!worker_required || (worker_ready && runtime && gpu && worker_scratch_mount_ok));
     let payload = ReadyStatus {
         ready,
         storage_writable,
         scratch_writable,
+        scratch_mount_ok: worker_scratch_mount_ok,
+        scratch_filesystem: worker_status
+            .as_ref()
+            .and_then(|status| status.scratch_filesystem.clone()),
+        scratch_total_bytes: worker_status
+            .as_ref()
+            .map_or(0, |status| status.scratch_total_bytes),
+        scratch_available_bytes: worker_status
+            .as_ref()
+            .map_or(0, |status| status.scratch_available_bytes),
         ffmpeg,
         catalog_models: local_runtime_models().len(),
         message: if ready {
@@ -2064,7 +2091,6 @@ fn worker_reports_ready(status: &crate::worker::WorkerModelStatus) -> bool {
         && status.weights_valid
         && status.runtime_available
         && status.runtime_compatible
-        && status.validation_test
 }
 
 async fn model_view_with_machine(
@@ -2087,13 +2113,19 @@ async fn model_view_with_machine(
     } else {
         None
     };
-    let runtime_supported = if entry.local {
-        true
+    let runtime_compatibility = if entry.local {
+        "SUPPORTED".to_owned()
+    } else if let Some(check) = &runtime_check {
+        match check.compatibility_status.as_str() {
+            "SUPPORTED" | "UNKNOWN" | "UNSUPPORTED" => check.compatibility_status.clone(),
+            _ if check.runtime_supported => "SUPPORTED".into(),
+            _ => "UNKNOWN".into(),
+        }
     } else {
-        runtime_check
-            .as_ref()
-            .is_some_and(|check| check.runtime_supported)
+        "UNKNOWN".into()
     };
+    let runtime_supported = runtime_compatibility == "SUPPORTED";
+    let runtime_allowed = runtime_compatibility != "UNSUPPORTED";
     let runtime_capabilities = if entry.local {
         entry.runtime_capabilities.clone()
     } else {
@@ -2140,9 +2172,9 @@ async fn model_view_with_machine(
     let installed = if entry.local {
         true
     } else {
-        worker_status.as_ref().is_some_and(|status| {
-            downloaded && status.installed && status.weights_valid && status.runtime_compatible
-        })
+        worker_status
+            .as_ref()
+            .is_some_and(|status| downloaded && status.installed && status.weights_valid)
     };
     let runtime_ready = entry.local || worker_status.as_ref().is_some_and(worker_reports_ready);
     let available_ram = machine.available_ram_bytes;
@@ -2195,8 +2227,10 @@ async fn model_view_with_machine(
     let compatibility_level = hardware_estimate.compatibility_level.clone();
     let installation_state = if entry.local {
         "READY".to_owned()
-    } else if !runtime_supported {
+    } else if runtime_compatibility == "UNSUPPORTED" {
         "RUNTIME_UNAVAILABLE".to_owned()
+    } else if runtime_compatibility == "UNKNOWN" && !downloaded {
+        "COMPATIBILITY_UNKNOWN".to_owned()
     } else if runtime_ready {
         "READY".to_owned()
     } else if worker_status
@@ -2260,7 +2294,7 @@ async fn model_view_with_machine(
         CompatibilityCheck {
             key: "runtime",
             label: "Pipeline VidioAI",
-            ok: runtime_supported && (entry.local || machine.runtime_available),
+            ok: runtime_allowed && (entry.local || machine.runtime_available),
             detail: runtime_detail,
         },
         CompatibilityCheck {
@@ -2275,7 +2309,7 @@ async fn model_view_with_machine(
         },
     ];
     let compatible = hardware_compatible
-        && runtime_supported
+        && runtime_allowed
         && entry.source_available
         && entry.quality_valid
         && (entry.local || machine.runtime_available);
@@ -2309,6 +2343,7 @@ async fn model_view_with_machine(
             .unwrap_or_else(|| "Non supporté".into()),
         engine_type: if entry.local { "procedural" } else { "ai" }.into(),
         runtime_supported,
+        runtime_compatibility: runtime_compatibility.clone(),
         runtime_reason,
         pipeline_class,
         runtime_capabilities: runtime_capabilities.clone(),
@@ -2318,7 +2353,11 @@ async fn model_view_with_machine(
         hardware_compatible,
         available_ram_bytes: available_ram,
         available_vram_bytes: available_vram,
-        installable: entry.installable && runtime_supported && compatible && access_ok,
+        installable: entry.source_available
+            && entry.quality_valid
+            && runtime_allowed
+            && compatible
+            && access_ok,
         compatibility_checks,
         accessibility: entry.accessibility.clone(),
         access_authorized: entry.access_authorized,
@@ -2558,7 +2597,7 @@ async fn start_model_install(
             "Ce modèle nécessite un accès Hugging Face autorisé via HF_TOKEN.",
         ));
     }
-    if !view.runtime_supported || !entry.quality_valid {
+    if view.runtime_compatibility == "UNSUPPORTED" || !entry.quality_valid {
         return Err(ApiError::conflict(
             "Le modèle ne possède pas les fichiers requis par un runtime VidioAI validé.",
         ));
@@ -2715,17 +2754,11 @@ async fn run_install(state: Arc<AppState>, job: Job, entry: CatalogEntry) {
             .update_job(
                 job.id,
                 JobStatus::Running,
-                "validating_runtime",
+                "validating_snapshot",
                 80,
-                "Chargement et test d'inférence du runtime",
+                "Snapshot et poids validés; aucun chargement GPU pendant l'installation",
             )
             .await;
-        let loaded = worker
-            .load(&entry.storage_id, &entry.repository, &entry.revision)
-            .await?;
-        if loaded.state != "READY" || !loaded.validation_test {
-            return Err("Le worker n'a pas atteint l'état READY strict.".into());
-        }
         if state.object_storage.enabled() {
             state
                 .update_job(
@@ -2751,9 +2784,9 @@ async fn run_install(state: Arc<AppState>, job: Job, entry: CatalogEntry) {
                 .update_job(
                     job.id,
                     JobStatus::Completed,
-                    "ready",
+                    "installed",
                     100,
-                    "Modèle READY : poids, runtime et test validés",
+                    "Modèle installé; chargement runtime disponible séparément",
                 )
                 .await
         }
@@ -2866,11 +2899,7 @@ async fn load_model_by_id(state: &AppState, id: &str) -> Result<Json<RuntimeEntr
                     .model_status(&entry.storage_id)
                     .await
                     .map_err(ApiError::unavailable)?;
-                if status.state == "READY"
-                    && status.validation_test
-                    && status.runtime_compatible
-                    && status.weights_valid
-                {
+                if status.state == "READY" && status.runtime_compatible && status.weights_valid {
                     return Ok(Json(existing));
                 }
                 state.runtime.write().await.remove(id);
@@ -2890,7 +2919,7 @@ async fn load_model_by_id(state: &AppState, id: &str) -> Result<Json<RuntimeEntr
             .load(&entry.storage_id, &entry.repository, &entry.revision)
             .await
             .map_err(ApiError::unavailable)?;
-        if status.state != "READY" || !status.validation_test {
+        if status.state != "READY" || !status.runtime_compatible {
             return Err(ApiError::unavailable(
                 "Le runtime worker n'a pas atteint READY.",
             ));
@@ -4669,9 +4698,9 @@ mod tests {
         AppSettings, CanvasEngine, GenerateVideoRequest, GenerationMode, ModelCapability,
         ModelIdQuery, image_endpoint, is_valid_image_capability_for_mode,
         is_valid_video_capability_for_mode, local_runtime_models, procedural_video_dimensions,
-        video_endpoint,
+        video_endpoint, worker_runtime_flags,
     };
-    use crate::worker::WorkerModelStatus;
+    use crate::worker::{WorkerModelStatus, WorkerReady};
     use serde_json::json;
 
     #[test]
@@ -4945,5 +4974,40 @@ mod tests {
             benchmark: None,
         };
         assert!(super::worker_reports_ready(&status));
+    }
+
+    #[test]
+    fn backend_ready_does_not_require_a_hidden_inference_during_load() {
+        let status = WorkerModelStatus {
+            model_id: "video-model".into(),
+            state: "READY".into(),
+            repository: Some("example/video-model".into()),
+            revision: Some("rev".into()),
+            installed: true,
+            weights_valid: true,
+            runtime_available: true,
+            runtime_compatible: true,
+            validation_test: false,
+            error: None,
+            benchmark: None,
+        };
+        assert!(super::worker_reports_ready(&status));
+    }
+
+    #[test]
+    fn worker_cuda_and_runtime_flags_map_without_contradiction() {
+        let status = WorkerReady {
+            ready: true,
+            profile: "GPU_PRODUCTION".into(),
+            runtime_available: true,
+            cuda_available: true,
+            gpu_required: true,
+            scratch_mount_ok: true,
+            scratch_filesystem: Some("device:contract".into()),
+            scratch_total_bytes: 1_500_000_000_000,
+            scratch_available_bytes: 1_400_000_000_000,
+            errors: vec![],
+        };
+        assert_eq!(worker_runtime_flags(Some(&status)), (true, true, true));
     }
 }

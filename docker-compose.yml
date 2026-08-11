@@ -92,6 +92,8 @@ services:
       HF_HOME: /data/cache/huggingface
       HF_HUB_CACHE: /data/cache/huggingface/hub
       HUGGINGFACE_HUB_CACHE: /data/cache/huggingface/hub
+      HF_XET_CACHE: /data/cache/huggingface/xet
+      HF_ASSETS_CACHE: /data/cache/huggingface/assets
       TRANSFORMERS_CACHE: /data/cache/huggingface/transformers
       DIFFUSERS_CACHE: /data/cache/huggingface/diffusers
       TORCH_HOME: /data/cache/torch

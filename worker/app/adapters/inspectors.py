@@ -169,9 +169,17 @@ def inspect_model_metadata(snapshot: str | Path) -> dict[str, Any]:
         pipeline_cls = resolution.pipeline_cls
         metadata["runtime_supported"] = resolution.runtime_supported
         metadata["runtime_reason"] = resolution.runtime_reason
+        metadata["compatibility_status"] = (
+            "SUPPORTED"
+            if resolution.runtime_supported
+            else "UNSUPPORTED"
+            if resolution.class_name
+            else "UNKNOWN"
+        )
     except Exception as error:
         metadata["runtime_supported"] = False
         metadata["runtime_reason"] = f"{type(error).__name__}: {error}"
+        metadata["compatibility_status"] = "UNSUPPORTED"
 
     metadata["capabilities"] = CapabilityResolver().resolve(metadata, pipeline_cls)
     return metadata

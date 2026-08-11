@@ -214,6 +214,7 @@ function GenerationsContent() {
   const sourceIsVideo = inputAsset?.kind === "VIDEO";
   const outputId = generation?.output_asset_id;
   const isRunning = generation && !TERMINAL_STATUSES.has(generation.status);
+  const selectedModel = models.find((model) => model.id === modelId);
 
   return (
     <div className={styles.page}>
@@ -289,6 +290,7 @@ function GenerationsContent() {
           <label className={styles.formGroup}><span>Modèle</span><select value={modelId} onChange={(event) => setModelId(event.target.value)}>
             {compatibleModels.map((model) => <option key={model.id} value={model.id}>{model.name}{model.runtime_ready ? " · prêt" : model.installed ? " · installé" : " · à installer"}</option>)}
           </select></label>
+          {selectedModel?.installed && !selectedModel.runtime_ready && <div className={styles.warningBanner}>Ce modèle est installé mais pas chargé. Ouvrez sa fiche et lancez « Charger le modèle » avant la génération.</div>}
 
           <div className={styles.videoSettingsRow}>
             <label className={styles.formGroup}><span>Durée</span><select value={duration} onChange={(event) => setDuration(event.target.value)}><option value="4">4 secondes</option><option value="6">6 secondes</option><option value="10">10 secondes</option><option value="15">15 secondes</option></select></label>
@@ -297,7 +299,7 @@ function GenerationsContent() {
             <label className={styles.formGroup}><span>Cadence</span><select value={fps} onChange={(event) => setFps(event.target.value)}><option value="12">12 fps</option><option value="24">24 fps</option><option value="30">30 fps</option></select></label>
           </div>
           <div className={styles.audioSetting}><span><strong>Ajouter une piste audio silencieuse</strong><small>Crée une piste AAC vide prête pour un mixage ultérieur.</small></span><button type="button" role="switch" aria-checked={audio} onClick={() => setAudio((value) => !value)} className={`${styles.toggle} ${audio ? styles.toggleOn : ""}`}><span /></button></div>
-          <button type="button" className={styles.generateButton} disabled={isRunning || !modelId || prompt.trim().length < 3} onClick={submitGeneration}><BsStars /> {isRunning ? "Génération en cours…" : "Générer la vidéo"}</button>
+          <button type="button" className={styles.generateButton} disabled={isRunning || !modelId || !selectedModel?.runtime_ready || prompt.trim().length < 3} onClick={submitGeneration}><BsStars /> {isRunning ? "Génération en cours…" : "Générer la vidéo"}</button>
         </div>
 
         <div className={styles.videoResultPanel}>

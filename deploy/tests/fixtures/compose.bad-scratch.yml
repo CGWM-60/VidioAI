@@ -1,0 +1,36 @@
+name: vidioai-bad-scratch-contract
+
+services:
+  backend:
+    image: ${VIDIOAI_REGISTRY}/backend:${VIDIOAI_VERSION}
+    volumes:
+      - ${VIDIOAI_SCRATCH_DIR}/models:/models
+      - ${VIDIOAI_SCRATCH_DIR}/cache:/cache
+      - ${VIDIOAI_SCRATCH_DIR}/work:/work
+
+  worker:
+    image: ${VIDIOAI_REGISTRY}/worker:${VIDIOAI_VERSION}
+    environment:
+      APP_ENV: GPU_PRODUCTION
+      GPU_REQUIRED: "true"
+      VIDIOAI_MODELS_DIR: /models
+      VIDIOAI_WORK_DIR: /worker-work
+      VIDIOAI_OUTPUTS_DIR: /work
+      HF_HOME: /cache/huggingface
+      HF_HUB_CACHE: /cache/huggingface/hub
+      HUGGINGFACE_HUB_CACHE: /cache/huggingface/hub
+      HF_XET_CACHE: /cache/huggingface/xet
+      HF_ASSETS_CACHE: /cache/huggingface/assets
+      TRANSFORMERS_CACHE: /cache/huggingface/transformers
+      DIFFUSERS_CACHE: /cache/huggingface/diffusers
+      TORCH_HOME: /cache/torch
+      XDG_CACHE_HOME: /cache/xdg
+      TMPDIR: /worker-work
+    volumes:
+      - /var/lib/vidioai/scratch/models:/models
+      - /var/lib/vidioai/scratch/cache:/cache
+      - /var/lib/vidioai/scratch/work:/work
+      - /var/lib/vidioai/scratch/worker-work:/worker-work
+
+  frontend:
+    image: ${VIDIOAI_REGISTRY}/frontend:${VIDIOAI_VERSION}

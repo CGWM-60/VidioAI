@@ -1,0 +1,14 @@
+{
+  "id": "stabilityai/stable-diffusion-xl-base-1.0",
+  "sha": "462165984030d82259a11f4367a4eed129e94a7b",
+  "pipeline_tag": "text-to-image",
+  "library_name": "diffusers",
+  "tags": [
+    "diffusers",
+    "stable-diffusion-xl",
+    "text-to-image",
+    "diffusers:StableDiffusionXLPipeline"
+  ],
+  "base_models": [],
+  "source": "https://huggingface.co/api/models/stabilityai/stable-diffusion-xl-base-1.0"
+}

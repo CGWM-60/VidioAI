@@ -90,6 +90,16 @@ class InputNormalizer:
             if source:
                 resolved.append(self.load_image(source))
                 roles.append(str(item.get("role") or "reference").lower())
+        if raw_images and not resolved and capability in {
+            "IMAGE_TO_VIDEO",
+            "MULTI_IMAGE_TO_VIDEO",
+            "START_END_IMAGE_TO_VIDEO",
+            "KEYFRAMES_TO_VIDEO",
+        } and not prepared.get("input_image"):
+            raise NormalizationError(
+                "Les asset IDs doivent être résolus vers des images avant l'appel pipeline.",
+                code="INVALID_INPUT_ASSET",
+            )
         if resolved:
             prepared["resolved_input_images"] = resolved
             prepared["resolved_image_roles"] = roles

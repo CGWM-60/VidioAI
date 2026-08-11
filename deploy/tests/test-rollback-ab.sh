@@ -27,6 +27,7 @@ VIDIOAI_WORKER_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 VIDIOAI_ADMIN_TOKEN=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 HOST_AGENT_TOKEN=cccccccccccccccccccccccccccccccc
 VIDIOAI_HTTP_PORT=8080
+VIDIOAI_SCRATCH_DIR=/scratch/vidioai
 EOF
 
 cat >"${project_dir}/compose.production.yml" <<'EOF'

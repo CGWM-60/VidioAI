@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+from dataclasses import fields, is_dataclass, replace
+from inspect import get_annotations
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -19,7 +21,7 @@ from app.adapters.registry import PipelineRegistry
 from app.adapters.inspectors import inspect_model_metadata
 from app.config import Settings
 from app.main import create_app
-from app.runtime import RuntimeManager, WorkerError
+from app.runtime import RuntimeImports, RuntimeManager, WorkerError
 
 
 CAPABILITY_ENDPOINTS: dict[str, str] = {
@@ -70,6 +72,15 @@ def _base_video_payload() -> dict[str, Any]:
     }
 
 
+def _valid_scratch_status() -> dict[str, object]:
+    return {
+        "scratch_mount_ok": True,
+        "scratch_filesystem": "device:contract",
+        "scratch_total_bytes": 1_500_000_000_000,
+        "scratch_available_bytes": 1_400_000_000_000,
+    }
+
+
 def settings(tmp_path: Path, *, profile: str = "LOCAL") -> Settings:
     return Settings(
         app_env=profile,
@@ -92,16 +103,68 @@ def test_health_is_liveness_only(tmp_path: Path) -> None:
     assert response.json()["status"] == "ok"
 
 
-def test_gpu_profile_never_claims_ready_without_real_cuda(tmp_path: Path) -> None:
-    client = TestClient(create_app(settings(tmp_path, profile="GPU_PRODUCTION")))
+def test_ready_gpu_production_cuda_unavailable_returns_503(tmp_path: Path) -> None:
+    token = "gpu-production-test-token-000000000000"
+    configuration = replace(
+        settings(tmp_path, profile="GPU_PRODUCTION"), worker_token=token
+    )
+    application = create_app(configuration)
+    application.state.manager._runtime_modules = _fake_runtime_imports(
+        cuda_available=False
+    )
+    application.state.manager._scratch_status = _valid_scratch_status
+    client = TestClient(application)
     response = client.get(
-        "/ready", headers={"X-VidioAI-Worker-Token": "test-token"}
+        "/ready", headers={"X-VidioAI-Worker-Token": token}
     )
     payload = response.json()
     assert response.status_code == 503
     assert payload["ready"] is False
     assert payload["gpu_required"] is True
     assert payload["cuda_available"] is False
+
+
+def test_ready_gpu_production_cuda_available_returns_200(tmp_path: Path) -> None:
+    token = "gpu-production-test-token-000000000000"
+    configuration = replace(
+        settings(tmp_path, profile="GPU_PRODUCTION"), worker_token=token
+    )
+    application = create_app(configuration)
+    application.state.manager._runtime_modules = _fake_runtime_imports(
+        cuda_available=True
+    )
+    application.state.manager._scratch_status = _valid_scratch_status
+    client = TestClient(application)
+    response = client.get(
+        "/ready", headers={"X-VidioAI-Worker-Token": token}
+    )
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["ready"] is True
+    assert payload["runtime_available"] is True
+    assert payload["cuda_available"] is True
+    assert payload["gpu_required"] is True
+    assert payload["scratch_mount_ok"] is True
+
+
+def test_ready_gpu_production_rejects_system_disk_scratch(tmp_path: Path) -> None:
+    token = "gpu-production-test-token-000000000000"
+    configuration = replace(
+        settings(tmp_path, profile="GPU_PRODUCTION"), worker_token=token
+    )
+    application = create_app(configuration)
+    application.state.manager._runtime_modules = _fake_runtime_imports(
+        cuda_available=True
+    )
+    client = TestClient(application)
+    response = client.get(
+        "/ready", headers={"X-VidioAI-Worker-Token": token}
+    )
+    payload = response.json()
+    assert response.status_code == 503
+    assert payload["cuda_available"] is True
+    assert payload["scratch_mount_ok"] is False
+    assert any("SCRATCH_FILESYSTEM_INVALID" in error for error in payload["errors"])
 
 
 def test_internal_routes_require_the_worker_token(tmp_path: Path) -> None:
@@ -781,18 +844,52 @@ def _write_incompatible_fake_snapshot(target: Path) -> None:
     (target / "model.safetensors").write_bytes(b"w" * 2048)
 
 
+def _write_unknown_diffusers_snapshot(target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "model_index.json").write_text(
+        json.dumps(
+            {
+                "transformer": ["diffusers", "FutureTransformer3DModel"],
+                "vae": ["diffusers", "FutureVideoVAE"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (target / "config.json").write_text(
+        json.dumps({"architectures": ["FutureTransformer3DModel"]}),
+        encoding="utf-8",
+    )
+    (target / "model.safetensors").write_bytes(b"w" * 2048)
+
+
 def _fake_torch(*, cuda_available: bool) -> SimpleNamespace:
     return SimpleNamespace(
+        float32="float32",
+        float16="float16",
+        bfloat16="bfloat16",
         cuda=SimpleNamespace(is_available=lambda: cuda_available),
         version=SimpleNamespace(cuda="12.4" if cuda_available else None),
         __version__="2.9.0",
     )
 
 
+def _fake_runtime_imports(
+    *,
+    cuda_available: bool,
+    hf_api: object | None = None,
+    snapshot_download: object | None = None,
+) -> RuntimeImports:
+    return RuntimeImports(
+        torch=_fake_torch(cuda_available=cuda_available),
+        hf_api=hf_api or object(),
+        snapshot_download=snapshot_download or object(),
+    )
+
+
 def test_runtime_status_handles_runtime_import_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager = RuntimeManager(settings(tmp_path))
 
-    def failing_imports() -> tuple[object, object]:
+    def failing_imports() -> RuntimeImports:
         raise WorkerError("Runtime IA indisponible: import error", 503)
 
     monkeypatch.setattr(manager, "_imports", failing_imports)
@@ -821,7 +918,11 @@ def test_load_model_returns_structured_error_for_incompatible_pipeline(tmp_path:
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(manager, "_imports", lambda: (_fake_torch(cuda_available=False), object()))
+    monkeypatch.setattr(
+        manager,
+        "_imports",
+        lambda: _fake_runtime_imports(cuda_available=False),
+    )
 
     with pytest.raises(WorkerError) as error:
         manager.load_model("incompatible-model")
@@ -830,13 +931,59 @@ def test_load_model_returns_structured_error_for_incompatible_pipeline(tmp_path:
     assert "CustomAudioPipeline" in str(error.value)
 
 
-def test_imports_contract_is_two_values(tmp_path: Path) -> None:
+def test_load_model_never_runs_a_hidden_inference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configuration = settings(tmp_path)
+    manager = RuntimeManager(configuration)
+    model_root = configuration.models_dir / "stable-image-core"
+    snapshot = model_root / "commit-sha"
+    _write_fake_snapshot(snapshot)
+    (model_root / "active.json").write_text(
+        json.dumps(
+            {
+                "model_id": "stable-image-core",
+                "repository": "stabilityai/sd-turbo",
+                "revision": "commit-sha",
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager._runtime_modules = _fake_runtime_imports(cuda_available=False)
+    pipeline = SimpleNamespace()
+    monkeypatch.setattr(manager, "_load_pipeline", lambda **_kwargs: pipeline)
+
+    def forbidden_inference(**_kwargs) -> None:
+        raise AssertionError("load_model ne doit lancer aucune inférence")
+
+    monkeypatch.setattr(manager, "_validate_loaded_pipeline", forbidden_inference)
+    status = manager.load_model("stable-image-core")
+    assert status["state"] == "READY"
+    assert status["loaded"] is True
+    assert status["ready"] is True
+    assert status["validation_test"] is False
+
+
+def test_imports_contract_is_named_and_complete(tmp_path: Path) -> None:
     manager = RuntimeManager(settings(tmp_path))
-    manager._runtime_modules = (_fake_torch(cuda_available=False), (object(), object()))
-    torch, hub = manager._imports()
-    assert torch is not None
-    assert isinstance(hub, tuple)
-    assert len(hub) == 2
+    imports = RuntimeImports(
+        torch=_fake_torch(cuda_available=False),
+        hf_api=object(),
+        snapshot_download=object(),
+    )
+    manager._runtime_modules = imports
+    assert manager._imports() is imports
+    assert imports.torch is not None
+    assert imports.hf_api is not None
+    assert imports.snapshot_download is not None
+    assert is_dataclass(RuntimeImports)
+    assert [field.name for field in fields(RuntimeImports)] == [
+        "torch",
+        "hf_api",
+        "snapshot_download",
+    ]
+    assert get_annotations(RuntimeManager._imports)["return"] == "RuntimeImports"
 
 
 def test_imports_raises_worker_error_when_runtime_error_is_cached(tmp_path: Path) -> None:
@@ -852,7 +999,11 @@ def test_runtime_status_cuda_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     manager = RuntimeManager(settings(tmp_path))
 
     fake_torch = _fake_torch(cuda_available=False)
-    monkeypatch.setattr(manager, "_imports", lambda: (fake_torch, object()))
+    monkeypatch.setattr(
+        manager,
+        "_imports",
+        lambda: RuntimeImports(fake_torch, object(), object()),
+    )
 
     status = manager.runtime_status()
     assert status["runtime_available"] is True
@@ -864,7 +1015,11 @@ def test_runtime_status_cuda_present(tmp_path: Path, monkeypatch: pytest.MonkeyP
     manager = RuntimeManager(settings(tmp_path))
 
     fake_torch = _fake_torch(cuda_available=True)
-    monkeypatch.setattr(manager, "_imports", lambda: (fake_torch, object()))
+    monkeypatch.setattr(
+        manager,
+        "_imports",
+        lambda: RuntimeImports(fake_torch, object(), object()),
+    )
 
     status = manager.runtime_status()
     assert status["runtime_available"] is True
@@ -876,7 +1031,7 @@ def test_runtime_status_cuda_present(tmp_path: Path, monkeypatch: pytest.MonkeyP
 def test_ready_endpoint_exposes_runtime_import_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     application = create_app(settings(tmp_path))
 
-    def failing_imports() -> tuple[object, object]:
+    def failing_imports() -> RuntimeImports:
         raise WorkerError("Runtime IA indisponible: import error", 503)
 
     monkeypatch.setattr(application.state.manager, "_imports", failing_imports)
@@ -888,6 +1043,32 @@ def test_ready_endpoint_exposes_runtime_import_error(tmp_path: Path, monkeypatch
     payload = response.json()
     assert payload["ready"] is False
     assert payload["runtime_available"] is False
+
+
+def test_ready_endpoint_never_returns_500_for_unexpected_runtime_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    application = create_app(settings(tmp_path))
+
+    def broken_configuration_errors(_settings: Settings) -> list[str]:
+        raise ValueError("invalid internal import contract")
+
+    monkeypatch.setattr(
+        Settings,
+        "configuration_errors",
+        broken_configuration_errors,
+    )
+    client = TestClient(application, raise_server_exceptions=False)
+    response = client.get(
+        "/ready", headers={"X-VidioAI-Worker-Token": "test-token"}
+    )
+    assert response.status_code == 503
+    payload = response.json()
+    assert payload["ready"] is False
+    assert payload["runtime_available"] is False
+    assert payload["error_code"] == "RUNTIME_STATUS_ERROR"
+    assert any("ValueError" in error for error in payload["errors"])
 
 
 @pytest.mark.parametrize("value", ["", "   "])
@@ -912,7 +1093,11 @@ def test_install_model_never_sends_empty_bearer_token(
     monkeypatch.setattr(
         manager,
         "_imports",
-        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+        lambda: _fake_runtime_imports(
+            cuda_available=False,
+            hf_api=FakeHfApi,
+            snapshot_download=fake_snapshot_download,
+        ),
     )
     monkeypatch.setenv("HF_TOKEN", value)
 
@@ -948,7 +1133,11 @@ def test_install_model_public_repository_works_without_token(
     monkeypatch.setattr(
         manager,
         "_imports",
-        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+        lambda: _fake_runtime_imports(
+            cuda_available=False,
+            hf_api=FakeHfApi,
+            snapshot_download=fake_snapshot_download,
+        ),
     )
     monkeypatch.delenv("HF_TOKEN", raising=False)
 
@@ -961,6 +1150,50 @@ def test_install_model_public_repository_works_without_token(
     assert status["state"] == "INSTALLED"
     assert observed["api_token"] is None
     assert observed["download_token"] is None
+
+
+def test_install_model_allows_unknown_diffusers_metadata_to_reach_snapshot_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+    observed = {"downloaded": False}
+
+    class FakeHfApi:
+        def __init__(self, token: str | None = None) -> None:
+            del token
+
+        def model_info(self, repository: str, revision: str = "main") -> SimpleNamespace:
+            del repository, revision
+            return SimpleNamespace(
+                sha="unknown-revision",
+                siblings=[SimpleNamespace(size=2048)],
+            )
+
+    def fake_snapshot_download(**kwargs) -> None:
+        observed["downloaded"] = True
+        _write_unknown_diffusers_snapshot(Path(kwargs["local_dir"]))
+
+    monkeypatch.setattr(
+        manager,
+        "_imports",
+        lambda: _fake_runtime_imports(
+            cuda_available=False,
+            hf_api=FakeHfApi,
+            snapshot_download=fake_snapshot_download,
+        ),
+    )
+    status = manager.install_model(
+        "future-video",
+        "example/future-video",
+        "main",
+        ["TEXT_TO_VIDEO"],
+    )
+    assert observed["downloaded"] is True
+    assert status["state"] == "INSTALLED"
+    assert status["runtime_compatible"] is False
+    assert status["capabilities"] == []
+    assert status["requested_capabilities"] == ["TEXT_TO_VIDEO"]
 
 
 def test_install_model_public_repository_works_with_token(
@@ -983,7 +1216,11 @@ def test_install_model_public_repository_works_with_token(
     monkeypatch.setattr(
         manager,
         "_imports",
-        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+        lambda: _fake_runtime_imports(
+            cuda_available=False,
+            hf_api=FakeHfApi,
+            snapshot_download=fake_snapshot_download,
+        ),
     )
     monkeypatch.setenv("HF_TOKEN", "hf_valid_token")
 
@@ -1019,7 +1256,11 @@ def test_install_model_gated_without_token_returns_access_required_error(
     monkeypatch.setattr(
         manager,
         "_imports",
-        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+        lambda: _fake_runtime_imports(
+            cuda_available=False,
+            hf_api=FakeHfApi,
+            snapshot_download=fake_snapshot_download,
+        ),
     )
     monkeypatch.delenv("HF_TOKEN", raising=False)
 
@@ -1055,7 +1296,11 @@ def test_install_model_private_without_token_returns_access_required_error(
     monkeypatch.setattr(
         manager,
         "_imports",
-        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+        lambda: _fake_runtime_imports(
+            cuda_available=False,
+            hf_api=FakeHfApi,
+            snapshot_download=fake_snapshot_download,
+        ),
     )
     monkeypatch.delenv("HF_TOKEN", raising=False)
 
@@ -1090,7 +1335,11 @@ def test_install_model_download_ok_with_xet_first_try(tmp_path: Path, monkeypatc
     monkeypatch.setattr(
         manager,
         "_imports",
-        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+        lambda: _fake_runtime_imports(
+            cuda_available=False,
+            hf_api=FakeHfApi,
+            snapshot_download=fake_snapshot_download,
+        ),
     )
 
     status = manager.install_model("stable-image-core", "stabilityai/sd-turbo", "main", ["TEXT_TO_IMAGE"])
@@ -1120,7 +1369,11 @@ def test_install_model_retries_transient_xet_reconstruction_error(tmp_path: Path
     monkeypatch.setattr(
         manager,
         "_imports",
-        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+        lambda: _fake_runtime_imports(
+            cuda_available=False,
+            hf_api=FakeHfApi,
+            snapshot_download=fake_snapshot_download,
+        ),
     )
 
     status = manager.install_model("stable-image-core", "stabilityai/sd-turbo", "main", ["TEXT_TO_IMAGE"])
@@ -1155,7 +1408,11 @@ def test_install_model_uses_fallback_without_xet_after_persistent_reconstruction
     monkeypatch.setattr(
         manager,
         "_imports",
-        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+        lambda: _fake_runtime_imports(
+            cuda_available=False,
+            hf_api=FakeHfApi,
+            snapshot_download=fake_snapshot_download,
+        ),
     )
 
     status = manager.install_model("stable-image-core", "stabilityai/sd-turbo", "main", ["TEXT_TO_IMAGE"])
@@ -1185,7 +1442,11 @@ def test_install_model_returns_hf_xet_reconstruction_error_when_fallback_disable
     monkeypatch.setattr(
         manager,
         "_imports",
-        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+        lambda: _fake_runtime_imports(
+            cuda_available=False,
+            hf_api=FakeHfApi,
+            snapshot_download=fake_snapshot_download,
+        ),
     )
     monkeypatch.setenv("VIDIOAI_ENABLE_HF_XET_FALLBACK", "false")
 
@@ -1263,7 +1524,11 @@ def test_partial_snapshot_is_never_marked_installed(tmp_path: Path, monkeypatch:
     monkeypatch.setattr(
         manager,
         "_imports",
-        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+        lambda: _fake_runtime_imports(
+            cuda_available=False,
+            hf_api=FakeHfApi,
+            snapshot_download=fake_snapshot_download,
+        ),
     )
 
     with pytest.raises(WorkerError):
@@ -1294,7 +1559,11 @@ def test_install_pipeline_unsupported_never_sets_installed_or_ready(
     monkeypatch.setattr(
         manager,
         "_imports",
-        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+        lambda: _fake_runtime_imports(
+            cuda_available=False,
+            hf_api=FakeHfApi,
+            snapshot_download=fake_snapshot_download,
+        ),
     )
 
     with pytest.raises(WorkerError) as error:
@@ -1348,7 +1617,11 @@ def test_valid_existing_snapshot_is_preserved_when_new_download_fails(
     monkeypatch.setattr(
         manager,
         "_imports",
-        lambda: (_fake_torch(cuda_available=False), (FakeHfApi, fake_snapshot_download)),
+        lambda: _fake_runtime_imports(
+            cuda_available=False,
+            hf_api=FakeHfApi,
+            snapshot_download=fake_snapshot_download,
+        ),
     )
     monkeypatch.setenv("VIDIOAI_ENABLE_HF_XET_FALLBACK", "false")
 

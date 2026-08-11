@@ -49,7 +49,15 @@ validate_png() {
 
 validate_video() {
   local file=${1:?file requis}
-  ffprobe -v error -show_streams -show_format "${file}" >/dev/null
+  ffprobe -v error -count_frames -select_streams v:0 \
+    -show_entries stream=codec_name,width,height,nb_frames,nb_read_frames:format=duration \
+    -of json "${file}" \
+    | jq -e '
+        .streams[0].codec_name == "h264" and
+        (.streams[0].width > 0) and (.streams[0].height > 0) and
+        ((.format.duration | tonumber) > 0) and
+        (((.streams[0].nb_read_frames // .streams[0].nb_frames) | tonumber) > 1)
+      ' >/dev/null
 }
 
 for ((attempt=1; attempt<=ATTEMPTS; attempt++)); do
@@ -150,7 +158,9 @@ if [[ "${PROFILE}" == "LOCAL" ]]; then
         input_asset_id:(if ($input_asset_id|length) > 0 then $input_asset_id else null end),
         input_images:$input_images,
         duration_seconds:2,
-        resolution:"720p"
+        quality:"480p",
+        aspect_ratio:"16:9",
+        fps:8
       }')
     generation_id=$(curl -fsS -X POST -H 'Content-Type: application/json' --data-binary "${payload}" "${BASE_URL}/api/videos/generate" | jq -er '.id')
     result=$(poll_generation "${generation_id}" 120 true)

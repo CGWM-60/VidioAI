@@ -1,0 +1,11 @@
+{
+  "_class_name": "HunyuanVideoPipeline",
+  "_diffusers_version": "0.32.0.dev0",
+  "scheduler": ["diffusers", "FlowMatchEulerDiscreteScheduler"],
+  "text_encoder": ["transformers", "LlamaModel"],
+  "text_encoder_2": ["transformers", "CLIPTextModel"],
+  "tokenizer": ["transformers", "LlamaTokenizerFast"],
+  "tokenizer_2": ["transformers", "CLIPTokenizer"],
+  "transformer": ["diffusers", "HunyuanVideoTransformer3DModel"],
+  "vae": ["diffusers", "AutoencoderKLHunyuanVideo"]
+}

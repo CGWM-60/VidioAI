@@ -29,6 +29,14 @@ pub struct WorkerReady {
     pub cuda_available: bool,
     pub gpu_required: bool,
     #[serde(default)]
+    pub scratch_mount_ok: bool,
+    #[serde(default)]
+    pub scratch_filesystem: Option<String>,
+    #[serde(default)]
+    pub scratch_total_bytes: u64,
+    #[serde(default)]
+    pub scratch_available_bytes: u64,
+    #[serde(default)]
     pub errors: Vec<String>,
 }
 
@@ -57,6 +65,8 @@ pub struct WorkerModelStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerCompatibility {
+    #[serde(default = "default_compatibility_status")]
+    pub compatibility_status: String,
     pub runtime_supported: bool,
     #[serde(default)]
     pub runtime_capabilities: Vec<String>,
@@ -65,6 +75,10 @@ pub struct WorkerCompatibility {
     pub error_code: Option<String>,
     #[serde(default)]
     pub dependency: Option<String>,
+}
+
+fn default_compatibility_status() -> String {
+    "UNKNOWN".into()
 }
 
 /// Mesure brute du worker. Le backend ajoute l'identifiant public, la révision
@@ -232,8 +246,17 @@ impl WorkerClient {
     }
 
     pub async fn ready(&self) -> Result<WorkerReady, String> {
-        self.json(self.request(reqwest::Method::GET, "/ready"))
+        let response = self
+            .request(reqwest::Method::GET, "/ready")
+            .send()
             .await
+            .map_err(|error| format!("WORKER_READY_REQUEST_FAILED: {error}"))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|error| format!("WORKER_READY_BODY_FAILED: {error}"))?;
+        decode_ready(status, &body)
     }
 
     pub async fn resources(&self) -> Result<WorkerResources, String> {
@@ -428,5 +451,114 @@ impl WorkerClient {
         } else {
             Err(format!("annulation worker refusée: {}", response.status()))
         }
+    }
+}
+
+fn decode_ready(status: StatusCode, body: &str) -> Result<WorkerReady, String> {
+    if status.is_success() || status == StatusCode::SERVICE_UNAVAILABLE {
+        return serde_json::from_str(body)
+            .map_err(|error| format!("WORKER_READY_INVALID_JSON: {error}"));
+    }
+    Err(format!("WORKER_READY_HTTP_ERROR: worker HTTP {status}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WorkerClient, WorkerCompatibility, decode_ready};
+    use reqwest::StatusCode;
+    use std::time::Duration;
+    use tokio::{io::AsyncReadExt, net::TcpListener, time::sleep};
+
+    const READY: &str = r#"{
+        "ready":true,
+        "profile":"GPU_PRODUCTION",
+        "runtime_available":true,
+        "cuda_available":true,
+        "gpu_required":true,
+        "scratch_mount_ok":true,
+        "scratch_filesystem":"device:contract",
+        "scratch_total_bytes":1500000000000,
+        "scratch_available_bytes":1400000000000,
+        "errors":[]
+    }"#;
+
+    #[test]
+    fn readiness_contract_accepts_200() {
+        let ready = decode_ready(StatusCode::OK, READY).unwrap();
+        assert!(ready.ready);
+        assert!(ready.cuda_available);
+    }
+
+    #[test]
+    fn readiness_contract_preserves_structured_503() {
+        let payload = READY.replace("\"ready\":true", "\"ready\":false");
+        let ready = decode_ready(StatusCode::SERVICE_UNAVAILABLE, &payload).unwrap();
+        assert!(!ready.ready);
+        assert!(ready.runtime_available);
+    }
+
+    #[test]
+    fn readiness_contract_rejects_malformed_json() {
+        let error = decode_ready(StatusCode::SERVICE_UNAVAILABLE, "not-json").unwrap_err();
+        assert!(error.contains("WORKER_READY_INVALID_JSON"));
+    }
+
+    #[test]
+    fn compatibility_contract_preserves_supported_unknown_and_unsupported() {
+        for expected in ["SUPPORTED", "UNKNOWN", "UNSUPPORTED"] {
+            let payload = format!(
+                r#"{{
+                    "compatibility_status":"{expected}",
+                    "runtime_supported":{},
+                    "runtime_capabilities":[],
+                    "pipeline_class":null,
+                    "runtime_reason":"contract",
+                    "error_code":null
+                }}"#,
+                expected == "SUPPORTED"
+            );
+            let parsed: WorkerCompatibility = serde_json::from_str(&payload).unwrap();
+            assert_eq!(parsed.compatibility_status, expected);
+        }
+    }
+
+    #[test]
+    fn compatibility_contract_defaults_legacy_payload_to_unknown() {
+        let parsed: WorkerCompatibility = serde_json::from_str(
+            r#"{
+                "runtime_supported":false,
+                "runtime_capabilities":[],
+                "pipeline_class":null,
+                "runtime_reason":"legacy",
+                "error_code":null
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.compatibility_status, "UNKNOWN");
+    }
+
+    #[tokio::test]
+    async fn readiness_contract_reports_timeout_and_sends_authentication() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+            assert!(request.contains("x-vidioai-worker-token: contract-token"));
+            sleep(Duration::from_millis(100)).await;
+        });
+        let client = WorkerClient {
+            base_url: format!("http://{address}"),
+            token: Some("contract-token".into()),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_millis(20))
+                .build()
+                .unwrap(),
+        };
+        let error = client.ready().await.unwrap_err();
+        assert!(error.contains("WORKER_READY_REQUEST_FAILED"));
+        server.await.unwrap();
     }
 }

@@ -4,15 +4,18 @@ set -Eeuo pipefail
 # Déploiement atomique piloté par une version. Aucun build ni pip install n'est
 # exécuté sur le GPU : seules les images préconstruites sont tirées.
 PROJECT_DIR=${VIDIOAI_PROJECT_DIR:-/opt/vidioai}
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 VERSION=${1:-${VIDIOAI_VERSION:-}}
 ENV_FILE=${VIDIOAI_ENV_FILE:-${PROJECT_DIR}/.env.production}
 COMPOSE_FILE=${VIDIOAI_COMPOSE_FILE:-${PROJECT_DIR}/compose.production.yml}
 WAIT_TIMEOUT=${VIDIOAI_DEPLOY_WAIT_TIMEOUT:-180}
 WAIT_INTERVAL=${VIDIOAI_DEPLOY_WAIT_INTERVAL:-2}
 BACKUP_DIR=${VIDIOAI_BACKUP_DIR:-/var/lib/vidioai/backups}
+source "${SCRIPT_DIR}/lib/scratch-storage.sh"
 
 compose() {
-  docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" "$@"
+  VIDIOAI_SCRATCH_DIR="${VIDIOAI_SCRATCH_DIR:?Scratch non configuré}" \
+    docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" "$@"
 }
 
 has_service() {
@@ -145,12 +148,23 @@ cd "${PROJECT_DIR}"
 test -f "${ENV_FILE}" || { echo "Configuration absente: ${ENV_FILE}" >&2; exit 1; }
 test -f "${COMPOSE_FILE}" || { echo "Compose absent: ${COMPOSE_FILE}" >&2; exit 1; }
 [[ -n "${VERSION}" && "${VERSION}" != "latest" ]] || { echo "Une version immuable est obligatoire." >&2; exit 1; }
+CALLER_SCRATCH_SET=${VIDIOAI_SCRATCH_DIR+x}
+CALLER_SCRATCH_VALUE=${VIDIOAI_SCRATCH_DIR-}
 set -a
 source "${ENV_FILE}"
 set +a
+if [[ -n "${CALLER_SCRATCH_SET}" && "${CALLER_SCRATCH_VALUE}" != "${VIDIOAI_SCRATCH_DIR:-}" ]]; then
+  echo "VIDIOAI_SCRATCH_DIR du shell contredit ${ENV_FILE}; déploiement refusé." >&2
+  exit 1
+fi
+vidioai_require_production_scratch "${ENV_FILE}"
 mkdir -p "${BACKUP_DIR}"
 cp "${ENV_FILE}" "${BACKUP_DIR}/env-$(date +%Y%m%d-%H%M%S)"
 
+if [[ "${VIDIOAI_RUN_PREFLIGHT:-true}" != "true" && -z "${VIDIOAI_TEST_STATE_DIR:-}" ]]; then
+  echo "Le preflight Scratch est obligatoire en production." >&2
+  exit 1
+fi
 if [[ "${VIDIOAI_RUN_PREFLIGHT:-true}" == "true" ]]; then
   VIDIOAI_PREFLIGHT_SKIP_TESTS=true \
     "${PROJECT_DIR}/deploy/scripts/preflight.sh" "${VERSION}"
@@ -179,6 +193,12 @@ for service in worker backend frontend proxy; do
   if has_service "${service}"; then
     compose up -d --remove-orphans "${service}"
     wait_for_service "${service}"
+    if [[ "${service}" == "worker" && -z "${VIDIOAI_TEST_STATE_DIR:-}" ]]; then
+      VIDIOAI_PROJECT_DIR="${PROJECT_DIR}" \
+        VIDIOAI_ENV_FILE="${ENV_FILE}" \
+        VIDIOAI_COMPOSE_FILE="${COMPOSE_FILE}" \
+        "${PROJECT_DIR}/deploy/scripts/verify-scratch.sh" worker
+    fi
   fi
 done
 verify_stack_healthy
