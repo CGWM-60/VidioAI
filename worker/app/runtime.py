@@ -1,4 +1,14 @@
-"""Runtime Diffusers réel et gestion sûre des snapshots de modèles."""
+"""Runtime Diffusers réel et gestion sûre des snapshots de modèles.
+
+Version corrigée pour :
+- fusion des capacités catalogue/worker ;
+- distinction DOWNLOADED / INSTALLED / READY ;
+- revalidation des snapshots déjà présents ;
+- chargement/rechargement du pipeline selon la capacité demandée ;
+- export vidéo MP4 réel à partir de toutes les frames ;
+- maintien de la compatibilité runtime après unload ;
+- retries/fallback HF-XET existants conservés.
+"""
 
 from __future__ import annotations
 
@@ -107,7 +117,12 @@ class RuntimeManager:
         return self._model_root(model_id) / "active.json"
 
     @staticmethod
-    def _log_model_state(model_id: str, from_state: str, to_state: str, reason: str | None = None) -> None:
+    def _log_model_state(
+        model_id: str,
+        from_state: str,
+        to_state: str,
+        reason: str | None = None,
+    ) -> None:
         suffix = f" reason={reason}" if reason else ""
         print(f"MODEL_STATE {model_id} {from_state} -> {to_state}{suffix}")
 
@@ -136,7 +151,13 @@ class RuntimeManager:
             str(frame_path),
         ]
         try:
-            subprocess.run(command, capture_output=True, text=True, timeout=20, check=True)
+            subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=True,
+            )
         except subprocess.SubprocessError as error:
             raise WorkerError(f"Décodage vidéo impossible: {error}", 422) from error
         try:
@@ -147,6 +168,7 @@ class RuntimeManager:
     def _resolve_generation_inputs(self, request: dict[str, Any]) -> dict[str, Any]:
         prepared = dict(request)
         capability = str(prepared.get("capability") or "").upper()
+
         input_path = prepared.get("input_path")
         if isinstance(input_path, str) and input_path.strip():
             candidate = Path(input_path)
@@ -185,6 +207,7 @@ class RuntimeManager:
             if not candidate.is_file():
                 raise WorkerError("Une image d'entrée référencée est introuvable.", 422)
             resolved_images.append(self._load_image(candidate))
+
         if resolved_images:
             prepared["resolved_input_images"] = resolved_images
 
@@ -201,24 +224,76 @@ class RuntimeManager:
             raise WorkerError("Le snapshot actif est absent du cache.", 409)
         return snapshot, metadata
 
+    @staticmethod
+    def _metadata_with_capabilities(
+        metadata: dict[str, Any],
+        fallback_capabilities: list[str] | None = None,
+    ) -> dict[str, Any]:
+        result = dict(metadata)
+        merged: list[str] = []
+        seen: set[str] = set()
+
+        for source in (
+            metadata.get("capabilities") or [],
+            fallback_capabilities or [],
+        ):
+            for capability in source:
+                if not isinstance(capability, str):
+                    continue
+                normalized = capability.strip().upper()
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                merged.append(normalized)
+
+        result["capabilities"] = merged
+        return result
+
     def _resolve_supported_capability(
         self,
         metadata: dict[str, Any],
         fallback_capabilities: list[str] | None = None,
     ) -> str | None:
-        capabilities = metadata.get("capabilities") or fallback_capabilities or []
-        normalized = {
-            str(capability).upper()
-            for capability in capabilities
-            if isinstance(capability, str) and capability.strip()
-        }
+        effective_metadata = self._metadata_with_capabilities(
+            metadata,
+            fallback_capabilities,
+        )
+        normalized = set(effective_metadata.get("capabilities", []))
+
         for candidate in self._capability_order():
             if normalized and candidate not in normalized:
                 continue
-            adapter = self._registry.select_for_capability(metadata, candidate)
+            adapter = self._registry.select_for_capability(
+                effective_metadata,
+                candidate,
+            )
             if adapter is not None:
                 return candidate
         return None
+
+    @staticmethod
+    def _read_manifest(snapshot: Path) -> dict[str, Any]:
+        path = snapshot / "vidioai-model.json"
+        if not path.is_file():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _effective_snapshot_metadata(
+        self,
+        snapshot: Path,
+        fallback_capabilities: list[str] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        manifest = self._read_manifest(snapshot)
+        metadata = inspect_model_metadata(snapshot)
+        metadata = self._metadata_with_capabilities(
+            metadata,
+            manifest.get("capabilities") or fallback_capabilities,
+        )
+        return metadata, manifest
 
     def _imports(self) -> tuple[Any, Any]:
         """Import paresseux : /health reste disponible même si CUDA est cassé."""
@@ -256,7 +331,16 @@ class RuntimeManager:
         if status_code in {401, 403}:
             return True
         message = str(error).lower()
-        return any(fragment in message for fragment in ["gated", "private", "authentication", "forbidden", "access"])
+        return any(
+            fragment in message
+            for fragment in [
+                "gated",
+                "private",
+                "authentication",
+                "forbidden",
+                "access",
+            ]
+        )
 
     @staticmethod
     def _looks_like_hf_not_found(error: Exception) -> bool:
@@ -284,7 +368,7 @@ class RuntimeManager:
             or "file reconstruction error" in message
             or "internal writer error" in message
             or "hf-xet" in message
-            or "xet" in message and "reconstruct" in message
+            or ("xet" in message and "reconstruct" in message)
         )
 
     @staticmethod
@@ -310,15 +394,35 @@ class RuntimeManager:
 
     def _precheck_download_environment(self, required_bytes: int) -> None:
         models_dir = self.settings.models_dir
-        cache_dir = Path(os.getenv("HF_HUB_CACHE") or os.getenv("HUGGINGFACE_HUB_CACHE") or (self.settings.hf_home / "hub"))
+        cache_dir = Path(
+            os.getenv("HF_HUB_CACHE")
+            or os.getenv("HUGGINGFACE_HUB_CACHE")
+            or (self.settings.hf_home / "hub")
+        )
         xet_dir = Path(os.getenv("HF_XET_CACHE") or (self.settings.hf_home / "xet"))
         tmp_dir = Path(os.getenv("TMPDIR") or self.settings.work_dir)
 
         for path, code, message in [
-            (models_dir, "SCRATCH_NOT_WRITABLE", "Le dossier Scratch des modèles n'est pas inscriptible."),
-            (cache_dir, "CACHE_NOT_WRITABLE", "Le cache Hugging Face n'est pas inscriptible."),
-            (xet_dir, "CACHE_NOT_WRITABLE", "Le cache HF-XET n'est pas inscriptible."),
-            (tmp_dir, "SCRATCH_NOT_WRITABLE", "Le dossier temporaire du worker n'est pas inscriptible."),
+            (
+                models_dir,
+                "SCRATCH_NOT_WRITABLE",
+                "Le dossier Scratch des modèles n'est pas inscriptible.",
+            ),
+            (
+                cache_dir,
+                "CACHE_NOT_WRITABLE",
+                "Le cache Hugging Face n'est pas inscriptible.",
+            ),
+            (
+                xet_dir,
+                "CACHE_NOT_WRITABLE",
+                "Le cache HF-XET n'est pas inscriptible.",
+            ),
+            (
+                tmp_dir,
+                "SCRATCH_NOT_WRITABLE",
+                "Le dossier temporaire du worker n'est pas inscriptible.",
+            ),
         ]:
             if not self._is_writable_directory(path):
                 raise WorkerError(message, 422, code=code)
@@ -356,16 +460,21 @@ class RuntimeManager:
                 total += size
         if total <= 0:
             return 2 * 1024 * 1024 * 1024
-        # marge pour fichiers temporaires/cache/reconstruction
         return int(total * 2.2)
 
     @staticmethod
     def _clear_partial_directory(path: Path) -> None:
+        if not path.exists():
+            return
         for child in path.iterdir():
             if child.is_dir():
                 shutil.rmtree(child, ignore_errors=True)
             else:
                 child.unlink(missing_ok=True)
+
+    @staticmethod
+    def _directory_has_files(path: Path) -> bool:
+        return path.is_dir() and any(item.is_file() for item in path.rglob("*"))
 
     @staticmethod
     def _snapshot_download_with_env(
@@ -458,7 +567,11 @@ class RuntimeManager:
         ]
         try:
             result = subprocess.run(
-                command, capture_output=True, text=True, timeout=5, check=True
+                command,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
             )
             line = result.stdout.strip().splitlines()[0]
             name, utilization, total, used, temperature = [
@@ -477,9 +590,6 @@ class RuntimeManager:
 
     @staticmethod
     def _ram_peak_bytes() -> int:
-        """Retourne le pic RSS du processus worker Linux en octets."""
-        # Sur Linux, `ru_maxrss` est exprimé en KiB. Le worker de production est
-        # conteneurisé sous Linux, ce qui rend cette conversion déterministe.
         return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
 
     def resources(self) -> dict[str, Any]:
@@ -492,6 +602,7 @@ class RuntimeManager:
                     "revision": model.revision,
                     "device": model.device,
                     "validation_test": model.validation_test,
+                    "capability": model.capability,
                 }
                 for model in self._loaded.values()
             ]
@@ -503,9 +614,7 @@ class RuntimeManager:
         return {
             "gpu": gpu,
             "gpu_status": "available" if gpu else "unavailable",
-            "worker_status": "ready"
-            if self.runtime_status()["ready"]
-            else "not_ready",
+            "worker_status": "ready" if self.runtime_status()["ready"] else "not_ready",
             "active_jobs": active_jobs,
             "loaded_models": loaded,
         }
@@ -534,7 +643,8 @@ class RuntimeManager:
         total_weights = sum(path.stat().st_size for path in weights)
         if not weights or total_weights < self.settings.minimum_weights_bytes:
             raise WorkerError(
-                "Le snapshot ne contient pas de poids safetensors cohérents.", 422
+                "Le snapshot ne contient pas de poids safetensors cohérents.",
+                422,
             )
 
         files = []
@@ -555,6 +665,75 @@ class RuntimeManager:
             "files": files,
         }
 
+    def _mark_failed(
+        self,
+        model_id: str,
+        *,
+        error: WorkerError,
+        downloaded: bool,
+        validated: bool = False,
+        installed: bool = False,
+    ) -> None:
+        with self._lock:
+            self._model_states[model_id] = {
+                "model_id": model_id,
+                "state": ModelState.FAILED,
+                "downloaded": downloaded,
+                "validated": validated,
+                "installed": installed,
+                "loaded": False,
+                "ready": False,
+                "runtime_compatible": False,
+                "validation_test": False,
+                "error_code": error.code,
+                "retryable": error.retryable,
+                "error": str(error),
+            }
+
+    def _cached_install_status(
+        self,
+        model_id: str,
+        snapshot: Path,
+        pointer: dict[str, Any],
+        capabilities: list[str],
+    ) -> dict[str, Any]:
+        validation = self.validate_snapshot(snapshot)
+        metadata, manifest = self._effective_snapshot_metadata(snapshot, capabilities)
+        resolved_capability = self._resolve_supported_capability(
+            metadata,
+            manifest.get("capabilities") or capabilities,
+        )
+        if resolved_capability is None:
+            raise WorkerError(
+                "pipeline non supporté: aucun adapter Diffusers compatible n'a été trouvé pour ce modèle.",
+                422,
+                code="PIPELINE_UNSUPPORTED",
+                retryable=False,
+            )
+
+        runtime_capabilities = metadata.get("capabilities") or [resolved_capability]
+        cached = {
+            **manifest,
+            "model_id": model_id,
+            "repository": pointer["repository"],
+            "revision": pointer["revision"],
+            "capabilities": runtime_capabilities,
+            "downloaded": True,
+            "validated": True,
+            "installed": True,
+            "weights_valid": validation["weights_valid"],
+            "runtime_available": self.runtime_status()["runtime_available"],
+            "runtime_compatible": True,
+            "validation_test": False,
+            "loaded": False,
+            "ready": False,
+            "state": ModelState.INSTALLED,
+            **validation,
+        }
+        with self._lock:
+            self._model_states[model_id] = cached
+        return cached
+
     def install_model(
         self,
         model_id: str,
@@ -564,71 +743,70 @@ class RuntimeManager:
     ) -> dict[str, Any]:
         model_id = self._safe_segment(model_id)
         self._log_model_state(model_id, "DISCOVERED", "DOWNLOADING")
-        # Un snapshot restauré depuis le cache L3 S3 est réutilisé uniquement
-        # après la même validation complète que pour un téléchargement HF.
+
+        # Réutilisation du snapshot actif seulement s'il correspond exactement à
+        # la révision demandée ET repasse la validation runtime actuelle.
         try:
             snapshot, pointer = self._active_snapshot(model_id)
-            # Ne jamais court-circuiter une mise à jour : `active.json` peut
-            # pointer vers l'ancienne révision alors que le backend a demandé le
-            # nouveau commit immuable publié par Hugging Face.
-            if pointer.get("revision") != revision:
-                raise WorkerError("Une révision plus récente doit être installée.", 409)
-            validation = self.validate_snapshot(snapshot)
-            cached = {
-                "model_id": model_id,
-                "repository": pointer["repository"],
-                "revision": pointer["revision"],
-                "installed": True,
-                "weights_valid": validation["weights_valid"],
-                "runtime_available": self.runtime_status()["runtime_available"],
-                "runtime_compatible": False,
-                "validation_test": False,
-                "state": ModelState.INSTALLED,
-                **validation,
-            }
-            with self._lock:
-                self._model_states[model_id] = cached
-            return cached
         except WorkerError:
-            pass
+            snapshot = None
+            pointer = None
+
+        if snapshot is not None and pointer is not None and pointer.get("revision") == revision:
+            try:
+                return self._cached_install_status(
+                    model_id,
+                    snapshot,
+                    pointer,
+                    capabilities,
+                )
+            except WorkerError as error:
+                # Un ancien snapshot valide mais incompatible ne doit pas être
+                # présenté comme installé. On ne retélécharge pas la même révision
+                # uniquement pour masquer une erreur de pipeline.
+                if error.code == "PIPELINE_UNSUPPORTED":
+                    self._mark_failed(
+                        model_id,
+                        error=error,
+                        downloaded=True,
+                    )
+                    raise
+                # Snapshot incomplet/corrompu : téléchargement propre autorisé.
+
         with self._lock:
             self._model_states[model_id] = {
                 "model_id": model_id,
                 "state": ModelState.DOWNLOADING,
                 "downloaded": False,
                 "validated": False,
+                "installed": False,
                 "loaded": False,
                 "ready": False,
                 "error": None,
             }
 
-        # Le staging vit sur le même filesystem que la destination. `os.replace`
-        # reste ainsi atomique même lorsque `/work` et `/models` sont deux mounts.
         temporary = (
             self.settings.models_dir
             / ".downloads"
             / f"download-{model_id}-{uuid.uuid4()}"
         )
-        temporary.mkdir(parents=True)
+        temporary.mkdir(parents=True, exist_ok=True)
+
         try:
             _, hub = self._imports()
             HfApi, snapshot_download = hub
             hf_token = self._hf_token()
-            info = HfApi(token=hf_token).model_info(
-                repository, revision=revision
-            )
+            info = HfApi(token=hf_token).model_info(repository, revision=revision)
             resolved_revision = self._safe_segment(info.sha)
 
             required_bytes = self._estimate_required_download_bytes(info)
             self._precheck_download_environment(required_bytes)
 
             xet_retries = max(1, int(os.getenv("VIDIOAI_HF_XET_RETRIES", "2")))
-            allow_no_xet_fallback = os.getenv("VIDIOAI_ENABLE_HF_XET_FALLBACK", "true").strip().lower() in {
-                "1",
+            allow_no_xet_fallback = os.getenv(
+                "VIDIOAI_ENABLE_HF_XET_FALLBACK",
                 "true",
-                "yes",
-                "on",
-            }
+            ).strip().lower() in {"1", "true", "yes", "on"}
 
             last_xet_error: Exception | None = None
             for attempt in range(1, xet_retries + 1):
@@ -652,38 +830,42 @@ class RuntimeManager:
                     self._clear_partial_directory(temporary)
 
             if last_xet_error is not None:
-                if allow_no_xet_fallback:
-                    try:
-                        self._snapshot_download_with_env(
-                            snapshot_download,
-                            repo_id=repository,
-                            revision=resolved_revision,
-                            local_dir=temporary,
-                            cache_dir=self.settings.hf_home,
-                            token=hf_token,
-                            disable_xet=True,
-                            sequential_reconstruct=False,
-                        )
-                    except Exception as fallback_error:
-                        raise WorkerError(
-                            f"HF_XET_RECONSTRUCTION_ERROR: reconstruction HF-XET échouée, fallback sans XET impossible ({type(fallback_error).__name__}).",
-                            502,
-                            code="HF_XET_RECONSTRUCTION_ERROR",
-                            retryable=True,
-                        ) from fallback_error
-                else:
+                if not allow_no_xet_fallback:
                     raise WorkerError(
                         "HF_XET_RECONSTRUCTION_ERROR: reconstruction HF-XET échouée après retries.",
                         502,
                         code="HF_XET_RECONSTRUCTION_ERROR",
                         retryable=True,
                     ) from last_xet_error
+                try:
+                    self._snapshot_download_with_env(
+                        snapshot_download,
+                        repo_id=repository,
+                        revision=resolved_revision,
+                        local_dir=temporary,
+                        cache_dir=self.settings.hf_home,
+                        token=hf_token,
+                        disable_xet=True,
+                        sequential_reconstruct=False,
+                    )
+                except Exception as fallback_error:
+                    raise WorkerError(
+                        "HF_XET_RECONSTRUCTION_ERROR: reconstruction HF-XET échouée, "
+                        f"fallback sans XET impossible ({type(fallback_error).__name__}).",
+                        502,
+                        code="HF_XET_RECONSTRUCTION_ERROR",
+                        retryable=True,
+                    ) from fallback_error
 
             validation = self.validate_snapshot(temporary)
             self._log_model_state(model_id, "DOWNLOADING", "VALIDATING")
 
             metadata = inspect_model_metadata(temporary)
-            resolved_capability = self._resolve_supported_capability(metadata, capabilities)
+            metadata = self._metadata_with_capabilities(metadata, capabilities)
+            resolved_capability = self._resolve_supported_capability(
+                metadata,
+                capabilities,
+            )
             if resolved_capability is None:
                 raise WorkerError(
                     "pipeline non supporté: aucun adapter Diffusers compatible n'a été trouvé pour ce modèle.",
@@ -692,12 +874,12 @@ class RuntimeManager:
                     retryable=False,
                 )
 
+            runtime_capabilities = metadata.get("capabilities") or [resolved_capability]
             destination = self._model_root(model_id) / resolved_revision
             destination.parent.mkdir(parents=True, exist_ok=True)
             if destination.exists():
                 shutil.rmtree(destination)
 
-            runtime_capabilities = metadata.get("capabilities") or capabilities or [resolved_capability]
             manifest = {
                 "model_id": model_id,
                 "repository": repository,
@@ -717,122 +899,122 @@ class RuntimeManager:
                 **validation,
             }
             (temporary / "vidioai-model.json").write_text(
-                json.dumps(manifest, indent=2), encoding="utf-8"
+                json.dumps(manifest, indent=2),
+                encoding="utf-8",
             )
             os.replace(temporary, destination)
-            pointer = {
+
+            pointer_payload = {
                 "model_id": model_id,
                 "repository": repository,
                 "revision": resolved_revision,
             }
             pointer_path = self._active_pointer(model_id)
             pointer_temporary = pointer_path.with_suffix(".json.tmp")
-            pointer_temporary.write_text(json.dumps(pointer), encoding="utf-8")
+            pointer_temporary.write_text(
+                json.dumps(pointer_payload),
+                encoding="utf-8",
+            )
             os.replace(pointer_temporary, pointer_path)
+
             with self._lock:
                 self._model_states[model_id] = manifest
             self._log_model_state(model_id, "VALIDATING", "INSTALLED")
             return manifest
+
         except WorkerError as error:
             self._log_model_state(model_id, "VALIDATING", "FAILED", reason=error.code)
-            with self._lock:
-                self._model_states[model_id] = {
-                    "model_id": model_id,
-                    "state": ModelState.FAILED,
-                    "downloaded": temporary.exists(),
-                    "validated": False,
-                    "installed": False,
-                    "loaded": False,
-                    "ready": False,
-                    "error_code": error.code,
-                    "retryable": error.retryable,
-                    "error": str(error),
-                }
+            self._mark_failed(
+                model_id,
+                error=error,
+                downloaded=self._directory_has_files(temporary),
+            )
             raise
+
         except Exception as error:
             if self._hf_token() is None and self._looks_like_hf_auth_error(error):
-                message = (
+                worker_error = WorkerError(
                     "Accès Hugging Face requis: ce repository est protégé "
-                    "(gated/private) et nécessite un HF_TOKEN valide."
+                    "(gated/private) et nécessite un HF_TOKEN valide.",
+                    403,
+                    code="HF_ACCESS_DENIED",
+                    retryable=False,
                 )
-                with self._lock:
-                    self._model_states[model_id] = {
-                        "model_id": model_id,
-                        "state": ModelState.FAILED,
-                        "error_code": "HF_ACCESS_DENIED",
-                        "retryable": False,
-                        "error": message,
-                    }
-                raise WorkerError(message, 403, code="HF_ACCESS_DENIED") from error
-
-            if self._looks_like_hf_not_found(error):
-                message = "Repository Hugging Face introuvable."
-                code = "HF_MODEL_NOT_FOUND"
-                status = 404
-                retryable = False
             elif self._looks_like_hf_revision_not_found(error):
-                message = "Révision Hugging Face introuvable pour ce repository."
-                code = "HF_REVISION_NOT_FOUND"
-                status = 404
-                retryable = False
+                worker_error = WorkerError(
+                    "Révision Hugging Face introuvable pour ce repository.",
+                    404,
+                    code="HF_REVISION_NOT_FOUND",
+                    retryable=False,
+                )
+            elif self._looks_like_hf_not_found(error):
+                worker_error = WorkerError(
+                    "Repository Hugging Face introuvable.",
+                    404,
+                    code="HF_MODEL_NOT_FOUND",
+                    retryable=False,
+                )
             elif self._looks_like_timeout(error):
-                message = "Délai dépassé pendant le téléchargement Hugging Face."
-                code = "HF_DOWNLOAD_TIMEOUT"
-                status = 504
-                retryable = True
+                worker_error = WorkerError(
+                    "Délai dépassé pendant le téléchargement Hugging Face.",
+                    504,
+                    code="HF_DOWNLOAD_TIMEOUT",
+                    retryable=True,
+                )
             elif self._looks_like_xet_reconstruction_error(error):
-                message = "Erreur de reconstruction HF-XET pendant le téléchargement."
-                code = "HF_XET_RECONSTRUCTION_ERROR"
-                status = 502
-                retryable = True
+                worker_error = WorkerError(
+                    "Erreur de reconstruction HF-XET pendant le téléchargement.",
+                    502,
+                    code="HF_XET_RECONSTRUCTION_ERROR",
+                    retryable=True,
+                )
             else:
-                message = f"Installation impossible: {type(error).__name__}: {error}"
-                code = "HF_DOWNLOAD_ERROR"
-                status = 502
-                retryable = False
+                worker_error = WorkerError(
+                    f"Installation impossible: {type(error).__name__}: {error}",
+                    502,
+                    code="HF_DOWNLOAD_ERROR",
+                    retryable=False,
+                )
 
-            with self._lock:
-                self._model_states[model_id] = {
-                    "model_id": model_id,
-                    "state": ModelState.FAILED,
-                    "downloaded": temporary.exists(),
-                    "validated": False,
-                    "installed": False,
-                    "loaded": False,
-                    "ready": False,
-                    "error_code": code,
-                    "retryable": retryable,
-                    "error": message,
-                }
-            raise WorkerError(message, status, code=code, retryable=retryable) from error
+            self._mark_failed(
+                model_id,
+                error=worker_error,
+                downloaded=self._directory_has_files(temporary),
+            )
+            raise worker_error from error
+
         finally:
             if temporary.exists():
                 shutil.rmtree(temporary, ignore_errors=True)
 
     def model_status(self, model_id: str) -> dict[str, Any]:
+        model_id = self._safe_segment(model_id)
         with self._lock:
             current = self._model_states.get(model_id)
-            # Les états transitoires/erreurs vivent en mémoire. Pour un état
-            # installé, le pointeur disque reste toutefois la source d'autorité
-            # afin qu'une suppression effectuée par le backend soit visible.
             if current is not None and current.get("state") in {
                 ModelState.DOWNLOADING,
                 ModelState.FAILED,
                 ModelState.RUNTIME_UNAVAILABLE,
                 ModelState.INCOMPATIBLE,
             }:
-                return current
+                return dict(current)
             if current is not None and self._active_pointer(model_id).is_file():
-                return current
+                return dict(current)
+
         try:
             snapshot, _ = self._active_snapshot(model_id)
-            manifest_path = snapshot / "vidioai-model.json"
-            if not manifest_path.is_file():
+            manifest = self._read_manifest(snapshot)
+            if not manifest:
                 raise WorkerError("Le manifest VidioAI du snapshot est absent.", 409)
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            metadata = inspect_model_metadata(snapshot)
+
+            validation = self.validate_snapshot(snapshot)
+            metadata, manifest = self._effective_snapshot_metadata(
+                snapshot,
+                manifest.get("capabilities"),
+            )
             resolved_capability = self._resolve_supported_capability(
-                metadata, manifest.get("capabilities")
+                metadata,
+                manifest.get("capabilities"),
             )
             if resolved_capability is None:
                 return {
@@ -841,7 +1023,7 @@ class RuntimeManager:
                     "downloaded": True,
                     "validated": False,
                     "installed": False,
-                    "weights_valid": manifest.get("weights_valid", False),
+                    "weights_valid": validation.get("weights_valid", False),
                     "runtime_available": self.runtime_status()["runtime_available"],
                     "runtime_compatible": False,
                     "validation_test": False,
@@ -850,11 +1032,28 @@ class RuntimeManager:
                     "error_code": "PIPELINE_UNSUPPORTED",
                     "error": "pipeline non supporté: aucun adapter Diffusers compatible n'a été trouvé pour ce modèle.",
                 }
-            manifest.setdefault("downloaded", True)
-            manifest.setdefault("validated", True)
-            manifest.setdefault("loaded", manifest.get("state") == ModelState.READY)
-            manifest.setdefault("ready", manifest.get("state") == ModelState.READY)
-            return manifest
+
+            with self._lock:
+                loaded = self._loaded.get(model_id)
+
+            status = {
+                **manifest,
+                "downloaded": True,
+                "validated": True,
+                "installed": True,
+                "weights_valid": validation["weights_valid"],
+                "runtime_compatible": True,
+                "loaded": loaded is not None,
+                "ready": loaded is not None and loaded.validation_test,
+                "state": (
+                    ModelState.READY
+                    if loaded is not None and loaded.validation_test
+                    else ModelState.INSTALLED
+                ),
+                "validation_test": loaded is not None and loaded.validation_test,
+            }
+            return status
+
         except WorkerError:
             return {
                 "model_id": model_id,
@@ -870,6 +1069,110 @@ class RuntimeManager:
                 "ready": False,
             }
 
+    @staticmethod
+    def _torch_dtype(torch: Any, cuda_available: bool) -> tuple[Any, str]:
+        if not cuda_available:
+            return torch.float32, "FP32"
+        bf16_supported = bool(
+            hasattr(torch.cuda, "is_bf16_supported")
+            and torch.cuda.is_bf16_supported()
+        )
+        if bf16_supported:
+            return torch.bfloat16, "BF16"
+        return torch.float16, "FP16"
+
+    def _load_pipeline(
+        self,
+        *,
+        snapshot: Path,
+        metadata: dict[str, Any],
+        capability: str,
+        adapter: Any,
+        device: str,
+        dtype: Any,
+    ) -> Any:
+        pipeline = adapter.load(
+            str(snapshot),
+            {"torch_dtype": dtype, "device": device},
+            {
+                "device": device,
+                "class_name": metadata.get("class_name"),
+                "metadata": metadata,
+                "capability": capability,
+            },
+        )
+        if device == "cuda" and hasattr(pipeline, "to"):
+            pipeline = pipeline.to(device)
+        return pipeline
+
+    def _validate_loaded_pipeline(
+        self,
+        *,
+        adapter: Any,
+        pipeline: Any,
+        metadata: dict[str, Any],
+        capability: str,
+        device: str,
+        torch: Any,
+    ) -> None:
+        # Les modes nécessitant une vraie vidéo/masque/contrôle sont validés à la
+        # première génération. Le chargement réel du pipeline reste obligatoire.
+        if capability in {
+            "VIDEO_TO_VIDEO",
+            "VIDEO_INPAINTING",
+            "VIDEO_UPSCALE",
+            "INPAINTING",
+            "CONTROLLED_IMAGE_GENERATION",
+        }:
+            if not callable(pipeline):
+                raise RuntimeError("Le pipeline Diffusers chargé n'est pas appelable.")
+            return
+
+        generator = torch.Generator(device=device if device == "cuda" else "cpu")
+        request: dict[str, Any] = {
+            "prompt": "VidioAI runtime validation",
+            "negative_prompt": None,
+            "width": 128 if "VIDEO" in capability else 64,
+            "height": 128 if "VIDEO" in capability else 64,
+            "steps": 1,
+            "guidance_scale": 0.0,
+            "frames": 5 if "VIDEO" in capability else None,
+            "fps": 8 if "VIDEO" in capability else None,
+            "duration_seconds": 1 if "VIDEO" in capability else None,
+        }
+
+        if capability in {
+            "IMAGE_TO_IMAGE",
+            "IMAGE_VARIATION",
+            "IMAGE_UPSCALE",
+            "OUTPAINTING",
+            "IMAGE_TO_VIDEO",
+            "MULTI_IMAGE_TO_VIDEO",
+            "START_END_IMAGE_TO_VIDEO",
+            "KEYFRAMES_TO_VIDEO",
+        }:
+            from PIL import Image
+
+            image = Image.new("RGB", (128, 128), (127, 127, 127))
+            request["input_image"] = image
+            request["resolved_input_images"] = [image]
+            request["input_images"] = [
+                {"asset_id": "validation", "order": 0, "role": "start_frame"}
+            ]
+
+        output = adapter.generate(
+            pipeline,
+            {
+                "device": device,
+                "generator": generator,
+                "metadata": metadata,
+                "capability": capability,
+            },
+            request,
+        )
+        if not output.get("images") and not output.get("frames"):
+            raise RuntimeError("Le pipeline n'a produit aucune sortie de validation.")
+
     def load_model(self, model_id: str) -> dict[str, Any]:
         model_id = self._safe_segment(model_id)
         self._log_model_state(model_id, "INSTALLED", "LOADING")
@@ -877,6 +1180,7 @@ class RuntimeManager:
         validation = self.validate_snapshot(snapshot)
         torch, _ = self._imports()
         cuda_available = bool(torch.cuda.is_available())
+
         if self.settings.gpu_required and not cuda_available:
             status = {
                 "model_id": model_id,
@@ -886,56 +1190,72 @@ class RuntimeManager:
                 "runtime_available": True,
                 "runtime_compatible": False,
                 "validation_test": False,
+                "loaded": False,
+                "ready": False,
                 "error": "CUDA est obligatoire mais indisponible.",
             }
             with self._lock:
                 self._model_states[model_id] = status
-            raise WorkerError(status["error"], 503)
+            raise WorkerError(status["error"], 503, code="RUNTIME_UNAVAILABLE")
 
-        metadata = inspect_model_metadata(snapshot)
-        capability = None
-        for candidate in self._capability_order():
-            adapter = self._registry.select_for_capability(metadata, candidate)
-            if adapter is not None:
-                capability = candidate
-                break
+        metadata, manifest = self._effective_snapshot_metadata(snapshot)
+        capability = self._resolve_supported_capability(
+            metadata,
+            manifest.get("capabilities"),
+        )
         if capability is None:
-            self._log_model_state(model_id, "LOADING", "FAILED", reason="PIPELINE_UNSUPPORTED")
-            raise WorkerError(
+            self._log_model_state(
+                model_id,
+                "LOADING",
+                "FAILED",
+                reason="PIPELINE_UNSUPPORTED",
+            )
+            error = WorkerError(
                 "pipeline non supporté: aucun adapter Diffusers compatible n'a été trouvé pour ce modèle.",
                 422,
                 code="PIPELINE_UNSUPPORTED",
             )
+            self._mark_failed(
+                model_id,
+                error=error,
+                downloaded=True,
+                validated=True,
+                installed=False,
+            )
+            raise error
+
         adapter = self._registry.select_for_capability(metadata, capability)
+        if adapter is None:
+            raise WorkerError(
+                "Adapter runtime introuvable.",
+                422,
+                code="PIPELINE_UNSUPPORTED",
+            )
+
         device = "cuda" if cuda_available else "cpu"
-        dtype = torch.float16 if cuda_available else torch.float32
-        precision = "FP16" if cuda_available else "FP32"
+        dtype, precision = self._torch_dtype(torch, cuda_available)
         gpu_before = self._nvidia_metrics()
         load_started = time.perf_counter()
         if cuda_available:
             torch.cuda.reset_peak_memory_stats()
+
         try:
-            pipeline = adapter.load(
-                str(snapshot),
-                {"torch_dtype": dtype, "device": device},
-                {"device": device, "class_name": metadata.get("class_name")},
+            pipeline = self._load_pipeline(
+                snapshot=snapshot,
+                metadata=metadata,
+                capability=capability,
+                adapter=adapter,
+                device=device,
+                dtype=dtype,
             )
-            if device == "cuda" and hasattr(pipeline, "to"):
-                pipeline = pipeline.to(device)
-            validation_output = adapter.generate(
-                pipeline,
-                {"device": device, "generator": torch.Generator(device=device) if hasattr(torch, "Generator") else None},
-                {
-                    "prompt": "VidioAI runtime validation",
-                    "negative_prompt": None,
-                    "width": 64,
-                    "height": 64,
-                    "steps": 1,
-                    "guidance_scale": 0.0,
-                },
+            self._validate_loaded_pipeline(
+                adapter=adapter,
+                pipeline=pipeline,
+                metadata=metadata,
+                capability=capability,
+                device=device,
+                torch=torch,
             )
-            if not validation_output.get("images") and not validation_output.get("frames"):
-                raise RuntimeError("Le pipeline n'a produit aucune sortie de validation.")
         except Exception as error:
             self._log_model_state(model_id, "LOADING", "FAILED", reason="LOAD_FAILED")
             status = {
@@ -954,7 +1274,12 @@ class RuntimeManager:
             }
             with self._lock:
                 self._model_states[model_id] = status
-            raise WorkerError(status["error"], 503) from error
+            raise WorkerError(
+                status["error"],
+                503,
+                code="LOAD_FAILED",
+                retryable=False,
+            ) from error
 
         gpu_after = self._nvidia_metrics()
         process_peak = int(torch.cuda.max_memory_reserved()) if cuda_available else 0
@@ -966,6 +1291,7 @@ class RuntimeManager:
         )
         if total_vram:
             observed_peak = min(observed_peak, total_vram)
+
         load_benchmark = {
             "gpu": str((gpu_after or gpu_before or {}).get("name", "CPU")),
             "vram_idle_bytes": idle_vram,
@@ -974,8 +1300,8 @@ class RuntimeManager:
             "ram_peak_bytes": self._ram_peak_bytes(),
             "runtime": "Diffusers",
             "precision": precision,
-            "resolution_width": 64,
-            "resolution_height": 64,
+            "resolution_width": None,
+            "resolution_height": None,
             "frames": None,
             "duration_seconds": None,
             "fps": None,
@@ -1025,6 +1351,7 @@ class RuntimeManager:
         return status
 
     def unload_model(self, model_id: str) -> dict[str, Any]:
+        model_id = self._safe_segment(model_id)
         with self._lock:
             loaded = self._loaded.pop(model_id, None)
         if loaded is not None:
@@ -1036,6 +1363,7 @@ class RuntimeManager:
                     torch.cuda.empty_cache()
             except WorkerError:
                 pass
+
         status = self.model_status(model_id)
         status = {
             **status,
@@ -1044,8 +1372,12 @@ class RuntimeManager:
                 if status.get("installed")
                 else ModelState.NOT_INSTALLED
             ),
-            "runtime_compatible": False,
+            "runtime_compatible": bool(
+                status.get("installed") and status.get("weights_valid")
+            ),
             "validation_test": False,
+            "loaded": False,
+            "ready": False,
         }
         with self._lock:
             self._model_states[model_id] = status
@@ -1058,6 +1390,74 @@ class RuntimeManager:
             self.unload_model(model_id)
         return {"unloaded": model_ids}
 
+    def _ensure_pipeline_for_capability(
+        self,
+        loaded: LoadedModel,
+        requested_capability: str,
+    ) -> Any:
+        metadata = loaded.metadata or {}
+        adapter = self._registry.select_for_capability(metadata, requested_capability)
+        if adapter is None:
+            raise WorkerError(
+                "Aucun adapter compatible ne peut générer cette capacité.",
+                422,
+                code="PIPELINE_UNSUPPORTED",
+            )
+
+        if loaded.capability == requested_capability and loaded.pipeline is not None:
+            return adapter
+
+        snapshot, _ = self._active_snapshot(loaded.model_id)
+        torch, _ = self._imports()
+
+        old_pipeline = loaded.pipeline
+        loaded.pipeline = None
+        if old_pipeline is not None:
+            del old_pipeline
+        gc.collect()
+        if loaded.device == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        dtype, _ = self._torch_dtype(torch, loaded.device == "cuda")
+        try:
+            pipeline = self._load_pipeline(
+                snapshot=snapshot,
+                metadata=metadata,
+                capability=requested_capability,
+                adapter=adapter,
+                device=loaded.device,
+                dtype=dtype,
+            )
+        except Exception as error:
+            with self._lock:
+                self._loaded.pop(loaded.model_id, None)
+                self._model_states[loaded.model_id] = {
+                    "model_id": loaded.model_id,
+                    "state": ModelState.FAILED,
+                    "downloaded": True,
+                    "validated": True,
+                    "installed": True,
+                    "weights_valid": True,
+                    "runtime_available": True,
+                    "runtime_compatible": False,
+                    "validation_test": False,
+                    "loaded": False,
+                    "ready": False,
+                    "error": (
+                        "Changement de pipeline impossible: "
+                        f"{type(error).__name__}: {error}"
+                    ),
+                }
+            raise WorkerError(
+                f"Impossible de charger le pipeline {requested_capability}: {error}",
+                503,
+                code="LOAD_FAILED",
+            ) from error
+
+        loaded.pipeline = pipeline
+        loaded.capability = requested_capability
+        return adapter
+
     def _output_path(self, relative_path: str) -> Path:
         candidate = (self.settings.outputs_dir / relative_path).resolve()
         root = self.settings.outputs_dir.resolve()
@@ -1066,11 +1466,118 @@ class RuntimeManager:
         candidate.parent.mkdir(parents=True, exist_ok=True)
         return candidate
 
-    def _generate_with_adapter(self, loaded: LoadedModel, request: dict[str, Any], *, job_id: str) -> dict[str, Any]:
-        requested_capability = request.get("capability") or loaded.capability or "TEXT_TO_IMAGE"
-        adapter = self._registry.select_for_capability(loaded.metadata or {}, requested_capability)
-        if adapter is None:
-            raise WorkerError("Aucun adapter compatible ne peut générer cette capacité.", 422)
+    @staticmethod
+    def _normalize_video_frames(frames: Any) -> list[Any]:
+        if frames is None:
+            return []
+
+        # Tensor/ndarray batché : [B, F, H, W, C] ou [F, H, W, C].
+        ndim = getattr(frames, "ndim", None)
+        if isinstance(ndim, int):
+            if ndim >= 5:
+                frames = frames[0]
+            return [frame for frame in frames]
+
+        if isinstance(frames, (list, tuple)):
+            if len(frames) == 1:
+                first = frames[0]
+                first_ndim = getattr(first, "ndim", None)
+                if isinstance(first, (list, tuple)):
+                    return list(first)
+                if isinstance(first_ndim, int) and first_ndim >= 4:
+                    return [frame for frame in first]
+            return list(frames)
+
+        return [frames]
+
+    def _export_frames_to_mp4(
+        self,
+        frames: Any,
+        output_path: Path,
+        fps: int,
+    ) -> None:
+        from PIL import Image
+
+        normalized = self._normalize_video_frames(frames)
+        if not normalized:
+            raise RuntimeError("Aucune frame vidéo à encoder.")
+
+        frame_dir = self.settings.work_dir / f"video-frames-{uuid.uuid4()}"
+        frame_dir.mkdir(parents=True, exist_ok=True)
+        temporary = output_path.with_name(f"{output_path.stem}.tmp.mp4")
+
+        try:
+            for index, frame in enumerate(normalized):
+                if hasattr(frame, "detach"):
+                    frame = frame.detach().cpu().numpy()
+
+                if hasattr(frame, "save"):
+                    image = frame.convert("RGB") if hasattr(frame, "convert") else frame
+                else:
+                    import numpy as np
+
+                    array = np.asarray(frame)
+                    if array.dtype.kind == "f":
+                        array = np.clip(array, 0.0, 1.0)
+                        array = (array * 255.0).round().astype("uint8")
+                    elif array.dtype != np.uint8:
+                        array = np.clip(array, 0, 255).astype("uint8")
+
+                    # Certains pipelines renvoient CHW au lieu de HWC.
+                    if array.ndim == 3 and array.shape[0] in {1, 3, 4} and array.shape[-1] not in {1, 3, 4}:
+                        array = np.moveaxis(array, 0, -1)
+                    if array.ndim == 3 and array.shape[-1] == 1:
+                        array = array[..., 0]
+                    image = Image.fromarray(array).convert("RGB")
+
+                image.save(frame_dir / f"frame-{index:06d}.png", format="PNG")
+
+            command = [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-framerate",
+                str(max(1, fps)),
+                "-i",
+                str(frame_dir / "frame-%06d.png"),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                str(temporary),
+            ]
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=60 * 10,
+                check=False,
+            )
+            if result.returncode != 0 or not temporary.is_file():
+                message = result.stderr.strip() or "ffmpeg n'a produit aucun fichier"
+                raise RuntimeError(f"Encodage MP4 impossible: {message}")
+            os.replace(temporary, output_path)
+        finally:
+            shutil.rmtree(frame_dir, ignore_errors=True)
+            temporary.unlink(missing_ok=True)
+
+    def _generate_with_adapter(
+        self,
+        loaded: LoadedModel,
+        request: dict[str, Any],
+        *,
+        job_id: str,
+    ) -> dict[str, Any]:
+        requested_capability = str(
+            request.get("capability") or loaded.capability or "TEXT_TO_IMAGE"
+        ).upper()
+        adapter = self._ensure_pipeline_for_capability(
+            loaded,
+            requested_capability,
+        )
         prepared_request = self._resolve_generation_inputs(request)
 
         with self._lock:
@@ -1081,66 +1588,107 @@ class RuntimeManager:
         def callback(_pipeline: Any, step: int, _timestep: Any, callback_kwargs: Any):
             if cancel_event.is_set():
                 raise InterruptedError("Job annulé.")
+            total_steps = max(1, int(prepared_request.get("steps") or 4))
             with self._lock:
-                self._jobs[job_id]["progress"] = min(95, int(((step + 1) / max(1, request.get("steps", 4))) * 95))
+                self._jobs[job_id]["progress"] = min(
+                    95,
+                    int(((step + 1) / total_steps) * 95),
+                )
             return callback_kwargs
 
         torch, _ = self._imports()
         generation_started = time.perf_counter()
         if loaded.device == "cuda":
             torch.cuda.reset_peak_memory_stats()
+
         generator_device = loaded.device if loaded.device == "cuda" else "cpu"
         generator = torch.Generator(device=generator_device)
         if request.get("seed") is not None:
             generator.manual_seed(request["seed"])
-        runtime = {"device": loaded.device, "generator": generator, "callback": callback}
-        output = adapter.generate(loaded.pipeline, runtime, prepared_request)
+
+        runtime = {
+            "device": loaded.device,
+            "generator": generator,
+            "callback": callback,
+            "metadata": loaded.metadata or {},
+            "capability": requested_capability,
+        }
+        output = adapter.generate(
+            loaded.pipeline,
+            runtime,
+            prepared_request,
+        )
         if cancel_event.is_set():
             raise InterruptedError("Job annulé.")
 
         images = output.get("images") or []
-        frames = output.get("frames") or []
-        if not images and not frames:
+        frames = output.get("frames")
+        normalized_frames = self._normalize_video_frames(frames)
+        if not images and not normalized_frames:
             raise RuntimeError("Le runtime n'a produit aucune sortie.")
 
         output_path = self._output_path(request["output_relative_path"])
-        temporary = output_path.with_suffix(output_path.suffix + ".tmp")
-        if images:
-            images[0].save(temporary, format="PNG")
-        else:
-            from PIL import Image
+        is_video_request = requested_capability in {
+            "TEXT_TO_VIDEO",
+            "IMAGE_TO_VIDEO",
+            "MULTI_IMAGE_TO_VIDEO",
+            "START_END_IMAGE_TO_VIDEO",
+            "KEYFRAMES_TO_VIDEO",
+            "VIDEO_TO_VIDEO",
+            "VIDEO_INPAINTING",
+            "VIDEO_UPSCALE",
+        }
 
-            frame = frames[0]
-            if isinstance(frame, list):
-                frame = frame[0]
-            if hasattr(frame, "save"):
-                frame.save(temporary, format="PNG")
-            else:
-                Image.fromarray(frame).save(temporary, format="PNG")
-        os.replace(temporary, output_path)
+        if is_video_request:
+            if not normalized_frames:
+                raise RuntimeError(
+                    "Le pipeline vidéo n'a renvoyé aucune séquence de frames exploitable."
+                )
+            fps = int(output.get("fps") or prepared_request.get("fps") or 24)
+            self._export_frames_to_mp4(normalized_frames, output_path, fps)
+        else:
+            if not images:
+                raise RuntimeError("Le pipeline image n'a renvoyé aucune image.")
+            temporary = output_path.with_name(
+                f"{output_path.stem}.tmp{output_path.suffix or '.png'}"
+            )
+            images[0].save(temporary, format="PNG")
+            os.replace(temporary, output_path)
+
         gpu_after = self._nvidia_metrics()
-        process_peak = int(torch.cuda.max_memory_reserved()) if loaded.device == "cuda" else 0
+        process_peak = (
+            int(torch.cuda.max_memory_reserved()) if loaded.device == "cuda" else 0
+        )
         idle_vram = int(loaded.load_benchmark.get("vram_idle_bytes", 0))
         total_vram = int((gpu_after or {}).get("vram_total_bytes", 0))
-        observed_peak = max(int((gpu_after or {}).get("vram_used_bytes", 0)), idle_vram + process_peak)
+        observed_peak = max(
+            int((gpu_after or {}).get("vram_used_bytes", 0)),
+            idle_vram + process_peak,
+        )
         if total_vram:
             observed_peak = min(observed_peak, total_vram)
+
+        width = int(output.get("width") or prepared_request.get("width") or 512)
+        height = int(output.get("height") or prepared_request.get("height") or 512)
+
         return {
             "job_id": job_id,
             "state": JobState.COMPLETED,
             "progress": 100,
             "output_relative_path": request["output_relative_path"],
-            "width": 512,
-            "height": 512,
+            "width": width,
+            "height": height,
             "sha256": self._sha256(output_path),
             "benchmark": {
                 **loaded.load_benchmark,
-                "vram_after_load_bytes": int(loaded.load_benchmark.get("vram_after_load_bytes", 0)),
+                "vram_after_load_bytes": int(
+                    loaded.load_benchmark.get("vram_after_load_bytes", 0)
+                ),
                 "vram_peak_bytes": observed_peak,
                 "ram_peak_bytes": self._ram_peak_bytes(),
                 "precision": loaded.precision,
-                "resolution_width": 512,
-                "resolution_height": 512,
+                "resolution_width": width,
+                "resolution_height": height,
                 "batch": 1,
                 "inference_seconds": time.perf_counter() - generation_started,
             },
@@ -1152,7 +1700,12 @@ class RuntimeManager:
         with self._lock:
             loaded = self._loaded.get(model_id)
             if loaded is None or not loaded.validation_test:
-                raise WorkerError("Le modèle n'est pas READY.", 409)
+                raise WorkerError(
+                    "Le modèle n'est pas READY.",
+                    409,
+                    code="MODEL_NOT_READY",
+                    retryable=False,
+                )
             cancel_event = threading.Event()
             self._cancel_events[job_id] = cancel_event
             self._jobs[job_id] = {

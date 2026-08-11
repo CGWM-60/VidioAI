@@ -11,7 +11,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{
-        Multipart, Path, Query, State,
+        DefaultBodyLimit, Multipart, Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, header},
@@ -968,8 +968,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/jobs/{id}", get(get_job))
         .route("/queue", get(get_queue))
         .route("/events", get(events_upgrade))
-        .route("/assets", get(list_assets).post(upload_asset))
-        .route("/assets/{id}", get(get_asset).delete(delete_asset))
+        .route(
+            "/assets",
+            get(list_assets)
+                .post(upload_asset)
+                .layer(
+                    DefaultBodyLimit::max(
+                        MAX_VIDEO_BYTES + 1024 * 1024,
+                    ),
+                ),
+)        .route("/assets/{id}", get(get_asset).delete(delete_asset))
         .route("/images/generate", post(generate_image))
         .route("/videos/generate", post(generate_video))
         .route("/generations", get(list_generations))
@@ -2084,10 +2092,15 @@ async fn model_view_with_machine(
     };
     let installed = if entry.local {
         true
-    } else if let Some(status) = &worker_status {
-        downloaded && status.installed && status.weights_valid && status.runtime_compatible
     } else {
-        downloaded
+        worker_status
+            .as_ref()
+            .is_some_and(|status| {
+                downloaded
+                    && status.installed
+                    && status.weights_valid
+                    && status.runtime_compatible
+            })
     };
     let runtime_ready = entry.local
         || worker_status.as_ref().is_some_and(worker_reports_ready);
@@ -3970,8 +3983,10 @@ async fn generate_video(
             "Capacité vidéo invalide pour ce mode.",
         ));
     }
-    if !entry.capabilities.contains(&expected)
-        || !entry.capabilities.contains(&requested_capability)
+    if !entry.runtime_capabilities.contains(&expected)
+        || !entry
+            .runtime_capabilities
+            .contains(&requested_capability)
     {
         return Err(ApiError::conflict(
             "Ce modèle ne supporte pas le mode vidéo choisi.",
@@ -4219,6 +4234,10 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
                     },
                     None,
                     Some(capability.api_name()),
+                    width,
+                    height,
+                    duration,
+                    24,
                 )
                 .await?;
 
@@ -4283,6 +4302,10 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
                     None,
                     None,
                     Some("TEXT_TO_VIDEO"),
+                    width,
+                    height,
+                    duration,
+                    24,
                 )
                 .await?;
             if worker_result.job_id != job_id.to_string()

@@ -306,58 +306,87 @@ impl WorkerClient {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn generate_video(
-        &self,
-        endpoint: &str,
-        job_id: &str,
-        model_id: &str,
-        prompt: &str,
-        negative_prompt: Option<&str>,
-        output_path: &Path,
-        input_path: Option<&str>,
-        input_images: Option<serde_json::Value>,
-        mask_path: Option<&str>,
-        capability: Option<&str>,
-    ) -> Result<GenerateResponse, String> {
-        let relative = output_path
-            .to_str()
-            .ok_or_else(|| "Chemin worker non UTF-8".to_owned())?;
-        let mut payload = serde_json::json!({
-            "job_id": job_id,
-            "model_id": model_id,
-            "prompt": prompt,
-            "negative_prompt": negative_prompt,
-            "width": 720,
-            "height": 480,
-            "steps": 4,
-            "guidance_scale": 0.0,
-            "duration_seconds": 4,
-            "fps": 8,
-            "frames": 8,
-            "seed": null,
-            "output_relative_path": relative,
-        });
-        if let Some(path) = input_path {
-            payload["input_path"] = serde_json::Value::String(path.into());
-        }
-        if let Some(images) = input_images {
-            payload["input_images"] = images;
-        }
-        if let Some(path) = mask_path {
-            payload["mask_path"] = serde_json::Value::String(path.into());
-        }
-        if let Some(value) = capability {
-            payload["capability"] = serde_json::Value::String(value.into());
-        }
-        self.json(
-            self.request(reqwest::Method::POST, endpoint)
-                .timeout(Duration::from_secs(60 * 30))
-                .json(&payload),
-        )
-        .await
+#[allow(clippy::too_many_arguments)]
+pub async fn generate_video(
+    &self,
+    endpoint: &str,
+    job_id: &str,
+    model_id: &str,
+    prompt: &str,
+    negative_prompt: Option<&str>,
+    output_path: &Path,
+    input_path: Option<&str>,
+    input_images: Option<serde_json::Value>,
+    mask_path: Option<&str>,
+    capability: Option<&str>,
+    width: u32,
+    height: u32,
+    duration_seconds: u32,
+    fps: u32,
+) -> Result<GenerateResponse, String> {
+    let relative = output_path
+        .to_str()
+        .ok_or_else(|| {
+            "Chemin worker non UTF-8".to_owned()
+        })?;
+
+    let frames = duration_seconds
+        .saturating_mul(fps)
+        .saturating_add(1);
+
+    let mut payload = serde_json::json!({
+        "job_id": job_id,
+        "model_id": model_id,
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "width": width,
+        "height": height,
+        "steps": 4,
+        "guidance_scale": 0.0,
+        "duration_seconds": duration_seconds,
+        "fps": fps,
+        "frames": frames,
+        "seed": null,
+        "output_relative_path": relative,
+    });
+
+    if let Some(path) = input_path {
+        payload["input_path"] =
+            serde_json::Value::String(
+                path.into(),
+            );
     }
 
+    if let Some(images) = input_images {
+        payload["input_images"] = images;
+    }
+
+    if let Some(path) = mask_path {
+        payload["mask_path"] =
+            serde_json::Value::String(
+                path.into(),
+            );
+    }
+
+    if let Some(value) = capability {
+        payload["capability"] =
+            serde_json::Value::String(
+                value.into(),
+            );
+    }
+
+    self.json(
+        self.request(
+            reqwest::Method::POST,
+            endpoint,
+        )
+        .timeout(
+            Duration::from_secs(60 * 30),
+        )
+        .json(&payload),
+    )
+    .await
+}
     pub async fn cancel(&self, job_id: &str) -> Result<(), String> {
         let response = self
             .request(reqwest::Method::POST, "/v1/jobs/cancel")

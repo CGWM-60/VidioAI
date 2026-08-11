@@ -1310,23 +1310,15 @@ fn infer_runtime_capabilities(
     {
         values.insert(ModelCapability::ControlledImageGeneration);
     }
-
-    if values.contains(&ModelCapability::ImageToVideo)
-        || advertised.contains(&ModelCapability::MultiImageToVideo)
-        || class_name.contains("wan")
-    {
+    if advertised.contains(&ModelCapability::MultiImageToVideo) {
         values.insert(ModelCapability::MultiImageToVideo);
     }
-    if values.contains(&ModelCapability::ImageToVideo)
-        || advertised.contains(&ModelCapability::StartEndImageToVideo)
-        || class_name.contains("ltx")
-    {
+
+    if advertised.contains(&ModelCapability::StartEndImageToVideo) {
         values.insert(ModelCapability::StartEndImageToVideo);
     }
-    if values.contains(&ModelCapability::ImageToVideo)
-        || advertised.contains(&ModelCapability::KeyframesToVideo)
-        || class_name.contains("cogvideo")
-    {
+
+    if advertised.contains(&ModelCapability::KeyframesToVideo) {
         values.insert(ModelCapability::KeyframesToVideo);
     }
 
