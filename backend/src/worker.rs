@@ -51,6 +51,10 @@ pub struct WorkerModelStatus {
     #[serde(default)]
     pub installed: bool,
     #[serde(default)]
+    pub loaded: bool,
+    #[serde(default)]
+    pub ready: bool,
+    #[serde(default)]
     pub weights_valid: bool,
     #[serde(default)]
     pub runtime_available: bool,
@@ -65,6 +69,18 @@ pub struct WorkerModelStatus {
     pub runtime_dependencies: Vec<serde_json::Value>,
     #[serde(default)]
     pub precision_plan: Option<serde_json::Value>,
+    #[serde(default)]
+    pub memory_plan: Option<serde_json::Value>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub capability: Option<String>,
+    #[serde(default)]
+    pub pipeline_class: Option<String>,
+    #[serde(default)]
+    pub device: Option<String>,
+    #[serde(default)]
+    pub stage: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +149,8 @@ pub struct WorkerResources {
     pub gpu_status: String,
     pub worker_status: String,
     pub loaded_models: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub memory: Option<serde_json::Value>,
     pub active_jobs: usize,
 }
 

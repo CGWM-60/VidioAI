@@ -208,6 +208,10 @@ class DTypeResolver:
         return getattr(torch, plan.load_dtype)
 
     @classmethod
+    def component_names(cls) -> tuple[str, ...]:
+        return cls._COMPONENTS
+
+    @classmethod
     def inspect_components(cls, pipeline: Any) -> list[ComponentPrecisionPlan]:
         result: list[ComponentPrecisionPlan] = []
         for name in cls._COMPONENTS:
@@ -248,8 +252,10 @@ class DTypeResolver:
             return None
         if plan.load_dtype == "bfloat16":
             dtype = "float16" if cuda_available else "float32"
-        elif plan.load_dtype in {"float16", "auto"}:
-            dtype = "float32"
+        elif plan.load_dtype == "float16":
+            # `auto` laisse Diffusers respecter les dtypes propres aux composants
+            # (par exemple VAE FP32 + transformer FP16) sans doubler toute la VRAM.
+            dtype = "auto"
         else:
             return None
         return PrecisionPlan(

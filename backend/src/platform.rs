@@ -1192,6 +1192,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/chats/{id}/messages", post(send_chat_message))
         .route("/models", get(get_models))
         .route("/models/catalog/refresh", post(refresh_models))
+        .route("/models/installed", get(list_installed_models))
         .route("/models/cloud", get(list_cloud_models))
         .route("/models/cloud/restore", post(restore_cloud_models))
         // Les routes query/body sont la forme canonique : un ID Hugging Face
@@ -2143,6 +2144,8 @@ async fn put_settings(
 #[derive(Debug, Deserialize)]
 struct InstalledPointer {
     revision: String,
+    #[serde(default)]
+    repository: Option<String>,
 }
 
 /// Résout d'abord les deux moteurs internes, puis interroge le Hub. Cette
@@ -3098,6 +3101,213 @@ struct CloudModelView {
 }
 
 #[derive(Debug, Serialize)]
+struct InstalledModelView {
+    id: String,
+    storage_id: String,
+    repository: String,
+    revision: String,
+    state: String,
+    stage: Option<String>,
+    loaded: bool,
+    capabilities: Vec<String>,
+    precision: String,
+    precision_plan: Option<serde_json::Value>,
+    pipeline_class: Option<String>,
+    size_bytes: u64,
+    device: Option<String>,
+    memory_strategy: Option<String>,
+    memory_plan: Option<serde_json::Value>,
+    vram_bytes: u64,
+    vram_peak_bytes: u64,
+    ram_peak_bytes: u64,
+    cpu_offload: bool,
+    disk_offload: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct InstalledModelsResponse {
+    items: Vec<InstalledModelView>,
+    loaded: usize,
+    gpu: Option<serde_json::Value>,
+    memory: Option<serde_json::Value>,
+}
+
+async fn directory_size(root: &FilePath) -> u64 {
+    let mut pending = vec![root.to_path_buf()];
+    let mut total = 0_u64;
+    while let Some(path) = pending.pop() {
+        let Ok(metadata) = fs::metadata(&path).await else {
+            continue;
+        };
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        } else if metadata.is_dir()
+            && let Ok(mut entries) = fs::read_dir(path).await
+        {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                pending.push(entry.path());
+            }
+        }
+    }
+    total
+}
+
+async fn list_installed_models(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<InstalledModelsResponse>, ApiError> {
+    let settings = state.settings.get().await;
+    let resources = if let Some(worker) = &state.worker {
+        worker.resources().await.ok()
+    } else {
+        None
+    };
+    let mut items = Vec::new();
+    let mut directories = fs::read_dir(&settings.models_dir)
+        .await
+        .map_err(ApiError::internal)?;
+    while let Some(entry) = directories.next_entry().await.map_err(ApiError::internal)? {
+        let storage_id = entry.file_name().to_string_lossy().to_string();
+        if storage_id.starts_with('.')
+            || !entry
+                .file_type()
+                .await
+                .map_err(ApiError::internal)?
+                .is_dir()
+        {
+            continue;
+        }
+        let pointer_path = entry.path().join("active.json");
+        let Ok(pointer_bytes) = fs::read(&pointer_path).await else {
+            continue;
+        };
+        let Ok(pointer) = serde_json::from_slice::<InstalledPointer>(&pointer_bytes) else {
+            continue;
+        };
+        let snapshot = entry.path().join(&pointer.revision);
+        if !fs::metadata(&snapshot)
+            .await
+            .is_ok_and(|metadata| metadata.is_dir())
+        {
+            continue;
+        }
+        let manifest = fs::read(snapshot.join("vidioai-model.json"))
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .unwrap_or_default();
+        let repository = pointer
+            .repository
+            .or_else(|| {
+                manifest
+                    .get("repository")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| storage_id.clone());
+        let status = if let Some(worker) = &state.worker {
+            worker.model_status(&storage_id).await.ok()
+        } else {
+            None
+        };
+        let capabilities = status
+            .as_ref()
+            .map(|status| status.capabilities.clone())
+            .filter(|values| !values.is_empty())
+            .unwrap_or_else(|| {
+                manifest
+                    .get("capabilities")
+                    .or_else(|| manifest.get("requested_capabilities"))
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| value.as_str().map(str::to_owned))
+                    .collect()
+            });
+        let precision_plan = status
+            .as_ref()
+            .and_then(|status| status.precision_plan.clone());
+        let memory_plan = status
+            .as_ref()
+            .and_then(|status| status.memory_plan.clone());
+        let benchmark = status.as_ref().and_then(|status| status.benchmark.as_ref());
+        let memory_strategy = memory_plan
+            .as_ref()
+            .and_then(|plan| plan.get("strategy"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let disk_offload = memory_strategy.as_deref() == Some("DISK_OFFLOAD");
+        let manifest_size = manifest
+            .get("files")
+            .and_then(serde_json::Value::as_array)
+            .map(|files| {
+                files
+                    .iter()
+                    .filter_map(|file| file.get("size").and_then(serde_json::Value::as_u64))
+                    .sum::<u64>()
+            })
+            .unwrap_or(0);
+        items.push(InstalledModelView {
+            id: repository.clone(),
+            storage_id,
+            repository,
+            revision: pointer.revision,
+            state: status
+                .as_ref()
+                .map(|status| status.state.clone())
+                .unwrap_or_else(|| "INSTALLED".into()),
+            stage: status.as_ref().and_then(|status| status.stage.clone()),
+            loaded: status.as_ref().is_some_and(|status| status.ready),
+            capabilities,
+            precision: precision_plan
+                .as_ref()
+                .and_then(|plan| plan.get("resolved"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("AUTO")
+                .to_owned(),
+            precision_plan,
+            pipeline_class: status
+                .as_ref()
+                .and_then(|status| status.pipeline_class.clone())
+                .or_else(|| {
+                    manifest
+                        .get("pipeline_class")
+                        .or_else(|| manifest.get("class_name"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                }),
+            size_bytes: if manifest_size > 0 {
+                manifest_size
+            } else {
+                directory_size(&snapshot).await
+            },
+            device: status.as_ref().and_then(|status| status.device.clone()),
+            memory_strategy,
+            memory_plan,
+            vram_bytes: benchmark.map_or(0, |value| value.vram_after_load_bytes),
+            vram_peak_bytes: benchmark.map_or(0, |value| value.vram_peak_bytes),
+            ram_peak_bytes: benchmark
+                .and_then(|value| value.ram_peak_bytes)
+                .unwrap_or(0),
+            cpu_offload: benchmark.is_some_and(|value| value.cpu_offload),
+            disk_offload,
+            error: status.and_then(|status| status.error),
+        });
+    }
+    items.sort_by(|left, right| left.repository.cmp(&right.repository));
+    let loaded = items.iter().filter(|item| item.loaded).count();
+    Ok(Json(InstalledModelsResponse {
+        items,
+        loaded,
+        gpu: resources
+            .as_ref()
+            .and_then(|resources| serde_json::to_value(&resources.gpu).ok())
+            .filter(|value| !value.is_null()),
+        memory: resources.and_then(|resources| resources.memory),
+    }))
+}
+
+#[derive(Debug, Serialize)]
 struct CloudModelsResponse {
     items: Vec<CloudModelView>,
 }
@@ -3260,6 +3470,29 @@ async fn restore_cloud_models(
             "Sélectionnez entre 1 et 20 snapshots.",
         ));
     }
+    let active_restores = state
+        .jobs
+        .read()
+        .await
+        .values()
+        .filter(|job| {
+            job.kind == JobKind::RestoreModel
+                && matches!(
+                    job.status,
+                    JobStatus::Queued | JobStatus::Dispatching | JobStatus::Running
+                )
+        })
+        .map(|job| job.target_id.clone())
+        .collect::<HashSet<_>>();
+    if input
+        .models
+        .iter()
+        .any(|selection| active_restores.contains(&selection.repository))
+    {
+        return Err(ApiError::conflict(
+            "CLOUD_RESTORE_ALREADY_RUNNING: une restauration est déjà active pour ce modèle.",
+        ));
+    }
     let available = state
         .object_storage
         .list_snapshots()
@@ -3366,7 +3599,7 @@ async fn run_cloud_restore(state: Arc<AppState>, job: Job, manifest: SnapshotMan
             "repository": manifest.repository,
             "revision": manifest.revision,
         });
-        let temporary = model_root.join("active.json.tmp");
+        let temporary = model_root.join(format!("active.json.{}.tmp", job.id));
         fs::write(
             &temporary,
             serde_json::to_vec_pretty(&pointer).map_err(|e| e.to_string())?,
@@ -3425,8 +3658,15 @@ async fn run_cloud_restore(state: Arc<AppState>, job: Job, manifest: SnapshotMan
                 .await;
         }
         Err(error) => {
+            let progress = state
+                .jobs
+                .read()
+                .await
+                .get(&job.id)
+                .map(|current| current.progress.min(99))
+                .unwrap_or(0);
             state
-                .update_job(job.id, JobStatus::Failed, "failed", 100, &error)
+                .update_job(job.id, JobStatus::Failed, "failed", progress, &error)
                 .await;
         }
     }
@@ -3804,7 +4044,65 @@ async fn load_model_from_body(
     load_model_by_id(&state, &input.model_id).await
 }
 
+async fn installed_storage_id(state: &AppState, id: &str) -> Option<(String, String)> {
+    let settings = state.settings.get().await;
+    let mut entries = fs::read_dir(settings.models_dir).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let stored_id = entry.file_name().to_string_lossy().to_string();
+        let bytes = fs::read(entry.path().join("active.json")).await.ok();
+        let Some(pointer) =
+            bytes.and_then(|bytes| serde_json::from_slice::<InstalledPointer>(&bytes).ok())
+        else {
+            continue;
+        };
+        if stored_id == storage_id(id) || pointer.repository.as_deref() == Some(id) {
+            return Some((stored_id, pointer.revision));
+        }
+    }
+    None
+}
+
 async fn load_model_by_id(state: &AppState, id: &str) -> Result<Json<RuntimeEntry>, ApiError> {
+    if let Some((installed_storage_id, revision)) = installed_storage_id(state, id).await {
+        let worker = state
+            .worker
+            .as_ref()
+            .ok_or_else(|| ApiError::unavailable("Le worker GPU n'est pas configuré."))?;
+        let status = worker
+            .load(&installed_storage_id, id, &revision)
+            .await
+            .map_err(ApiError::unavailable)?;
+        if status.state != "READY" || !status.ready || !status.runtime_compatible {
+            return Err(ApiError::unavailable(status.error.unwrap_or_else(|| {
+                "Le runtime worker n'a pas atteint READY.".into()
+            })));
+        }
+        if let Some(observation) = &status.benchmark {
+            record_worker_benchmark(state, id, &revision, observation).await;
+        }
+        let runtime = RuntimeEntry {
+            model_id: id.to_owned(),
+            state: "ready".into(),
+            device: status.device.unwrap_or_else(|| "GPU".into()),
+            ram_bytes: status
+                .benchmark
+                .as_ref()
+                .and_then(|benchmark| benchmark.ram_peak_bytes)
+                .unwrap_or(0),
+            vram_bytes: status
+                .benchmark
+                .as_ref()
+                .map_or(0, |benchmark| benchmark.vram_after_load_bytes),
+            last_used_at: unix_now(),
+        };
+        state
+            .runtime
+            .write()
+            .await
+            .insert(id.to_owned(), runtime.clone());
+        state.emit("resources.updated", &runtime);
+        return Ok(Json(runtime));
+    }
     let entry = resolve_model(state, id).await?;
     let view = model_view(state, &entry).await;
     if !view.installed {
@@ -3914,17 +4212,19 @@ async fn unload_model_from_body(
 }
 
 async fn unload_model_by_id(state: &AppState, id: &str) -> Result<StatusCode, ApiError> {
-    if let Some(worker) = &state.worker {
-        // Une réponse « non installé » est acceptable : le registre local reste
-        // tout de même nettoyé. Les autres erreurs indiquent un worker coupé.
-        let _ = worker.unload(&storage_id(id)).await;
+    let worker_handled = if let Some(worker) = &state.worker {
+        worker
+            .unload(&storage_id(id))
+            .await
+            .map_err(ApiError::unavailable)?;
+        true
+    } else {
+        false
+    };
+    let removed = state.runtime.write().await.remove(id).is_some();
+    if !removed && !worker_handled {
+        return Err(ApiError::not_found("Ce modèle n'est pas chargé."));
     }
-    state
-        .runtime
-        .write()
-        .await
-        .remove(id)
-        .ok_or_else(|| ApiError::not_found("Ce modèle n'est pas chargé."))?;
     state.emit(
         "resources.updated",
         &json!({ "model_id": id, "state": "unloaded" }),
@@ -6073,6 +6373,8 @@ mod tests {
             repository: Some("Wan-AI/Wan2.2-TI2V-5B-Diffusers".into()),
             revision: Some("rev".into()),
             installed: true,
+            loaded: false,
+            ready: false,
             weights_valid: true,
             runtime_available: true,
             runtime_compatible: true,
@@ -6081,6 +6383,12 @@ mod tests {
             benchmark: None,
             runtime_dependencies: vec![],
             precision_plan: None,
+            memory_plan: None,
+            capabilities: vec![],
+            capability: None,
+            pipeline_class: None,
+            device: None,
+            stage: None,
         };
         assert!(!super::worker_reports_ready(&status));
     }
@@ -6093,6 +6401,8 @@ mod tests {
             repository: Some("Wan-AI/Wan2.2-TI2V-5B-Diffusers".into()),
             revision: Some("rev".into()),
             installed: true,
+            loaded: true,
+            ready: true,
             weights_valid: true,
             runtime_available: true,
             runtime_compatible: true,
@@ -6101,6 +6411,12 @@ mod tests {
             benchmark: None,
             runtime_dependencies: vec![],
             precision_plan: None,
+            memory_plan: None,
+            capabilities: vec![],
+            capability: None,
+            pipeline_class: None,
+            device: None,
+            stage: None,
         };
         assert!(super::worker_reports_ready(&status));
     }
@@ -6113,6 +6429,8 @@ mod tests {
             repository: Some("example/video-model".into()),
             revision: Some("rev".into()),
             installed: true,
+            loaded: true,
+            ready: true,
             weights_valid: true,
             runtime_available: true,
             runtime_compatible: true,
@@ -6121,6 +6439,12 @@ mod tests {
             benchmark: None,
             runtime_dependencies: vec![],
             precision_plan: None,
+            memory_plan: None,
+            capabilities: vec![],
+            capability: None,
+            pipeline_class: None,
+            device: None,
+            stage: None,
         };
         assert!(super::worker_reports_ready(&status));
     }

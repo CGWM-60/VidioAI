@@ -77,6 +77,38 @@ class GenericDiffusersAdapter(RuntimeAdapter):
         del pipeline
 
     @staticmethod
+    def _has_output_items(value: Any) -> bool:
+        if value is None:
+            return False
+        try:
+            return len(value) > 0
+        except TypeError:
+            return True
+
+    @classmethod
+    def _normalize_output(
+        cls, output: Any, capability: str, values: dict[str, Any]
+    ) -> dict[str, Any]:
+        images = getattr(output, "images", None)
+        if cls._has_output_items(images):
+            return {"images": images, **values}
+
+        frames = getattr(output, "frames", None)
+        if cls._has_output_items(frames):
+            return {"frames": frames, **values}
+
+        if isinstance(output, (tuple, list)) and cls._has_output_items(output):
+            candidate = output[0] if isinstance(output, tuple) and len(output) == 1 else output
+            if cls._has_output_items(candidate):
+                key = "frames" if "VIDEO" in capability else "images"
+                return {key: candidate, **values}
+
+        raise NormalizationError(
+            "Le pipeline Diffusers n'a produit aucune image ou frame exploitable.",
+            code="OUTPUT_NORMALIZATION_FAILED",
+        )
+
+    @staticmethod
     def _prepare_pipeline_inputs(request: dict[str, Any]) -> tuple[list[Any], list[str]]:
         resolved_images = request.get("resolved_input_images") or []
         if resolved_images:
@@ -149,7 +181,4 @@ class GenericDiffusersAdapter(RuntimeAdapter):
             if key in accepted and value is not None
         }
         output = pipeline(**filtered)
-        frames = getattr(output, "frames", [])
-        if frames is not None:
-            return {"frames": frames, **values}
-        return {"images": getattr(output, "images", []), **values}
+        return self._normalize_output(output, capability, values)

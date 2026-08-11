@@ -144,6 +144,9 @@ export default function ModelsPage() {
 
   return (
     <div className={styles.page}>
+      <nav className={styles.modelNavigation} aria-label="Navigation modèles">
+        <Link className={styles.modelNavigationActive} href="/models">Catalogue</Link><Link href="/models/installed">Installés</Link><Link href="/models/cloud">Sauvegardes cloud</Link>
+      </nav>
       <header className={styles.pageHeading}>
         <div><h1>Catalogue de modèles</h1><p>Découvrez, téléchargez et installez des modèles en un clic.</p></div>
         <span className={styles.avatar}>A</span>

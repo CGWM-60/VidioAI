@@ -691,11 +691,12 @@ impl ObjectStorage for S3Storage {
                         .map_err(|error| error.to_string())?;
                 }
                 let temporary = destination.with_extension(format!(
-                    "{}.tmp",
+                    "{}.{}.tmp",
                     destination
                         .extension()
                         .and_then(|value| value.to_str())
-                        .unwrap_or("")
+                        .unwrap_or(""),
+                    Uuid::new_v4(),
                 ));
                 self.aws(&[
                     "s3api".into(),

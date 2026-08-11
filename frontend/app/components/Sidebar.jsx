@@ -13,6 +13,7 @@ import {
   BsGear,
   BsGrid1X2,
   BsHouse,
+  BsHddStack,
   BsQuestionCircle,
   BsRobot,
   BsStars,
@@ -21,6 +22,7 @@ import {
 const navigation = [
   { href: "/", label: "Accueil", icon: BsHouse },
   { href: "/models", label: "Modèles", icon: BsBox },
+  { href: "/models/installed", label: "Modèles installés", icon: BsHddStack },
   { href: "/models/cloud", label: "Sauvegardes cloud", icon: BsCloudArrowDown },
   { href: "/projects", label: "Projets", icon: BsFolder },
   { href: "/generations", label: "Générations", icon: BsRobot },

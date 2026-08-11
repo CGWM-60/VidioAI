@@ -40,6 +40,7 @@ from .resolution_resolver import ResolutionResolver
 from .config import Settings
 from .dtype_resolver import DTypeResolver, PrecisionPlan
 from .generation_progress import GenerationProgressReporter
+from .memory_planner import MemoryPlan, MemoryPlanner
 from .schemas import CompatibilityStatus, JobState, ModelState
 
 
@@ -74,6 +75,7 @@ class LoadedModel:
     capability: str | None = None
     metadata: dict[str, Any] | None = None
     precision_plan: PrecisionPlan | None = None
+    memory_plan: MemoryPlan | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +107,7 @@ class RuntimeManager:
             self.settings.runtime_dependencies_path
         )
         self._dtype_resolver = DTypeResolver()
+        self._memory_planner = MemoryPlanner()
         self._resolution_resolver = ResolutionResolver()
         self._input_normalizer = InputNormalizer(self.settings.work_dir)
         self._output_normalizer = OutputNormalizer(self.settings.work_dir)
@@ -905,6 +908,40 @@ class RuntimeManager:
     def _ram_peak_bytes() -> int:
         return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
 
+    def _memory_metrics(self) -> dict[str, int]:
+        total = 0
+        available = 0
+        process = 0
+        try:
+            values = {}
+            for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+                key, raw = line.split(":", maxsplit=1)
+                values[key] = int(raw.strip().split()[0]) * 1024
+            total = values.get("MemTotal", 0)
+            available = values.get("MemAvailable", values.get("MemFree", 0))
+            for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines():
+                if line.startswith("VmRSS:"):
+                    process = int(line.split()[1]) * 1024
+                    break
+        except (FileNotFoundError, OSError, ValueError):
+            try:
+                page_size = int(os.sysconf("SC_PAGE_SIZE"))
+                total = int(os.sysconf("SC_PHYS_PAGES")) * page_size
+                available = int(os.sysconf("SC_AVPHYS_PAGES")) * page_size
+            except (AttributeError, OSError, TypeError, ValueError):
+                pass
+            process = self._ram_peak_bytes()
+        try:
+            scratch_available = int(shutil.disk_usage(self.settings.work_dir).free)
+        except OSError:
+            scratch_available = 0
+        return {
+            "ram_total_bytes": total,
+            "ram_available_bytes": available,
+            "vidioai_ram_bytes": process,
+            "scratch_available_bytes": scratch_available,
+        }
+
     def resources(self) -> dict[str, Any]:
         gpu = self._nvidia_metrics()
         with self._lock:
@@ -916,6 +953,20 @@ class RuntimeManager:
                     "device": model.device,
                     "validation_test": model.validation_test,
                     "capability": model.capability,
+                    "precision": model.precision,
+                    "precision_plan": (
+                        model.precision_plan.as_dict()
+                        if model.precision_plan is not None
+                        else None
+                    ),
+                    "memory_plan": (
+                        model.memory_plan.as_dict()
+                        if model.memory_plan is not None
+                        else None
+                    ),
+                    "benchmark": model.load_benchmark,
+                    "pipeline_class": (model.metadata or {}).get("class_name"),
+                    "capabilities": list((model.metadata or {}).get("capabilities") or []),
                 }
                 for model in self._loaded.values()
             ]
@@ -926,6 +977,7 @@ class RuntimeManager:
             )
         return {
             "gpu": gpu,
+            "memory": self._memory_metrics(),
             "gpu_status": "available" if gpu else "unavailable",
             "worker_status": "ready" if self.runtime_status()["ready"] else "not_ready",
             "active_jobs": active_jobs,
@@ -1035,6 +1087,22 @@ class RuntimeManager:
             raise self._unsupported_pipeline_error(metadata)
 
         runtime_capabilities = list(metadata.get("capabilities") or [])
+        precision_plan = None
+        memory_plan = None
+        try:
+            torch = self._imports().torch
+            precision_plan = self._precision_plan(
+                torch, metadata, bool(torch.cuda.is_available())
+            )
+            memory_plan = self._memory_plan(
+                torch,
+                metadata,
+                resolved_capability,
+                precision_plan,
+                int(validation.get("weights_bytes") or 0),
+            )
+        except WorkerError:
+            pass
         cached = {
             **manifest,
             "model_id": model_id,
@@ -1052,6 +1120,12 @@ class RuntimeManager:
             "loaded": False,
             "ready": False,
             "state": ModelState.INSTALLED,
+            "stage": "installed",
+            "pipeline_class": metadata.get("class_name"),
+            "precision_plan": (
+                precision_plan.as_dict() if precision_plan is not None else None
+            ),
+            "memory_plan": memory_plan.as_dict() if memory_plan is not None else None,
             "runtime_dependencies": self._merge_dependency_records(
                 list(manifest.get("runtime_dependencies") or []),
                 runtime_dependencies,
@@ -1455,6 +1529,26 @@ class RuntimeManager:
             with self._lock:
                 loaded = self._loaded.get(model_id)
 
+            precision_plan = loaded.precision_plan if loaded is not None else None
+            memory_plan = loaded.memory_plan if loaded is not None else None
+            if precision_plan is None:
+                try:
+                    torch = self._imports().torch
+                    cuda_available = bool(torch.cuda.is_available())
+                    precision_plan = self._precision_plan(
+                        torch, metadata, cuda_available
+                    )
+                    memory_plan = self._memory_plan(
+                        torch,
+                        metadata,
+                        resolved_capability,
+                        precision_plan,
+                        int(validation.get("weights_bytes") or 0),
+                    )
+                except WorkerError:
+                    precision_plan = None
+                    memory_plan = None
+
             status = {
                 **manifest,
                 "downloaded": True,
@@ -1470,7 +1564,18 @@ class RuntimeManager:
                     else ModelState.INSTALLED
                 ),
                 "validation_test": loaded is not None and loaded.validation_test,
+                "device": loaded.device if loaded is not None else None,
+                "capability": resolved_capability,
+                "capabilities": list(metadata.get("capabilities") or []),
+                "pipeline_class": metadata.get("class_name"),
+                "benchmark": loaded.load_benchmark if loaded is not None else None,
+                "precision_plan": (
+                    precision_plan.as_dict() if precision_plan is not None else None
+                ),
+                "memory_plan": memory_plan.as_dict() if memory_plan is not None else None,
             }
+            with self._lock:
+                self._model_states[model_id] = dict(status)
             return status
 
         except WorkerError:
@@ -1505,6 +1610,141 @@ class RuntimeManager:
             bf16_supported=bf16_supported,
         )
 
+    def _memory_plan(
+        self,
+        torch: Any,
+        metadata: dict[str, Any],
+        capability: str,
+        precision_plan: PrecisionPlan,
+        model_bytes: int,
+        *,
+        width: int | None = None,
+        height: int | None = None,
+        frames: int | None = None,
+    ) -> MemoryPlan:
+        gpu = self._nvidia_metrics() or {}
+        total = int(gpu.get("vram_total_bytes") or 0)
+        used = int(gpu.get("vram_used_bytes") or 0)
+        if total <= 0 and torch.cuda.is_available() and hasattr(torch.cuda, "mem_get_info"):
+            try:
+                free, total = torch.cuda.mem_get_info()
+                used = max(0, int(total) - int(free))
+            except (RuntimeError, TypeError, ValueError):
+                total = 0
+                used = 0
+        profile = ModelRuntimeProfile.from_metadata(metadata, None)
+        is_video = capability in VIDEO_CAPABILITIES
+        memory = self._memory_metrics()
+        return self._memory_planner.plan(
+            vram_total_bytes=total,
+            vram_free_bytes=max(0, total - used),
+            model_bytes=max(0, int(model_bytes)),
+            ram_total_bytes=memory["ram_total_bytes"],
+            ram_available_bytes=memory["ram_available_bytes"],
+            vidioai_ram_bytes=memory["vidioai_ram_bytes"],
+            scratch_available_bytes=memory["scratch_available_bytes"],
+            disk_offload_supported=True,
+            precision=precision_plan.precision,
+            capability=capability,
+            width=int(width or profile.width),
+            height=int(height or profile.height),
+            frames=int(frames or (97 if is_video else 1)),
+        )
+
+    @staticmethod
+    def _enable_pipeline_method(pipeline: Any, method_name: str) -> bool:
+        method = getattr(pipeline, method_name, None)
+        if not callable(method):
+            return False
+        try:
+            method()
+            return True
+        except (ImportError, NotImplementedError, RuntimeError, TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _cleanup_disk_offload(pipeline: Any) -> None:
+        path = getattr(pipeline, "_vidioai_disk_offload_dir", None)
+        if path:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def _apply_memory_plan(self, pipeline: Any, plan: MemoryPlan, device: str) -> Any:
+        if not plan.feasible:
+            raise WorkerError(
+                "La VRAM disponible est insuffisante, y compris avec offload CPU.",
+                409,
+                code="INSUFFICIENT_VRAM",
+                retryable=True,
+            )
+        if device != "cuda" or plan.strategy == "CPU":
+            return pipeline
+
+        if plan.strategy == "FULL_GPU":
+            if not hasattr(pipeline, "to"):
+                raise WorkerError(
+                    "La pipeline ne permet pas son placement CUDA.",
+                    422,
+                    code="PIPELINE_UNSUPPORTED",
+                )
+            pipeline = pipeline.to("cuda")
+        elif plan.strategy == "MODEL_CPU_OFFLOAD":
+            if not self._enable_pipeline_method(pipeline, "enable_model_cpu_offload"):
+                if self._enable_pipeline_method(pipeline, "enable_sequential_cpu_offload"):
+                    plan.strategy = "SEQUENTIAL_CPU_OFFLOAD"
+                else:
+                    raise WorkerError(
+                        "VRAM insuffisante et aucun offload CPU n'est supporté par la pipeline.",
+                        409,
+                        code="INSUFFICIENT_VRAM",
+                        retryable=True,
+                    )
+        elif plan.strategy == "SEQUENTIAL_CPU_OFFLOAD" and not self._enable_pipeline_method(
+            pipeline, "enable_sequential_cpu_offload"
+        ):
+            raise WorkerError(
+                "VRAM insuffisante et offload séquentiel indisponible.",
+                409,
+                code="INSUFFICIENT_VRAM",
+                retryable=True,
+            )
+        elif plan.strategy == "DISK_OFFLOAD":
+            try:
+                from accelerate import disk_offload
+
+                offload_root = self.settings.work_dir / "offload" / str(uuid.uuid4())
+                offload_root.mkdir(parents=True, exist_ok=False)
+                offloaded = 0
+                for name in self._dtype_resolver.component_names():
+                    component = getattr(pipeline, name, None)
+                    if component is None:
+                        continue
+                    target = offload_root / name
+                    target.mkdir(parents=True, exist_ok=True)
+                    setattr(
+                        pipeline,
+                        name,
+                        disk_offload(component, target, execution_device="cuda"),
+                    )
+                    offloaded += 1
+                if offloaded == 0:
+                    raise RuntimeError("aucun composant offloadable")
+                setattr(pipeline, "_vidioai_disk_offload_dir", str(offload_root))
+            except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
+                raise WorkerError(
+                    f"Offload Scratch indisponible: {error}",
+                    409,
+                    code="INSUFFICIENT_VRAM",
+                    retryable=True,
+                ) from error
+
+        for optimization, method_name in (
+            ("VAE_SLICING", "enable_vae_slicing"),
+            ("VAE_TILING", "enable_vae_tiling"),
+        ):
+            if optimization in plan.optimizations:
+                self._enable_pipeline_method(pipeline, method_name)
+        return pipeline
+
     def _load_pipeline(
         self,
         *,
@@ -1514,6 +1754,7 @@ class RuntimeManager:
         adapter: Any,
         device: str,
         dtype: Any,
+        memory_plan: MemoryPlan,
     ) -> Any:
         pipeline = adapter.load(
             str(snapshot),
@@ -1525,8 +1766,7 @@ class RuntimeManager:
                 "capability": capability,
             },
         )
-        if device == "cuda" and hasattr(pipeline, "to"):
-            pipeline = pipeline.to(device)
+        pipeline = self._apply_memory_plan(pipeline, memory_plan, device)
         capability_sets = CapabilityResolver().describe(metadata, pipeline)
         resolved_capabilities = capability_sets["runtime_capabilities"]
         if resolved_capabilities:
@@ -1644,6 +1884,11 @@ class RuntimeManager:
 
     def load_model(self, model_id: str) -> dict[str, Any]:
         model_id = self._safe_segment(model_id)
+        with self._lock:
+            existing = self._loaded.get(model_id)
+            current = self._model_states.get(model_id)
+            if existing is not None and existing.pipeline is not None and current is not None:
+                return dict(current)
         self._log_model_state(model_id, "INSTALLED", "LOADING")
         snapshot, pointer = self._active_snapshot(model_id)
         validation = self.validate_snapshot(snapshot)
@@ -1704,9 +1949,49 @@ class RuntimeManager:
             raise self._unsupported_pipeline_error(metadata, capability)
 
         device = "cuda" if cuda_available else "cpu"
+        with self._lock:
+            self._model_states[model_id]["stage"] = "resolving_precision"
         precision_plan = self._precision_plan(torch, metadata, cuda_available)
         dtype = self._dtype_resolver.materialize(torch, precision_plan)
         precision = precision_plan.precision
+        with self._lock:
+            self._model_states[model_id]["stage"] = "planning_memory"
+        memory_plan = self._memory_plan(
+            torch,
+            metadata,
+            capability,
+            precision_plan,
+            int(validation.get("weights_bytes") or 0),
+        )
+        if not memory_plan.feasible:
+            status = {
+                "model_id": model_id,
+                "state": ModelState.INSTALLED,
+                "stage": "memory_rejected",
+                "installed": True,
+                "weights_valid": True,
+                "runtime_available": True,
+                "runtime_compatible": True,
+                "loaded": False,
+                "ready": False,
+                "memory_plan": memory_plan.as_dict(),
+                "error_code": "INSUFFICIENT_VRAM",
+                "error": "Chargement impossible : VRAM insuffisante.",
+            }
+            with self._lock:
+                self._model_states[model_id] = status
+            raise WorkerError(
+                status["error"],
+                409,
+                code="INSUFFICIENT_VRAM",
+                retryable=True,
+            )
+        with self._lock:
+            self._model_states[model_id].update(
+                stage="loading_pipeline",
+                precision_plan=precision_plan.as_dict(),
+                memory_plan=memory_plan.as_dict(),
+            )
         gpu_before = self._nvidia_metrics()
         load_started = time.perf_counter()
         if cuda_available:
@@ -1721,6 +2006,7 @@ class RuntimeManager:
                     adapter=adapter,
                     device=device,
                     dtype=dtype,
+                    memory_plan=memory_plan,
                 ),
                 self._dependency_installer,
             )
@@ -1732,13 +2018,9 @@ class RuntimeManager:
                 snapshot, manifest, runtime_dependencies
             )
         except Exception as error:
-            code = (
-                error.code
-                if isinstance(
-                    error, (PipelineResolutionError, DependencyResolutionError)
-                )
-                else "LOAD_FAILED"
-            )
+            code = error.code if isinstance(
+                error, (WorkerError, PipelineResolutionError, DependencyResolutionError)
+            ) else "LOAD_FAILED"
             self._log_model_state(model_id, "LOADING", "FAILED", reason=code)
             status = {
                 "model_id": model_id,
@@ -1807,8 +2089,13 @@ class RuntimeManager:
             "batch": 1,
             "attention_implementation": None,
             "vae_tiling": bool(getattr(pipeline, "vae_tiling", False)),
-            "cpu_offload": False,
-            "model_offload": False,
+            "cpu_offload": memory_plan.strategy in {
+                "MODEL_CPU_OFFLOAD",
+                "SEQUENTIAL_CPU_OFFLOAD",
+            },
+            "model_offload": memory_plan.strategy == "MODEL_CPU_OFFLOAD",
+            "disk_offload": memory_plan.strategy == "DISK_OFFLOAD",
+            "memory_strategy": memory_plan.strategy,
             "inference_seconds": time.perf_counter() - load_started,
         }
 
@@ -1825,6 +2112,7 @@ class RuntimeManager:
             capability=capability,
             metadata=metadata,
             precision_plan=precision_plan,
+            memory_plan=memory_plan,
         )
         precision_plan.components = self._dtype_resolver.inspect_components(pipeline)
         status = {
@@ -1848,6 +2136,9 @@ class RuntimeManager:
             "benchmark": load_benchmark,
             "runtime_dependencies": runtime_dependencies,
             "precision_plan": precision_plan.as_dict(),
+            "memory_plan": memory_plan.as_dict(),
+            "memory_strategy": memory_plan.strategy,
+            "stage": "ready",
         }
         with self._lock:
             self._loaded[model_id] = loaded
@@ -1858,8 +2149,17 @@ class RuntimeManager:
     def unload_model(self, model_id: str) -> dict[str, Any]:
         model_id = self._safe_segment(model_id)
         with self._lock:
+            current = dict(self._model_states.get(model_id) or {})
+            self._model_states[model_id] = {
+                **current,
+                "model_id": model_id,
+                "state": ModelState.UNLOADING,
+                "stage": "releasing_pipeline",
+                "ready": False,
+            }
             loaded = self._loaded.pop(model_id, None)
         if loaded is not None:
+            self._cleanup_disk_offload(loaded.pipeline)
             del loaded.pipeline
             gc.collect()
             try:
@@ -1925,6 +2225,13 @@ class RuntimeManager:
             loaded.device == "cuda",
         )
         dtype = self._dtype_resolver.materialize(torch, precision_plan)
+        memory_plan = self._memory_plan(
+            torch,
+            metadata,
+            requested_capability,
+            precision_plan,
+            loaded.memory_plan.model_bytes if loaded.memory_plan is not None else 0,
+        )
         try:
             pipeline = self._load_pipeline(
                 snapshot=snapshot,
@@ -1933,6 +2240,7 @@ class RuntimeManager:
                 adapter=adapter,
                 device=loaded.device,
                 dtype=dtype,
+                memory_plan=memory_plan,
             )
         except Exception as error:
             with self._lock:
@@ -1965,6 +2273,7 @@ class RuntimeManager:
         precision_plan.components = self._dtype_resolver.inspect_components(pipeline)
         loaded.precision_plan = precision_plan
         loaded.precision = precision_plan.precision
+        loaded.memory_plan = memory_plan
         return adapter
 
     def _output_path(self, relative_path: str) -> Path:
@@ -2007,6 +2316,13 @@ class RuntimeManager:
         if loaded.device == "cuda" and torch.cuda.is_available():
             torch.cuda.empty_cache()
         try:
+            memory_plan = self._memory_plan(
+                torch,
+                loaded.metadata or {},
+                requested_capability,
+                replacement,
+                loaded.memory_plan.model_bytes if loaded.memory_plan is not None else 0,
+            )
             loaded.pipeline = self._load_pipeline(
                 snapshot=snapshot,
                 metadata=loaded.metadata or {},
@@ -2014,6 +2330,7 @@ class RuntimeManager:
                 adapter=adapter,
                 device=loaded.device,
                 dtype=self._dtype_resolver.materialize(torch, replacement),
+                memory_plan=memory_plan,
             )
         except Exception as recovery_error:
             raise WorkerError(
@@ -2025,6 +2342,90 @@ class RuntimeManager:
         replacement.components = self._dtype_resolver.inspect_components(loaded.pipeline)
         loaded.precision_plan = replacement
         loaded.precision = replacement.precision
+        loaded.memory_plan = memory_plan
+
+    @staticmethod
+    def _is_cuda_oom(error: BaseException) -> bool:
+        return "cuda out of memory" in f"{type(error).__name__}: {error}".lower()
+
+    def _release_pipeline_after_oom(self, loaded: LoadedModel) -> None:
+        pipeline = loaded.pipeline
+        loaded.pipeline = None
+        with self._lock:
+            self._loaded.pop(loaded.model_id, None)
+            self._model_states[loaded.model_id] = {
+                "model_id": loaded.model_id,
+                "repository": loaded.repository,
+                "revision": loaded.revision,
+                "state": ModelState.INSTALLED,
+                "stage": "cuda_memory_released",
+                "installed": True,
+                "weights_valid": True,
+                "runtime_available": True,
+                "runtime_compatible": True,
+                "loaded": False,
+                "ready": False,
+                "error_code": "INSUFFICIENT_VRAM",
+                "error": "La pipeline a été libérée après épuisement de la VRAM.",
+            }
+        if pipeline is not None:
+            self._cleanup_disk_offload(pipeline)
+            del pipeline
+        gc.collect()
+        try:
+            torch = self._imports().torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except WorkerError:
+            pass
+
+    def _adapt_memory_plan_for_request(
+        self,
+        loaded: LoadedModel,
+        prepared_request: dict[str, Any],
+        capability: str,
+        torch: Any,
+    ) -> None:
+        if loaded.device != "cuda" or loaded.precision_plan is None:
+            return
+        model_bytes = loaded.memory_plan.model_bytes if loaded.memory_plan is not None else 0
+        request_plan = self._memory_plan(
+            torch,
+            loaded.metadata or {},
+            capability,
+            loaded.precision_plan,
+            0,
+            width=int(prepared_request.get("width") or 1024),
+            height=int(prepared_request.get("height") or 1024),
+            frames=int(prepared_request.get("frames") or 1),
+        )
+        request_plan.model_bytes = model_bytes
+        if not request_plan.feasible:
+            raise WorkerError(
+                "Chargement impossible : VRAM insuffisante pour cette résolution et ce nombre de frames.",
+                409,
+                code="INSUFFICIENT_VRAM",
+                retryable=True,
+            )
+        ranks = {
+            "FULL_GPU": 0,
+            "MODEL_CPU_OFFLOAD": 1,
+            "SEQUENTIAL_CPU_OFFLOAD": 2,
+            "DISK_OFFLOAD": 3,
+        }
+        current_strategy = loaded.memory_plan.strategy if loaded.memory_plan is not None else "FULL_GPU"
+        if ranks.get(request_plan.strategy, 0) > ranks.get(current_strategy, 0):
+            if hasattr(loaded.pipeline, "to"):
+                loaded.pipeline.to("cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
+            loaded.pipeline = self._apply_memory_plan(
+                loaded.pipeline, request_plan, loaded.device
+            )
+            loaded.memory_plan = request_plan
+            loaded.load_benchmark["memory_strategy"] = request_plan.strategy
+            loaded.load_benchmark["cpu_offload"] = request_plan.strategy != "DISK_OFFLOAD"
+            loaded.load_benchmark["disk_offload"] = request_plan.strategy == "DISK_OFFLOAD"
 
     def _generate_with_adapter(
         self,
@@ -2098,6 +2499,9 @@ class RuntimeManager:
         )
 
         torch = self._imports().torch
+        self._adapt_memory_plan_for_request(
+            loaded, prepared_request, requested_capability, torch
+        )
         generation_started = time.perf_counter()
         if loaded.device == "cuda":
             torch.cuda.reset_peak_memory_stats()
@@ -2127,13 +2531,32 @@ class RuntimeManager:
                     ) from retry_error
                 raise
         except Exception as error:
+            if self._is_cuda_oom(error):
+                self._release_pipeline_after_oom(loaded)
+                raise WorkerError(
+                    "VRAM insuffisante pendant l'inférence ; ressources CUDA libérées.",
+                    409,
+                    code="INSUFFICIENT_VRAM",
+                    retryable=True,
+                ) from error
             self._recover_dtype_pipeline(
                 loaded,
                 requested_capability,
                 adapter,
                 error,
             )
-            output = adapter.generate(loaded.pipeline, runtime, prepared_request)
+            try:
+                output = adapter.generate(loaded.pipeline, runtime, prepared_request)
+            except Exception as retry_error:
+                if self._is_cuda_oom(retry_error):
+                    self._release_pipeline_after_oom(loaded)
+                    raise WorkerError(
+                        "VRAM insuffisante pendant la récupération dtype ; ressources CUDA libérées.",
+                        409,
+                        code="INSUFFICIENT_VRAM",
+                        retryable=True,
+                    ) from retry_error
+                raise
         if cancel_event.is_set():
             raise InterruptedError("Job annulé.")
 
@@ -2169,6 +2592,43 @@ class RuntimeManager:
         width = int(media_probe.get("width") or output.get("width") or prepared_request.get("width") or 512)
         height = int(media_probe.get("height") or output.get("height") or prepared_request.get("height") or 512)
 
+        benchmark = {
+            **loaded.load_benchmark,
+            "vram_after_load_bytes": int(
+                loaded.load_benchmark.get("vram_after_load_bytes", 0)
+            ),
+            "vram_peak_bytes": observed_peak,
+            "ram_peak_bytes": self._ram_peak_bytes(),
+            "precision": loaded.precision,
+            "precision_plan": (
+                loaded.precision_plan.as_dict()
+                if loaded.precision_plan is not None
+                else None
+            ),
+            "memory_plan": (
+                loaded.memory_plan.as_dict()
+                if loaded.memory_plan is not None
+                else None
+            ),
+            "resolution_width": width,
+            "resolution_height": height,
+            "frames": media_probe.get("frames"),
+            "duration_seconds": media_probe.get("duration"),
+            "fps": media_probe.get("fps"),
+            "batch": 1,
+            "inference_seconds": time.perf_counter() - generation_started,
+        }
+        loaded.load_benchmark = benchmark
+        with self._lock:
+            current = self._model_states.get(loaded.model_id)
+            if current is not None:
+                current["benchmark"] = benchmark
+                current["memory_plan"] = (
+                    loaded.memory_plan.as_dict()
+                    if loaded.memory_plan is not None
+                    else None
+                )
+
         return {
             "job_id": job_id,
             "state": JobState.COMPLETED,
@@ -2183,27 +2643,7 @@ class RuntimeManager:
             "actual_fps": media_probe.get("fps") if is_video_request else None,
             "actual_frames": media_probe.get("frames") if is_video_request else None,
             "sha256": self._sha256(output_path),
-            "benchmark": {
-                **loaded.load_benchmark,
-                "vram_after_load_bytes": int(
-                    loaded.load_benchmark.get("vram_after_load_bytes", 0)
-                ),
-                "vram_peak_bytes": observed_peak,
-                "ram_peak_bytes": self._ram_peak_bytes(),
-                "precision": loaded.precision,
-                "precision_plan": (
-                    loaded.precision_plan.as_dict()
-                    if loaded.precision_plan is not None
-                    else None
-                ),
-                "resolution_width": width,
-                "resolution_height": height,
-                "frames": media_probe.get("frames"),
-                "duration_seconds": media_probe.get("duration"),
-                "fps": media_probe.get("fps"),
-                "batch": 1,
-                "inference_seconds": time.perf_counter() - generation_started,
-            },
+            "benchmark": benchmark,
         }
 
     def generate_image(self, request: dict[str, Any]) -> dict[str, Any]:

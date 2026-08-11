@@ -70,6 +70,46 @@
 .successBanner { color: #baf9d3; background: rgba(34, 148, 91, .15); border: 1px solid rgba(52, 211, 153, .28); }
 .stateCard { display: grid; place-items: center; min-height: 280px; gap: 12px; color: #a9b2c3; border: 1px solid var(--border); border-radius: 14px; background: rgba(12, 24, 41, .8); }
 
+.modelNavigation { display: inline-flex; gap: 4px; margin-bottom: 22px; padding: 4px; border: 1px solid var(--border); border-radius: 10px; background: rgba(5, 14, 28, .76); }
+.modelNavigation a { padding: 9px 14px; color: #9ca8ba; border-radius: 7px; font-size: 12px; font-weight: 650; }
+.modelNavigation .modelNavigationActive { color: #fff; background: rgba(124, 75, 226, .35); }
+.headingActions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 10px; }
+.cloudSummary, .installedSummary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 20px; }
+.cloudSummary > div, .installedSummary > div { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 4px 10px; min-height: 74px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 11px; background: rgba(12, 24, 41, .82); }
+.cloudSummary strong, .installedSummary strong { font-size: 18px; }
+.cloudSummary span, .installedSummary span { grid-column: 1 / -1; color: #8390a4; font-size: 11px; }
+.installedSummary svg { color: #a779ff; }
+.cloudGrid, .installedGrid, .restoreJobs { display: grid; gap: 12px; }
+.cloudGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.cloudCard, .installedCard, .restoreJob { display: grid; gap: 15px; padding: 18px; border: 1px solid rgba(151, 166, 192, .19); border-radius: 13px; background: linear-gradient(145deg, rgba(17, 28, 47, .94), rgba(9, 19, 34, .92)); }
+.cloudCardSelected, .installedCardFocused { border-color: rgba(151, 100, 255, .75); box-shadow: 0 0 0 1px rgba(151, 100, 255, .24); }
+.cloudCardHeading, .restoreJobHeading, .installedCardHeading > div { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.cloudCardHeading label { display: flex; align-items: center; min-width: 0; gap: 10px; font-weight: 700; }
+.cloudCardHeading label span { overflow: hidden; text-overflow: ellipsis; }
+.cloudCardHeading > svg { color: #9e71ff; }
+.compactDetails, .installedDetails { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px 18px; margin: 0; }
+.compactDetails > div, .installedDetails > div { display: grid; gap: 4px; padding-bottom: 8px; border-bottom: 1px solid rgba(151, 166, 192, .1); }
+.compactDetails dt, .installedDetails dt { color: #7f8ca0; font-size: 10px; }
+.compactDetails dd, .installedDetails dd { margin: 0; overflow-wrap: anywhere; color: #d8dde6; font-size: 12px; }
+.restoreJobs { margin-bottom: 18px; }
+.restoreJob { background: rgba(14, 27, 45, .95); }
+.restoreJobFailed { border-color: rgba(251, 113, 133, .45); background: rgba(91, 25, 40, .25); }
+.restoreJobCompleted { border-color: rgba(52, 211, 153, .35); }
+.restoreJobHeading > div { display: grid; gap: 4px; }
+.restoreJobHeading span, .restoreMetrics { color: #8996aa; font-size: 11px; }
+.restoreProgress { height: 7px; overflow: hidden; border-radius: 99px; background: #273449; }
+.restoreProgress span { display: block; height: 100%; background: linear-gradient(90deg, #7542e6, #a476ff); }
+.restoreMetrics { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 18px; }
+.restoreError { display: grid; gap: 8px; color: #ffd2da; }
+.restoreError span { font-size: 12px; }
+.installedCard { scroll-margin-top: 24px; }
+.installedCardHeading { display: grid; gap: 7px; }
+.installedCardHeading h2 { margin: 0; font-size: 17px; }
+.installedCardHeading small { color: #9c88d7; }
+.installedDetails { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.neutralPill { display: inline-flex; padding: 5px 9px; color: #c4ccda; background: rgba(113, 128, 153, .15); border-radius: 6px; font-size: 11px; }
+.inlineRuntimeError { padding: 10px 12px; color: #ffd2da; border: 1px solid rgba(251, 113, 133, .25); border-radius: 8px; background: rgba(115, 29, 48, .18); font-size: 12px; }
+
 /* Catalogue ---------------------------------------------------------------- */
 
 .catalogToolbar { display: grid; grid-template-columns: minmax(250px, 1fr) auto auto auto; align-items: center; gap: 12px; margin-bottom: 24px; }
@@ -366,6 +406,7 @@
    trop étroit pour quatre colonnes. On replie alors les actions afin d'éviter
    toute barre de défilement horizontale. */
 @media (max-width: 1400px) {
+  .cloudSummary, .installedSummary { grid-template-columns: 1fr 1fr; }
   .catalogToolbar { grid-template-columns: 1fr; }
   .filterTabs { overflow-x: auto; }
   .modelRow { grid-template-columns: 190px 1fr; }
@@ -384,6 +425,11 @@
 @media (max-width: 720px) {
   .page { padding: 22px 16px 30px; }
   .pageHeading { flex-direction: column; }
+  .modelNavigation { display: flex; overflow-x: auto; }
+  .headingActions { justify-content: stretch; }
+  .headingActions button { flex: 1; }
+  .cloudSummary, .installedSummary, .cloudGrid { grid-template-columns: 1fr; }
+  .compactDetails, .installedDetails { grid-template-columns: 1fr; }
   .modelRow { grid-template-columns: 1fr; }
   .modelArtwork { height: 150px; }
   .modelSize,
