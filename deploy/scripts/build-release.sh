@@ -9,17 +9,6 @@ VERSION=${1:?Usage: build-release.sh <version-immuable>}
 REGISTRY=${VIDIOAI_REGISTRY:?VIDIOAI_REGISTRY requis}
 PLATFORM=${VIDIOAI_PLATFORM:-linux/amd64}
 
-for command_name in ffmpeg ffprobe; do
-  if ! command -v "${command_name}" >/dev/null 2>&1; then
-    echo "Dépendance média requise absente: ${command_name}" >&2
-    exit 1
-  fi
-done
-if ! ffmpeg -hide_banner -encoders 2>/dev/null | grep 'libx264' >/dev/null; then
-  echo "L'encodeur H.264 libx264 est requis pour tester et publier le Worker." >&2
-  exit 1
-fi
-
 if [[ "${VERSION}" == "latest" || ! "${VERSION}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]+$ ]]; then
   echo "Version immuable invalide: ${VERSION}" >&2
   exit 1
@@ -35,8 +24,7 @@ cargo test --manifest-path host-agent/Cargo.toml --locked
 npm --prefix frontend ci
 npm --prefix frontend run lint
 npm --prefix frontend run build
-python -m pip install --disable-pip-version-check -r worker/requirements-test.txt
-python -m pytest -q worker
+bash deploy/scripts/test-worker.sh
 bash deploy/tests/test-s3-paths.sh
 if [[ "${VIDIOAI_RUN_COMPOSE_TESTS:-true}" == "true" ]]; then
   bash deploy/tests/test-compose-orchestration.sh
@@ -65,7 +53,7 @@ docker run --rm --platform "${PLATFORM}" \
   -w /src rust:1.96-bookworm \
   sh -c 'cargo build --release --locked && cp /tmp/vidioai-host-agent-target/release/vidioai-host-agent /out/'
 cp deploy/systemd/vidioai-host-agent.service "${RELEASE_DIR}/deploy/systemd/"
-cp deploy/scripts/{bootstrap-server,deploy,rollback,smoke-test,shutdown,preflight,gpu-acceptance}.sh "${RELEASE_DIR}/deploy/scripts/"
+cp deploy/scripts/{bootstrap-server,deploy,rollback,smoke-test,shutdown,preflight,gpu-acceptance,test-worker}.sh "${RELEASE_DIR}/deploy/scripts/"
 
 # Les digests sont capturés après publication afin que l'audit puisse relier un
 # tag lisible aux couches exactes tirées par Docker.
