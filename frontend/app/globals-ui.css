@@ -1,0 +1,1293 @@
+/* ============================================================
+   VIDIOAI — UI COMPONENTS
+   À ajouter à la fin de app/globals.css
+   ============================================================ */
+
+
+/* ============================================================
+   FIELDS
+   ============================================================ */
+
+.vidio-field {
+  width: 100%;
+}
+
+.vidio-label {
+  display: block;
+  margin-bottom: 8px;
+
+  color: var(--foreground);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.vidio-field-help,
+.vidio-field-error {
+  margin-top: 7px;
+  font-size: 12px;
+}
+
+.vidio-field-help {
+  color: var(--foreground-muted);
+}
+
+.vidio-field-error {
+  color: var(--danger);
+}
+
+.vidio-input-wrapper,
+.vidio-select-wrapper,
+.vidio-textarea-wrapper {
+  position: relative;
+}
+
+.vidio-input-wrapper,
+.vidio-select-wrapper {
+  display: flex;
+  align-items: center;
+}
+
+.vidio-input {
+  width: 100%;
+  min-height: 44px;
+
+  padding: 0 13px;
+
+  color: var(--foreground);
+
+  background:
+    linear-gradient(
+      180deg,
+      rgba(5, 14, 29, 0.92),
+      rgba(5, 16, 32, 0.92)
+    );
+
+  border: 1px solid var(--border);
+  border-radius: 9px;
+
+  transition:
+    border-color 150ms ease,
+    box-shadow 150ms ease,
+    background 150ms ease;
+}
+
+.vidio-input:hover,
+.vidio-select:hover,
+.vidio-textarea:hover {
+  border-color: var(--border-hover);
+}
+
+.vidio-input:focus,
+.vidio-select:focus,
+.vidio-textarea:focus {
+  outline: none;
+
+  border-color: rgba(129, 72, 245, 0.72);
+
+  box-shadow:
+    0 0 0 3px rgba(129, 72, 245, 0.09);
+}
+
+.vidio-input-icon {
+  position: absolute;
+  left: 13px;
+
+  z-index: 2;
+
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+
+  color: var(--foreground-muted);
+
+  pointer-events: none;
+}
+
+.vidio-input-with-icon,
+.vidio-select-with-icon {
+  padding-left: 39px !important;
+}
+
+.vidio-input-right {
+  position: absolute;
+  right: 10px;
+
+  display: flex;
+  align-items: center;
+}
+
+.vidio-input-wrapper-error .vidio-input,
+.vidio-input-wrapper-error .vidio-select,
+.vidio-input-wrapper-error .vidio-textarea {
+  border-color: rgba(251, 113, 133, 0.65);
+}
+
+
+/* ============================================================
+   TEXTAREA
+   ============================================================ */
+
+.vidio-textarea {
+  width: 100%;
+  min-height: 120px;
+
+  padding: 13px 14px 34px;
+
+  color: var(--foreground);
+
+  background:
+    linear-gradient(
+      180deg,
+      rgba(5, 14, 29, 0.92),
+      rgba(5, 16, 32, 0.92)
+    );
+
+  border: 1px solid var(--border);
+  border-radius: 10px;
+
+  resize: vertical;
+}
+
+.vidio-textarea-counter {
+  position: absolute;
+  right: 12px;
+  bottom: 10px;
+
+  color: var(--foreground-muted);
+
+  font-size: 11px;
+}
+
+
+/* ============================================================
+   SELECT
+   ============================================================ */
+
+.vidio-select {
+  width: 100%;
+  min-height: 44px;
+
+  padding: 0 38px 0 13px;
+
+  color: var(--foreground);
+
+  background-color: rgba(5, 14, 29, 0.94);
+
+  border: 1px solid var(--border);
+  border-radius: 9px;
+
+  cursor: pointer;
+}
+
+
+/* ============================================================
+   BUTTONS
+   ============================================================ */
+
+.vidio-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+
+  border-radius: 9px;
+
+  font-weight: 600;
+
+  transition:
+    transform 150ms ease,
+    filter 150ms ease,
+    border-color 150ms ease,
+    background 150ms ease,
+    box-shadow 150ms ease;
+}
+
+.vidio-button-sm {
+  min-height: 34px;
+  padding: 0 12px;
+  font-size: 12px;
+}
+
+.vidio-button-md {
+  min-height: 42px;
+  padding: 0 17px;
+  font-size: 13px;
+}
+
+.vidio-button-lg {
+  min-height: 50px;
+  padding: 0 22px;
+  font-size: 15px;
+}
+
+.vidio-button-primary {
+  color: white;
+
+  border: 1px solid rgba(145, 92, 248, 0.35);
+
+  background:
+    linear-gradient(
+      135deg,
+      #8d4df6,
+      #6734db
+    );
+
+  box-shadow:
+    0 10px 30px rgba(103, 52, 219, 0.18);
+}
+
+.vidio-button-primary:hover:not(:disabled) {
+  color: white;
+  filter: brightness(1.08);
+
+  box-shadow:
+    0 12px 35px rgba(103, 52, 219, 0.29);
+}
+
+.vidio-button-secondary {
+  color: var(--foreground);
+
+  background:
+    rgba(15, 28, 47, 0.75);
+
+  border: 1px solid var(--border);
+}
+
+.vidio-button-secondary:hover:not(:disabled) {
+  color: white;
+
+  background:
+    rgba(23, 40, 65, 0.92);
+
+  border-color: var(--border-hover);
+}
+
+.vidio-button-danger {
+  color: white;
+
+  background:
+    linear-gradient(
+      135deg,
+      rgba(225, 72, 100, 0.95),
+      rgba(180, 48, 78, 0.96)
+    );
+
+  border: 1px solid rgba(251, 113, 133, 0.27);
+}
+
+.vidio-button-ghost {
+  color: var(--foreground-secondary);
+
+  background: transparent;
+
+  border: 1px solid transparent;
+}
+
+.vidio-button-ghost:hover:not(:disabled) {
+  color: white;
+
+  background: rgba(255, 255, 255, 0.05);
+
+  border-color: var(--border);
+}
+
+.vidio-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.vidio-button:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+
+/* ============================================================
+   TOGGLE
+   ============================================================ */
+
+.vidio-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.vidio-toggle-copy {
+  min-width: 0;
+}
+
+.vidio-toggle-label {
+  color: var(--foreground);
+
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.vidio-toggle-description {
+  margin-top: 3px;
+
+  color: var(--foreground-muted);
+
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.switch {
+  position: relative;
+
+  width: 43px;
+  height: 24px;
+
+  flex: 0 0 43px;
+
+  padding: 0;
+
+  background: #273349;
+
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 999px;
+
+  transition:
+    background 180ms ease,
+    box-shadow 180ms ease;
+}
+
+.switch::after {
+  content: "";
+
+  position: absolute;
+
+  top: 2px;
+  left: 2px;
+
+  width: 18px;
+  height: 18px;
+
+  background: #d7dce5;
+
+  border-radius: 50%;
+
+  box-shadow:
+    0 2px 8px rgba(0, 0, 0, 0.3);
+
+  transition:
+    transform 180ms ease,
+    background 180ms ease;
+}
+
+.switch-active {
+  background:
+    linear-gradient(
+      90deg,
+      #7138e2,
+      #925cf8
+    );
+
+  box-shadow:
+    0 0 16px rgba(129, 72, 245, 0.18);
+}
+
+.switch-active::after {
+  transform: translateX(19px);
+  background: white;
+}
+
+.switch:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+
+/* ============================================================
+   TABS
+   ============================================================ */
+
+.vidio-tabs {
+  display: inline-flex;
+
+  padding: 3px;
+
+  background:
+    rgba(4, 14, 29, 0.7);
+
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.vidio-tabs-fluid {
+  display: flex;
+  width: 100%;
+}
+
+.vidio-tabs-fluid .vidio-tab {
+  flex: 1;
+}
+
+.vidio-tab {
+  position: relative;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+
+  min-height: 40px;
+
+  padding: 0 16px;
+
+  color: var(--foreground-secondary);
+
+  background: transparent;
+
+  border: 0;
+  border-radius: 8px;
+
+  transition:
+    color 150ms ease,
+    background 150ms ease,
+    box-shadow 150ms ease;
+}
+
+.vidio-tab:hover {
+  color: white;
+}
+
+.vidio-tab-active {
+  color: white;
+
+  background:
+    linear-gradient(
+      135deg,
+      rgba(126, 71, 236, 0.5),
+      rgba(82, 48, 157, 0.36)
+    );
+
+  box-shadow:
+    inset 0 0 0 1px rgba(145, 99, 246, 0.28),
+    0 8px 20px rgba(70, 38, 145, 0.14);
+}
+
+.vidio-tab-text {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+}
+
+.vidio-tab-text small {
+  color: var(--foreground-muted);
+
+  font-size: 10px;
+}
+
+.vidio-tab-active .vidio-tab-text small {
+  color: #c8b5ff;
+}
+
+.vidio-tab-check {
+  position: absolute;
+
+  top: 7px;
+  right: 8px;
+
+  display: grid;
+  place-items: center;
+
+  width: 17px;
+  height: 17px;
+
+  color: white;
+
+  background: #8b52f5;
+
+  border-radius: 50%;
+
+  font-size: 10px;
+}
+
+
+/* ============================================================
+   CARD
+   ============================================================ */
+
+.vidio-card {
+  background:
+    linear-gradient(
+      145deg,
+      rgba(14, 28, 47, 0.82),
+      rgba(8, 20, 36, 0.82)
+    );
+
+  border: 1px solid var(--border);
+  border-radius: 12px;
+
+  transition:
+    transform 160ms ease,
+    border-color 160ms ease,
+    background 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.vidio-card-interactive {
+  cursor: pointer;
+}
+
+.vidio-card-interactive:hover {
+  transform: translateY(-1px);
+
+  border-color: var(--border-hover);
+
+  background:
+    linear-gradient(
+      145deg,
+      rgba(18, 35, 58, 0.93),
+      rgba(11, 25, 44, 0.93)
+    );
+}
+
+.vidio-card-selected {
+  border-color: rgba(129, 72, 245, 0.5);
+
+  box-shadow:
+    inset 0 0 0 1px rgba(129, 72, 245, 0.18),
+    0 0 24px rgba(129, 72, 245, 0.08);
+}
+
+
+/* ============================================================
+   PANEL
+   ============================================================ */
+
+.vidio-panel {
+  background:
+    linear-gradient(
+      145deg,
+      rgba(14, 28, 47, 0.88),
+      rgba(8, 20, 36, 0.87)
+    );
+
+  border: 1px solid var(--border);
+  border-radius: 14px;
+
+  box-shadow:
+    0 16px 50px rgba(0, 0, 0, 0.14);
+}
+
+.vidio-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+
+  padding: 18px 20px;
+
+  border-bottom: 1px solid var(--border);
+}
+
+.vidio-panel-icon {
+  display: grid;
+  place-items: center;
+
+  width: 34px;
+  height: 34px;
+
+  color: var(--primary-light);
+
+  background: rgba(129, 72, 245, 0.1);
+
+  border: 1px solid rgba(129, 72, 245, 0.16);
+  border-radius: 10px;
+}
+
+.vidio-panel-title {
+  margin: 0;
+
+  color: var(--foreground);
+
+  font-size: 16px;
+  font-weight: 650;
+}
+
+.vidio-panel-subtitle {
+  margin: 4px 0 0;
+
+  color: var(--foreground-muted);
+
+  font-size: 12px;
+}
+
+.vidio-panel-body {
+  padding: 20px;
+}
+
+
+/* ============================================================
+   BADGE
+   ============================================================ */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+
+  min-height: 23px;
+
+  padding: 0 8px;
+
+  border-radius: 999px;
+
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.badge-purple {
+  color: #d7c6ff;
+  background: rgba(129, 72, 245, 0.15);
+  border: 1px solid rgba(129, 72, 245, 0.22);
+}
+
+.badge-green {
+  color: #78e7b8;
+  background: rgba(52, 211, 153, 0.11);
+  border: 1px solid rgba(52, 211, 153, 0.17);
+}
+
+.badge-red {
+  color: #ff9daf;
+  background: rgba(251, 113, 133, 0.11);
+  border: 1px solid rgba(251, 113, 133, 0.17);
+}
+
+.badge-warning {
+  color: #ffd875;
+  background: rgba(251, 191, 36, 0.1);
+  border: 1px solid rgba(251, 191, 36, 0.18);
+}
+
+.badge-info {
+  color: #9ac7ff;
+  background: rgba(96, 165, 250, 0.1);
+  border: 1px solid rgba(96, 165, 250, 0.18);
+}
+
+.badge-gray {
+  color: #bec6d2;
+  background: rgba(148, 163, 184, 0.08);
+  border: 1px solid rgba(148, 163, 184, 0.14);
+}
+
+.vidio-badge-dot {
+  width: 6px;
+  height: 6px;
+
+  margin-right: 5px;
+
+  background: currentColor;
+
+  border-radius: 50%;
+}
+
+
+/* ============================================================
+   PROGRESS BAR
+   ============================================================ */
+
+.vidio-progress-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+
+  margin-bottom: 9px;
+
+  color: var(--foreground-secondary);
+
+  font-size: 12px;
+}
+
+.progress-track {
+  width: 100%;
+
+  overflow: hidden;
+
+  background: rgba(255, 255, 255, 0.075);
+
+  border-radius: 999px;
+}
+
+.progress-track-sm {
+  height: 4px;
+}
+
+.progress-track-md {
+  height: 7px;
+}
+
+.progress-track-lg {
+  height: 10px;
+}
+
+.progress-value {
+  height: 100%;
+
+  border-radius: inherit;
+
+  background:
+    linear-gradient(
+      90deg,
+      #7140e8,
+      #925cf8
+    );
+
+  box-shadow:
+    0 0 14px rgba(129, 72, 245, 0.42);
+
+  transition: width 260ms ease;
+}
+
+
+/* ============================================================
+   CIRCULAR PROGRESS
+   ============================================================ */
+
+.vidio-circular-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.vidio-circular-progress {
+  position: relative;
+
+  display: grid;
+  place-items: center;
+}
+
+.vidio-circular-progress svg {
+  position: absolute;
+  inset: 0;
+
+  transform: rotate(-90deg);
+}
+
+.vidio-circular-progress circle {
+  fill: none;
+}
+
+.vidio-circular-track {
+  stroke: rgba(255, 255, 255, 0.075);
+}
+
+.vidio-circular-value {
+  stroke: #8c52f7;
+  stroke-linecap: round;
+
+  filter:
+    drop-shadow(0 0 5px rgba(129, 72, 245, 0.55));
+
+  transition:
+    stroke-dashoffset 280ms ease;
+}
+
+.vidio-circular-center {
+  position: relative;
+  z-index: 2;
+
+  display: flex;
+  align-items: baseline;
+}
+
+.vidio-circular-center strong {
+  color: white;
+
+  font-size: clamp(30px, 5vw, 55px);
+  font-weight: 700;
+}
+
+.vidio-circular-label {
+  margin-top: 20px;
+
+  color: var(--foreground);
+
+  font-size: 18px;
+  font-weight: 650;
+}
+
+.vidio-circular-sublabel {
+  margin-top: 5px;
+
+  color: var(--foreground-muted);
+
+  font-size: 13px;
+}
+
+
+/* ============================================================
+   MODAL
+   ============================================================ */
+
+.vidio-modal-backdrop {
+  position: fixed;
+
+  inset: 0;
+
+  z-index: 1050;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  padding: 22px;
+
+  background: rgba(0, 5, 15, 0.76);
+
+  backdrop-filter: blur(9px);
+  -webkit-backdrop-filter: blur(9px);
+}
+
+.vidio-modal {
+  width: 100%;
+
+  color: var(--foreground);
+
+  background:
+    linear-gradient(
+      145deg,
+      rgba(13, 28, 49, 0.99),
+      rgba(7, 18, 34, 0.99)
+    );
+
+  border: 1px solid var(--border-hover);
+  border-radius: 15px;
+
+  box-shadow:
+    0 35px 100px rgba(0, 0, 0, 0.55);
+}
+
+.vidio-modal-sm {
+  max-width: 420px;
+}
+
+.vidio-modal-md {
+  max-width: 580px;
+}
+
+.vidio-modal-lg {
+  max-width: 820px;
+}
+
+.vidio-modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+
+  padding: 19px 20px;
+
+  border-bottom: 1px solid var(--border);
+}
+
+.vidio-modal-header h2 {
+  margin: 0;
+
+  font-size: 18px;
+  font-weight: 650;
+}
+
+.vidio-modal-header p {
+  margin: 4px 0 0;
+
+  color: var(--foreground-muted);
+
+  font-size: 12px;
+}
+
+.vidio-modal-close {
+  width: 32px;
+  height: 32px;
+
+  color: var(--foreground-secondary);
+
+  background: rgba(255, 255, 255, 0.05);
+
+  border: 1px solid var(--border);
+  border-radius: 8px;
+
+  font-size: 19px;
+  line-height: 1;
+}
+
+.vidio-modal-close:hover {
+  color: white;
+
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.vidio-modal-body {
+  padding: 20px;
+}
+
+.vidio-modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 9px;
+
+  padding: 15px 20px;
+
+  border-top: 1px solid var(--border);
+}
+
+
+/* ============================================================
+   TOAST
+   ============================================================ */
+
+.vidio-toast {
+  position: fixed;
+
+  top: 22px;
+  right: 22px;
+
+  z-index: 1100;
+
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+
+  width: min(390px, calc(100vw - 32px));
+
+  padding: 13px 14px;
+
+  color: var(--foreground);
+
+  background:
+    rgba(9, 23, 42, 0.97);
+
+  border: 1px solid var(--border);
+  border-radius: 12px;
+
+  box-shadow:
+    0 22px 60px rgba(0, 0, 0, 0.42);
+
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+
+.vidio-toast-marker {
+  width: 8px;
+  height: 8px;
+
+  margin-top: 5px;
+
+  border-radius: 50%;
+
+  background: var(--info);
+
+  box-shadow:
+    0 0 12px rgba(96, 165, 250, 0.5);
+}
+
+.vidio-toast-success .vidio-toast-marker {
+  background: var(--success);
+  box-shadow: 0 0 12px rgba(52, 211, 153, 0.5);
+}
+
+.vidio-toast-error .vidio-toast-marker {
+  background: var(--danger);
+  box-shadow: 0 0 12px rgba(251, 113, 133, 0.5);
+}
+
+.vidio-toast-warning .vidio-toast-marker {
+  background: var(--warning);
+  box-shadow: 0 0 12px rgba(251, 191, 36, 0.5);
+}
+
+.vidio-toast-title {
+  color: white;
+
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.vidio-toast-message {
+  margin-top: 2px;
+
+  color: var(--foreground-secondary);
+
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.vidio-toast-close {
+  padding: 0;
+
+  color: var(--foreground-muted);
+
+  background: transparent;
+
+  border: 0;
+
+  font-size: 20px;
+  line-height: 1;
+}
+
+.vidio-toast-close:hover {
+  color: white;
+}
+
+
+/* ============================================================
+   EMPTY / ERROR / LOADING STATES
+   ============================================================ */
+
+.vidio-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+
+  min-height: 250px;
+
+  padding: 30px;
+
+  text-align: center;
+}
+
+.vidio-state-compact {
+  min-height: 160px;
+  padding: 20px;
+}
+
+.vidio-state-icon {
+  display: grid;
+  place-items: center;
+
+  width: 52px;
+  height: 52px;
+
+  margin-bottom: 15px;
+
+  color: var(--primary-light);
+
+  background:
+    rgba(129, 72, 245, 0.1);
+
+  border: 1px solid rgba(129, 72, 245, 0.2);
+  border-radius: 14px;
+
+  font-size: 24px;
+  font-weight: 600;
+}
+
+.vidio-state h3 {
+  margin: 0;
+
+  color: var(--foreground);
+
+  font-size: 17px;
+  font-weight: 650;
+}
+
+.vidio-state p {
+  max-width: 480px;
+
+  margin: 7px 0 0;
+
+  color: var(--foreground-muted);
+
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.vidio-state-error .vidio-state-icon {
+  color: var(--danger);
+
+  background:
+    rgba(251, 113, 133, 0.09);
+
+  border-color:
+    rgba(251, 113, 133, 0.18);
+}
+
+
+/* LOADING DOTS */
+
+.vidio-loader {
+  display: flex;
+  gap: 6px;
+
+  margin-bottom: 18px;
+}
+
+.vidio-loader span {
+  width: 8px;
+  height: 8px;
+
+  background: var(--primary-light);
+
+  border-radius: 50%;
+
+  animation:
+    vidio-loading 900ms infinite ease-in-out;
+}
+
+.vidio-loader span:nth-child(2) {
+  animation-delay: 120ms;
+}
+
+.vidio-loader span:nth-child(3) {
+  animation-delay: 240ms;
+}
+
+@keyframes vidio-loading {
+  0%,
+  80%,
+  100% {
+    opacity: 0.35;
+    transform: translateY(0);
+  }
+
+  40% {
+    opacity: 1;
+    transform: translateY(-5px);
+  }
+}
+
+
+/* ============================================================
+   UPLOAD ZONE
+   ============================================================ */
+
+.upload-zone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+
+  min-height: 150px;
+
+  padding: 24px;
+
+  color: var(--foreground-secondary);
+
+  background:
+    rgba(4, 14, 29, 0.4);
+
+  border:
+    1px dashed rgba(145, 158, 185, 0.35);
+
+  border-radius: 12px;
+
+  cursor: pointer;
+
+  transition:
+    background 160ms ease,
+    border-color 160ms ease,
+    box-shadow 160ms ease,
+    transform 160ms ease;
+}
+
+.upload-zone:hover {
+  background:
+    rgba(12, 25, 44, 0.68);
+
+  border-color:
+    rgba(139, 92, 246, 0.62);
+}
+
+.upload-zone-active {
+  background:
+    rgba(49, 30, 91, 0.55);
+
+  border-color:
+    rgba(146, 92, 248, 0.92);
+
+  box-shadow:
+    0 0 0 3px rgba(129, 72, 245, 0.08);
+}
+
+.upload-zone-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.upload-zone-icon {
+  display: grid;
+  place-items: center;
+
+  width: 46px;
+  height: 46px;
+
+  margin-bottom: 12px;
+
+  color: var(--primary-light);
+
+  background:
+    rgba(129, 72, 245, 0.1);
+
+  border:
+    1px solid rgba(129, 72, 245, 0.19);
+
+  border-radius: 12px;
+
+  font-size: 24px;
+}
+
+.upload-zone-title {
+  color: var(--foreground);
+
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.upload-zone-description {
+  margin-top: 4px;
+
+  color: var(--foreground-secondary);
+
+  font-size: 12px;
+}
+
+.upload-zone-helper {
+  margin-top: 8px;
+
+  color: var(--foreground-muted);
+
+  font-size: 10px;
+}
+
+
+/* ============================================================
+   RESPONSIVE
+   ============================================================ */
+
+@media (max-width: 650px) {
+  .vidio-tabs {
+    width: 100%;
+
+    overflow-x: auto;
+  }
+
+  .vidio-tab {
+    flex: 0 0 auto;
+  }
+
+  .vidio-tabs-fluid .vidio-tab {
+    min-width: 120px;
+  }
+
+  .vidio-panel-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .vidio-modal-backdrop {
+    padding: 12px;
+  }
+
+  .vidio-toast {
+    top: 12px;
+    right: 12px;
+    left: 12px;
+
+    width: auto;
+  }
+}

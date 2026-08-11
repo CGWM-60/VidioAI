@@ -229,23 +229,22 @@ class RuntimeManager:
         metadata: dict[str, Any],
         fallback_capabilities: list[str] | None = None,
     ) -> dict[str, Any]:
+        # IMPORTANT : les capacités du backend ne doivent jamais être injectées
+        # dans les métadonnées détectées. Sinon un modèle incompatible peut
+        # devenir artificiellement TEXT_TO_VIDEO/IMAGE_TO_VIDEO et un adapter
+        # spécialisé l'accepte à tort.
+        del fallback_capabilities
         result = dict(metadata)
         merged: list[str] = []
         seen: set[str] = set()
-
-        for source in (
-            metadata.get("capabilities") or [],
-            fallback_capabilities or [],
-        ):
-            for capability in source:
-                if not isinstance(capability, str):
-                    continue
-                normalized = capability.strip().upper()
-                if not normalized or normalized in seen:
-                    continue
-                seen.add(normalized)
-                merged.append(normalized)
-
+        for capability in metadata.get("capabilities") or []:
+            if not isinstance(capability, str):
+                continue
+            normalized = capability.strip().upper()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            merged.append(normalized)
         result["capabilities"] = merged
         return result
 
@@ -254,14 +253,29 @@ class RuntimeManager:
         metadata: dict[str, Any],
         fallback_capabilities: list[str] | None = None,
     ) -> str | None:
-        effective_metadata = self._metadata_with_capabilities(
-            metadata,
-            fallback_capabilities,
-        )
-        normalized = set(effective_metadata.get("capabilities", []))
+        effective_metadata = self._metadata_with_capabilities(metadata)
+        detected = set(effective_metadata.get("capabilities") or [])
+        requested = {
+            str(capability).strip().upper()
+            for capability in (fallback_capabilities or [])
+            if isinstance(capability, str) and capability.strip()
+        }
+
+        if detected and requested:
+            candidates = detected & requested
+        elif detected:
+            candidates = detected
+        elif requested:
+            # Seulement pour permettre au GenericDiffusersAdapter de valider
+            # une classe Diffusers réellement existante quand les métadonnées
+            # n'annoncent aucune capability. Les capacités ne sont PAS ajoutées
+            # à effective_metadata.
+            candidates = requested
+        else:
+            candidates = set(self._capability_order())
 
         for candidate in self._capability_order():
-            if normalized and candidate not in normalized:
+            if candidate not in candidates:
                 continue
             adapter = self._registry.select_for_capability(
                 effective_metadata,
@@ -289,10 +303,7 @@ class RuntimeManager:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         manifest = self._read_manifest(snapshot)
         metadata = inspect_model_metadata(snapshot)
-        metadata = self._metadata_with_capabilities(
-            metadata,
-            manifest.get("capabilities") or fallback_capabilities,
-        )
+        metadata = self._metadata_with_capabilities(metadata)
         return metadata, manifest
 
     def _imports(self) -> tuple[Any, Any]:
@@ -861,7 +872,7 @@ class RuntimeManager:
             self._log_model_state(model_id, "DOWNLOADING", "VALIDATING")
 
             metadata = inspect_model_metadata(temporary)
-            metadata = self._metadata_with_capabilities(metadata, capabilities)
+            metadata = self._metadata_with_capabilities(metadata)
             resolved_capability = self._resolve_supported_capability(
                 metadata,
                 capabilities,
