@@ -8,6 +8,7 @@ import {
   BsImage, BsInfoCircle, BsStars,
 } from "react-icons/bs";
 import { apiFetch, assetUrl, closeWebSocketSafely, eventsUrl } from "../lib/api";
+import { generationFromJob, TERMINAL_JOB_STATUSES } from "../lib/generation-job-state.mjs";
 import styles from "../studio.module.css";
 
 // Les capacités sont des identifiants d'API, pas des phrases. Ce mapping évite
@@ -48,6 +49,7 @@ export default function ImagesPage() {
   const [sourceAsset, setSourceAsset] = useState(null);
   const [sourcePreview, setSourcePreview] = useState("");
   const [generation, setGeneration] = useState(null);
+  const [activeJobId, setActiveJobId] = useState(() => typeof window === "undefined" ? "" : window.localStorage.getItem("vidioai.images.activeJob") || "");
   const [busy, setBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [maskAsset, setMaskAsset] = useState(null);
@@ -92,13 +94,38 @@ export default function ImagesPage() {
     const socket = new WebSocket(eventsUrl());
     socket.onmessage = (message) => {
       const envelope = JSON.parse(message.data);
-      if (envelope.event.startsWith("generation.") && envelope.data.id === generation?.id) {
+      if (envelope.event === "job.updated" && envelope.data.id === activeJobId) {
+        setGeneration((current) => generationFromJob(current, envelope.data));
+        if (TERMINAL_JOB_STATUSES.has(envelope.data.status)) setBusy(false);
+      } else if (envelope.event.startsWith("generation.") && envelope.data.id === generation?.id) {
         setGeneration(envelope.data);
         if (["completed", "failed"].includes(envelope.data.status)) setBusy(false);
       }
     };
     return () => closeWebSocketSafely(socket);
-  }, [generation?.id]);
+  }, [activeJobId, generation?.id]);
+
+  useEffect(() => {
+    if (!activeJobId) return undefined;
+    const reconcile = async () => {
+      try {
+        const job = await apiFetch(`/api/jobs/${activeJobId}`);
+        if (job.result?.generation) setGeneration((current) => generationFromJob(current, job));
+        else if (job.target_id) {
+          const current = await apiFetch(`/api/generations/${job.target_id}`);
+          setGeneration({ ...current, progress: job.progress });
+        }
+        if (TERMINAL_JOB_STATUSES.has(job.status)) {
+          setBusy(false);
+          setActiveJobId("");
+          window.localStorage.removeItem("vidioai.images.activeJob");
+        }
+      } catch (requestError) { setError(requestError.message); }
+    };
+    void reconcile();
+    const interval = window.setInterval(() => void reconcile(), 1500);
+    return () => window.clearInterval(interval);
+  }, [activeJobId]);
 
   const outputUrl = useMemo(() => assetUrl(generation?.output_asset_id), [generation]);
 
@@ -143,6 +170,8 @@ export default function ImagesPage() {
         }),
       });
       setGeneration(created);
+      setActiveJobId(created.job_id);
+      window.localStorage.setItem("vidioai.images.activeJob", created.job_id);
     } catch (requestError) { setError(requestError.message); setBusy(false); }
   }
 

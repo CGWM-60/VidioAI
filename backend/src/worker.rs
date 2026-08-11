@@ -63,6 +63,8 @@ pub struct WorkerModelStatus {
     pub benchmark: Option<WorkerBenchmarkObservation>,
     #[serde(default)]
     pub runtime_dependencies: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub precision_plan: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +190,18 @@ pub struct GenerateResponse {
     pub sha256: String,
     #[serde(default)]
     pub benchmark: Option<WorkerBenchmarkObservation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerJobStatus {
+    pub job_id: String,
+    pub state: String,
+    #[serde(default)]
+    pub progress: u8,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub error_code: Option<String>,
 }
 
 impl WorkerClient {
@@ -453,6 +467,11 @@ impl WorkerClient {
         } else {
             Err(format!("annulation worker refusée: {}", response.status()))
         }
+    }
+
+    pub async fn job_status(&self, job_id: &str) -> Result<WorkerJobStatus, String> {
+        self.json(self.request(reqwest::Method::GET, &format!("/v1/jobs/{job_id}")))
+            .await
     }
 }
 

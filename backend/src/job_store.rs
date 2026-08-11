@@ -70,6 +70,19 @@ impl JobStore {
         .await
     }
 
+    pub async fn get(&self, id: uuid::Uuid) -> Result<Option<Job>, String> {
+        self.run(move |connection| {
+            let mut statement = connection.prepare("SELECT payload FROM jobs WHERE id=?1")?;
+            let mut rows = statement.query([id.to_string()])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            let payload: String = row.get(0)?;
+            Ok(serde_json::from_str(&payload).ok())
+        })
+        .await
+    }
+
     pub async fn load_and_interrupt_active(&self) -> Result<Vec<Job>, String> {
         self.run(move |connection| {
             let transaction = connection.transaction()?;
@@ -81,7 +94,13 @@ impl JobStore {
                 for row in rows {
                     let payload = row?;
                     if let Ok(mut job) = serde_json::from_str::<Job>(&payload) {
-                        if matches!(job.status, JobStatus::Queued | JobStatus::Running) {
+                        if matches!(
+                            job.status,
+                            JobStatus::Queued
+                                | JobStatus::Dispatching
+                                | JobStatus::Running
+                                | JobStatus::SavingOutput
+                        ) {
                             let was_queued = job.status == JobStatus::Queued;
                             job.status = if was_queued {
                                 JobStatus::PendingRetry
@@ -145,6 +164,8 @@ mod tests {
             id: Uuid::new_v4(),
             kind: JobKind::GenerateImage,
             target_id: Uuid::new_v4().to_string(),
+            model_id: Some("model".into()),
+            capability: Some("TEXT_TO_IMAGE".into()),
             status: JobStatus::Running,
             stage: "generating".into(),
             progress: 42,
@@ -153,6 +174,10 @@ mod tests {
             dependency: None,
             cache_status: None,
             cache_error: None,
+            started_at: Some(1),
+            completed_at: None,
+            error: None,
+            result: None,
             created_at: 1,
             updated_at: 2,
         };
@@ -178,6 +203,8 @@ mod tests {
             id: Uuid::new_v4(),
             kind: JobKind::InstallModel,
             target_id: "stable-image-core".into(),
+            model_id: None,
+            capability: None,
             status: JobStatus::Queued,
             stage: "queued".into(),
             progress: 0,
@@ -186,6 +213,10 @@ mod tests {
             dependency: None,
             cache_status: None,
             cache_error: None,
+            started_at: None,
+            completed_at: None,
+            error: None,
+            result: None,
             created_at: 1,
             updated_at: 1,
         };
@@ -198,6 +229,67 @@ mod tests {
             .expect("restore queued job");
         assert_eq!(jobs[0].status, JobStatus::PendingRetry);
         assert_eq!(jobs[0].stage, "pending_retry");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn generation_lifecycle_is_monotone_and_terminal_result_is_durable() {
+        let path =
+            std::env::temp_dir().join(format!("vidioai-lifecycle-{}.sqlite", Uuid::new_v4()));
+        let store = JobStore::open(path.clone()).await.expect("open sqlite");
+        let mut job = Job {
+            id: Uuid::new_v4(),
+            kind: JobKind::GenerateVideo,
+            target_id: Uuid::new_v4().to_string(),
+            model_id: Some("owner/model".into()),
+            capability: Some("IMAGE_TO_VIDEO".into()),
+            status: JobStatus::Queued,
+            stage: "queued".into(),
+            progress: 0,
+            message: "queued".into(),
+            transfer: None,
+            dependency: None,
+            cache_status: None,
+            cache_error: None,
+            started_at: None,
+            completed_at: None,
+            error: None,
+            result: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        let transitions = [
+            (JobStatus::Queued, 0),
+            (JobStatus::Dispatching, 5),
+            (JobStatus::Running, 45),
+            (JobStatus::SavingOutput, 90),
+        ];
+        let mut observed = Vec::new();
+        for (status, progress) in transitions {
+            job.status = status;
+            job.progress = progress;
+            job.updated_at += 1;
+            store.upsert(&job).await.unwrap();
+            observed.push(progress);
+        }
+        job.result = Some(serde_json::json!({"asset_id": "asset-1"}));
+        store.upsert(&job).await.unwrap();
+        assert!(store.get(job.id).await.unwrap().unwrap().result.is_some());
+        job.status = JobStatus::Completed;
+        job.progress = 100;
+        job.completed_at = Some(10);
+        store.upsert(&job).await.unwrap();
+        observed.push(100);
+        assert!(observed.windows(2).all(|pair| pair[0] <= pair[1]));
+        let terminal = JobStore::open(path.clone())
+            .await
+            .unwrap()
+            .get(job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.status, JobStatus::Completed);
+        assert!(terminal.result.is_some());
         let _ = std::fs::remove_file(path);
     }
 }

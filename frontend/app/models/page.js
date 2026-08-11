@@ -15,7 +15,9 @@ import styles from "../studio.module.css";
 // leurs capacités restent exclusivement fournis par GET /api/models.
 const FILTERS = [
   ["all", "Tous"], ["CHAT", "Chat"], ["IMAGE", "Image"],
-  ["VIDEO", "Vidéo"], ["VISION", "Vision"], ["AUDIO", "Audio"],
+  ["VIDEO", "Tous vidéo"], ["TEXT_TO_VIDEO", "T2V"],
+  ["IMAGE_TO_VIDEO", "I2V"], ["VIDEO_TO_VIDEO", "V2V"],
+  ["VISION", "Vision"], ["AUDIO", "Audio"],
   ["installed", "Installés"], ["compatible", "Compatibles"],
 ];
 
@@ -86,6 +88,10 @@ export default function ModelsPage() {
       const parameters = new URLSearchParams({ page: String(page), limit: "20", sort });
       if (query.trim()) parameters.set("search", query.trim());
       if (["CHAT", "IMAGE", "VIDEO", "VISION", "AUDIO"].includes(filter)) parameters.set("category", filter);
+      if (["TEXT_TO_VIDEO", "IMAGE_TO_VIDEO", "VIDEO_TO_VIDEO"].includes(filter)) {
+        parameters.set("category", "VIDEO");
+        parameters.set("task", filter);
+      }
       if (filter === "installed") parameters.set("installed", "true");
       if (filter === "compatible") parameters.set("compatible", "true");
       // Le backend borne déjà ses appels HF et peut ensuite interroger le Worker

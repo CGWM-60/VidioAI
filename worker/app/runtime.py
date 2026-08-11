@@ -38,6 +38,8 @@ from .dependency_resolver import DependencyResolutionError, DependencyResolver
 from .model_profile import ModelRuntimeProfile
 from .resolution_resolver import ResolutionResolver
 from .config import Settings
+from .dtype_resolver import DTypeResolver, PrecisionPlan
+from .generation_progress import GenerationProgressReporter
 from .schemas import CompatibilityStatus, JobState, ModelState
 
 
@@ -71,6 +73,7 @@ class LoadedModel:
     pipeline: Any
     capability: str | None = None
     metadata: dict[str, Any] | None = None
+    precision_plan: PrecisionPlan | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +104,7 @@ class RuntimeManager:
         self._dependency_installer = DependencyInstaller(
             self.settings.runtime_dependencies_path
         )
+        self._dtype_resolver = DTypeResolver()
         self._resolution_resolver = ResolutionResolver()
         self._input_normalizer = InputNormalizer(self.settings.work_dir)
         self._output_normalizer = OutputNormalizer(self.settings.work_dir)
@@ -214,7 +218,8 @@ class RuntimeManager:
                 "error_code": error.code,
                 "dependency": error.dependency,
             }
-        capabilities = CapabilityResolver().resolve(metadata, resolution.pipeline_cls)
+        capability_sets = CapabilityResolver().describe(metadata, resolution.pipeline_cls)
+        capabilities = capability_sets["runtime_capabilities"]
         status = CompatibilityStatus.SUPPORTED
         error_code = None
         if not resolution.runtime_supported:
@@ -227,6 +232,8 @@ class RuntimeManager:
             "compatibility_status": status,
             "runtime_supported": resolution.runtime_supported,
             "runtime_capabilities": capabilities,
+            "declared_capabilities": capability_sets["declared_capabilities"],
+            "display_capabilities": capability_sets["display_capabilities"],
             "pipeline_class": resolution.class_name,
             "runtime_reason": resolution.runtime_reason,
             "error_code": error_code,
@@ -745,10 +752,9 @@ class RuntimeManager:
             metadata["runtime_reason"] = (
                 "Métadonnées publiques incomplètes; validation du snapshot requise."
             )
-        metadata["capabilities"] = CapabilityResolver().resolve(
-            metadata,
-            resolution.pipeline_cls,
-        )
+        capability_sets = CapabilityResolver().describe(metadata, resolution.pipeline_cls)
+        metadata.update(capability_sets)
+        metadata["capabilities"] = capability_sets["display_capabilities"]
         return metadata
 
     def runtime_status(self) -> dict[str, Any]:
@@ -1482,17 +1488,22 @@ class RuntimeManager:
                 "ready": False,
             }
 
-    @staticmethod
-    def _torch_dtype(torch: Any, cuda_available: bool) -> tuple[Any, str]:
-        if not cuda_available:
-            return torch.float32, "FP32"
+    def _precision_plan(
+        self,
+        torch: Any,
+        metadata: dict[str, Any],
+        cuda_available: bool,
+    ) -> PrecisionPlan:
         bf16_supported = bool(
-            hasattr(torch.cuda, "is_bf16_supported")
+            cuda_available
+            and hasattr(torch.cuda, "is_bf16_supported")
             and torch.cuda.is_bf16_supported()
         )
-        if bf16_supported:
-            return torch.bfloat16, "BF16"
-        return torch.float16, "FP16"
+        return self._dtype_resolver.resolve(
+            metadata,
+            cuda_available=cuda_available,
+            bf16_supported=bf16_supported,
+        )
 
     def _load_pipeline(
         self,
@@ -1516,9 +1527,11 @@ class RuntimeManager:
         )
         if device == "cuda" and hasattr(pipeline, "to"):
             pipeline = pipeline.to(device)
-        resolved_capabilities = CapabilityResolver().resolve(metadata, pipeline)
+        capability_sets = CapabilityResolver().describe(metadata, pipeline)
+        resolved_capabilities = capability_sets["runtime_capabilities"]
         if resolved_capabilities:
-            metadata["capabilities"] = resolved_capabilities
+            metadata.update(capability_sets)
+            metadata["capabilities"] = capability_sets["display_capabilities"]
             if capability not in resolved_capabilities:
                 raise PipelineResolutionError(
                     f"La signature chargee ne supporte pas {capability}.",
@@ -1691,7 +1704,9 @@ class RuntimeManager:
             raise self._unsupported_pipeline_error(metadata, capability)
 
         device = "cuda" if cuda_available else "cpu"
-        dtype, precision = self._torch_dtype(torch, cuda_available)
+        precision_plan = self._precision_plan(torch, metadata, cuda_available)
+        dtype = self._dtype_resolver.materialize(torch, precision_plan)
+        precision = precision_plan.precision
         gpu_before = self._nvidia_metrics()
         load_started = time.perf_counter()
         if cuda_available:
@@ -1809,7 +1824,9 @@ class RuntimeManager:
             pipeline=pipeline,
             capability=capability,
             metadata=metadata,
+            precision_plan=precision_plan,
         )
+        precision_plan.components = self._dtype_resolver.inspect_components(pipeline)
         status = {
             "model_id": model_id,
             "state": ModelState.READY,
@@ -1830,6 +1847,7 @@ class RuntimeManager:
             "revision": pointer["revision"],
             "benchmark": load_benchmark,
             "runtime_dependencies": runtime_dependencies,
+            "precision_plan": precision_plan.as_dict(),
         }
         with self._lock:
             self._loaded[model_id] = loaded
@@ -1901,7 +1919,12 @@ class RuntimeManager:
         if loaded.device == "cuda" and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        dtype, _ = self._torch_dtype(torch, loaded.device == "cuda")
+        precision_plan = self._precision_plan(
+            torch,
+            metadata,
+            loaded.device == "cuda",
+        )
+        dtype = self._dtype_resolver.materialize(torch, precision_plan)
         try:
             pipeline = self._load_pipeline(
                 snapshot=snapshot,
@@ -1939,6 +1962,9 @@ class RuntimeManager:
 
         loaded.pipeline = pipeline
         loaded.capability = requested_capability
+        precision_plan.components = self._dtype_resolver.inspect_components(pipeline)
+        loaded.precision_plan = precision_plan
+        loaded.precision = precision_plan.precision
         return adapter
 
     def _output_path(self, relative_path: str) -> Path:
@@ -1948,6 +1974,57 @@ class RuntimeManager:
             raise WorkerError("Le chemin de sortie quitte le volume autorisé.", 422)
         candidate.parent.mkdir(parents=True, exist_ok=True)
         return candidate
+
+    def _recover_dtype_pipeline(
+        self,
+        loaded: LoadedModel,
+        requested_capability: str,
+        adapter: Any,
+        error: BaseException,
+    ) -> None:
+        plan = loaded.precision_plan
+        if plan is None or not self._dtype_resolver.is_dtype_mismatch(error):
+            raise error
+        replacement = self._dtype_resolver.recovery_plan(
+            plan,
+            cuda_available=loaded.device == "cuda",
+        )
+        if replacement is None:
+            raise WorkerError(
+                f"DTYPE_MISMATCH: {type(error).__name__}: {error}",
+                422,
+                code="DTYPE_MISMATCH",
+                retryable=False,
+            ) from error
+
+        snapshot, _ = self._active_snapshot(loaded.model_id)
+        torch = self._imports().torch
+        previous = loaded.pipeline
+        loaded.pipeline = None
+        if previous is not None:
+            del previous
+        gc.collect()
+        if loaded.device == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        try:
+            loaded.pipeline = self._load_pipeline(
+                snapshot=snapshot,
+                metadata=loaded.metadata or {},
+                capability=requested_capability,
+                adapter=adapter,
+                device=loaded.device,
+                dtype=self._dtype_resolver.materialize(torch, replacement),
+            )
+        except Exception as recovery_error:
+            raise WorkerError(
+                f"DTYPE_MISMATCH_RECOVERY_FAILED: {type(recovery_error).__name__}: {recovery_error}",
+                422,
+                code="DTYPE_MISMATCH",
+                retryable=False,
+            ) from recovery_error
+        replacement.components = self._dtype_resolver.inspect_components(loaded.pipeline)
+        loaded.precision_plan = replacement
+        loaded.precision = replacement.precision
 
     def _generate_with_adapter(
         self,
@@ -2010,16 +2087,15 @@ class RuntimeManager:
             if cancel_event is None:
                 raise WorkerError("Job actif introuvable.", 404)
 
-        def callback(_pipeline: Any, step: int, _timestep: Any, callback_kwargs: Any):
-            if cancel_event.is_set():
-                raise InterruptedError("Job annulé.")
-            total_steps = max(1, int(prepared_request.get("steps") or 4))
+        def emit_progress(progress: int) -> None:
             with self._lock:
-                self._jobs[job_id]["progress"] = min(
-                    95,
-                    int(((step + 1) / total_steps) * 95),
-                )
-            return callback_kwargs
+                self._jobs[job_id]["progress"] = progress
+
+        callback = GenerationProgressReporter(
+            total_steps=int(prepared_request.get("steps") or 4),
+            cancelled=cancel_event.is_set,
+            emit=emit_progress,
+        )
 
         torch = self._imports().torch
         generation_started = time.perf_counter()
@@ -2038,11 +2114,26 @@ class RuntimeManager:
             "metadata": loaded.metadata or {},
             "capability": requested_capability,
         }
-        output = adapter.generate(
-            loaded.pipeline,
-            runtime,
-            prepared_request,
-        )
+        try:
+            try:
+                output = adapter.generate(loaded.pipeline, runtime, prepared_request)
+            except Exception as retry_error:
+                if self._dtype_resolver.is_dtype_mismatch(retry_error):
+                    raise WorkerError(
+                        f"DTYPE_MISMATCH: {type(retry_error).__name__}: {retry_error}",
+                        422,
+                        code="DTYPE_MISMATCH",
+                        retryable=False,
+                    ) from retry_error
+                raise
+        except Exception as error:
+            self._recover_dtype_pipeline(
+                loaded,
+                requested_capability,
+                adapter,
+                error,
+            )
+            output = adapter.generate(loaded.pipeline, runtime, prepared_request)
         if cancel_event.is_set():
             raise InterruptedError("Job annulé.")
 
@@ -2100,6 +2191,11 @@ class RuntimeManager:
                 "vram_peak_bytes": observed_peak,
                 "ram_peak_bytes": self._ram_peak_bytes(),
                 "precision": loaded.precision,
+                "precision_plan": (
+                    loaded.precision_plan.as_dict()
+                    if loaded.precision_plan is not None
+                    else None
+                ),
                 "resolution_width": width,
                 "resolution_height": height,
                 "frames": media_probe.get("frames"),

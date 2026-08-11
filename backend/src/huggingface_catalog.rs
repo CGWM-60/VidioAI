@@ -1388,7 +1388,7 @@ fn requested_pipelines(query: &CatalogQuery) -> Vec<&'static str> {
             | "IMAGE_VARIATION"
             | "IMAGE_UPSCALE"
             | "CONTROLLED_IMAGE_GENERATION" => vec!["image-to-image"],
-            "TEXT_TO_VIDEO" => vec!["text-to-video"],
+            "TEXT_TO_VIDEO" => vec!["text-to-video", "video-generation"],
             "IMAGE_TO_VIDEO"
             | "MULTI_IMAGE_TO_VIDEO"
             | "START_END_IMAGE_TO_VIDEO"
@@ -1411,7 +1411,12 @@ fn requested_pipelines(query: &CatalogQuery) -> Vec<&'static str> {
     {
         "CHAT" => vec!["text-generation"],
         "IMAGE" => vec!["text-to-image", "image-to-image"],
-        "VIDEO" => vec!["text-to-video", "image-to-video", "video-to-video"],
+        "VIDEO" => vec![
+            "text-to-video",
+            "image-to-video",
+            "video-to-video",
+            "video-generation",
+        ],
         "VISION" => vec!["image-text-to-text", "visual-question-answering"],
         "AUDIO" => vec![
             "text-to-speech",

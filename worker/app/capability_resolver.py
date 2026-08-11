@@ -72,13 +72,23 @@ class CapabilityResolver:
         metadata: dict[str, Any],
         pipeline_or_class: Any | None = None,
     ) -> list[str]:
-        params = self.signature_parameters(pipeline_or_class)
-        tokens = self._metadata_tokens(metadata)
-        capabilities: set[str] = set()
+        """Capacites affichees, avec la signature runtime comme priorite."""
+        runtime = self.runtime_capabilities(pipeline_or_class)
+        if runtime:
+            return runtime
+        declared = self.declared_capabilities(metadata)
+        if declared:
+            return declared
+        return self._display_hints(metadata)
 
-        for token in tokens:
-            if token in self.TAG_MAP:
-                capabilities.add(self.TAG_MAP[token])
+    def declared_capabilities(self, metadata: dict[str, Any]) -> list[str]:
+        tokens = self._metadata_tokens(metadata)
+        capabilities = {self.TAG_MAP[token] for token in tokens if token in self.TAG_MAP}
+        return [value for value in CAPABILITY_ORDER if value in capabilities]
+
+    def runtime_capabilities(self, pipeline_or_class: Any | None) -> list[str]:
+        params = self.signature_parameters(pipeline_or_class)
+        capabilities: set[str] = set()
 
         has_prompt = "prompt" in params or "prompt_embeds" in params
         has_frames = "num_frames" in params or "video_length" in params
@@ -110,6 +120,31 @@ class CapabilityResolver:
         if has_prompt and not has_frames and not has_image and not has_video:
             capabilities.add("TEXT_TO_IMAGE")
 
-        # Une capability precise publiee par le Hub reste utile si la signature
-        # n'est pas introspectable. On ne derive jamais les modes multi/start/end.
         return [value for value in CAPABILITY_ORDER if value in capabilities]
+
+    def _display_hints(self, metadata: dict[str, Any]) -> list[str]:
+        """Dernier recours UI, jamais publie comme preuve runtime."""
+        hint = " ".join(
+            str(metadata.get(key) or "").lower()
+            for key in ("class_name", "repository", "model_id")
+        )
+        capabilities: set[str] = set()
+        if "video" in hint or any(token in hint for token in ("wan", "ltx", "cogvideo")):
+            capabilities.add("TEXT_TO_VIDEO")
+        elif "image" in hint or "flux" in hint or "stable-diffusion" in hint:
+            capabilities.add("TEXT_TO_IMAGE")
+        return [value for value in CAPABILITY_ORDER if value in capabilities]
+
+    def describe(
+        self,
+        metadata: dict[str, Any],
+        pipeline_or_class: Any | None = None,
+    ) -> dict[str, list[str]]:
+        declared = self.declared_capabilities(metadata)
+        runtime = self.runtime_capabilities(pipeline_or_class)
+        display = runtime or declared or self._display_hints(metadata)
+        return {
+            "declared_capabilities": declared,
+            "runtime_capabilities": runtime,
+            "display_capabilities": display,
+        }

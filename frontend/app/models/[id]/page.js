@@ -124,6 +124,16 @@ function ModelDetailsContent() {
           </div>
         ))}</div>
       </section>}
+      {model.runtime_precision && <section className={styles.largePanel}>
+        <h2>Précision runtime : {model.runtime_precision.precision}</h2>
+        <p>{model.runtime_precision.source}{model.runtime_precision.quantization ? ` · ${model.runtime_precision.quantization}` : ""}</p>
+        <div className={styles.dependencyList}>{model.runtime_precision.components?.map((component) => (
+          <div key={component.name}>
+            <strong>{component.name.replaceAll("_", " ")} · {component.dtype || "auto"}</strong>
+            <span>{component.device || "device auto"}{component.quantization ? ` · ${component.quantization}` : ""}</span>
+          </div>
+        ))}</div>
+      </section>}
       {model.cache_status === "CACHE_FAILED" && <section className={styles.largePanel}>
         <h2>Cache S3 à reprendre</h2>
         <p>Le modèle reste installé localement. {model.cache_error}</p>

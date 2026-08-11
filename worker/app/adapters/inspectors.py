@@ -126,6 +126,7 @@ def inspect_model_metadata(snapshot: str | Path) -> dict[str, Any]:
         "config": None,
         "raw_tags": [],
         "base_models": [],
+        "component_configs": {},
     }
 
     model_index_path = root / "model_index.json"
@@ -138,6 +139,18 @@ def inspect_model_metadata(snapshot: str | Path) -> dict[str, Any]:
 
     model_index = metadata["model_index"] or {}
     config = metadata["config"] or {}
+
+    for component_name in (
+        "unet",
+        "transformer",
+        "vae",
+        "image_encoder",
+        "text_encoder",
+        "text_encoder_2",
+    ):
+        component_path = root / component_name / "config.json"
+        if component_path.is_file():
+            metadata["component_configs"][component_name] = _read_json(component_path)
 
     metadata["pipeline_tag"] = model_index.get("pipeline_tag") or config.get("pipeline_tag")
     metadata["library_name"] = _infer_library_name(model_index, config)
@@ -181,5 +194,7 @@ def inspect_model_metadata(snapshot: str | Path) -> dict[str, Any]:
         metadata["runtime_reason"] = f"{type(error).__name__}: {error}"
         metadata["compatibility_status"] = "UNSUPPORTED"
 
-    metadata["capabilities"] = CapabilityResolver().resolve(metadata, pipeline_cls)
+    capability_sets = CapabilityResolver().describe(metadata, pipeline_cls)
+    metadata.update(capability_sets)
+    metadata["capabilities"] = capability_sets["display_capabilities"]
     return metadata

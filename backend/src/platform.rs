@@ -24,6 +24,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     path::{Path as FilePath, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -33,7 +34,7 @@ use tokio::{
     fs,
     process::Command,
     sync::{RwLock, broadcast, mpsc},
-    time::{Duration, sleep},
+    time::{Duration, Instant, sleep},
 };
 use uuid::Uuid;
 
@@ -49,9 +50,13 @@ use crate::huggingface_catalog::{
 };
 use crate::job_store::JobStore;
 use crate::object_storage::{
-    ObjectStorage, S3Storage, UploadProgress, UploadProgressCallback, model_s3_prefix,
+    ObjectStorage, S3Storage, SnapshotManifest, TransferProgressCallback, UploadProgress,
+    UploadProgressCallback, model_s3_prefix,
 };
-use crate::worker::{WorkerBenchmarkObservation, WorkerClient, WorkerReady, WorkerResources};
+use crate::worker::{
+    GenerateResponse, WorkerBenchmarkObservation, WorkerClient, WorkerCompatibility, WorkerReady,
+    WorkerResources,
+};
 
 /// Taille maximale d'un asset reçu. La limite protège le processus avant même
 /// que les données ne soient décodées par la crate `image`.
@@ -322,11 +327,14 @@ pub struct ModelView {
     pub description: String,
     pub kind: ModelKind,
     pub capabilities: Vec<ModelCapability>,
+    pub declared_capabilities: Vec<ModelCapability>,
+    pub display_capabilities: Vec<ModelCapability>,
     pub variants: Vec<ModelVariant>,
     pub installed: bool,
     pub cache_status: String,
     pub cache_error: Option<String>,
     pub runtime_dependencies: Vec<serde_json::Value>,
+    pub runtime_precision: Option<serde_json::Value>,
     /// `true` uniquement lorsqu'un runtime exploitable a été validé. Un simple
     /// manifeste Hugging Face ne doit jamais être présenté comme un modèle prêt.
     pub runtime_ready: bool,
@@ -410,6 +418,7 @@ pub struct CompatibilityCheck {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum JobKind {
     InstallModel,
+    RestoreModel,
     CacheModel,
     GenerateImage,
     GenerateVideo,
@@ -419,7 +428,9 @@ pub enum JobKind {
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
     Queued,
+    Dispatching,
     Running,
+    SavingOutput,
     Completed,
     Failed,
     Cancelled,
@@ -436,6 +447,10 @@ pub struct Job {
     pub id: Uuid,
     pub kind: JobKind,
     pub target_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
     pub status: JobStatus,
     pub stage: String,
     pub progress: u8,
@@ -448,6 +463,14 @@ pub struct Job {
     pub cache_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -524,6 +547,8 @@ pub enum GenerationStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Generation {
     pub id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<Uuid>,
     pub kind: AssetKind,
     pub mode: GenerationMode,
     #[serde(default)]
@@ -728,6 +753,7 @@ pub struct AppState {
     settings: SettingsStore,
     /// Client Hugging Face et cache disque partagés entre toutes les requêtes.
     catalog: HuggingFaceCatalogService,
+    compatibility_cache: RwLock<HashMap<String, (u64, WorkerCompatibility)>>,
     jobs: RwLock<HashMap<Uuid, Job>>,
     runtime: RwLock<HashMap<String, RuntimeEntry>>,
     generations: RwLock<HashMap<Uuid, Generation>>,
@@ -798,6 +824,7 @@ impl AppState {
         let state = Arc::new(Self {
             settings,
             catalog,
+            compatibility_cache: RwLock::new(HashMap::new()),
             jobs: RwLock::new(jobs),
             runtime: RwLock::new(HashMap::new()),
             generations: RwLock::new(generations),
@@ -899,11 +926,45 @@ impl AppState {
         let updated = {
             let mut jobs = self.jobs.write().await;
             let Some(job) = jobs.get_mut(&id) else { return };
+            let now = unix_now();
+            if matches!(
+                status,
+                JobStatus::Dispatching | JobStatus::Running | JobStatus::SavingOutput
+            ) && job.started_at.is_none()
+            {
+                job.started_at = Some(now);
+            }
+            if matches!(
+                status,
+                JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled
+            ) {
+                job.completed_at = Some(now);
+            }
+            if status == JobStatus::Failed {
+                let candidate = message.split(':').next().unwrap_or("JOB_FAILED").trim();
+                let code = if !candidate.is_empty()
+                    && candidate
+                        .chars()
+                        .all(|character| character.is_ascii_uppercase() || character == '_')
+                {
+                    candidate
+                } else {
+                    "JOB_FAILED"
+                };
+                job.error = Some(json!({
+                    "code": code,
+                    "message": message,
+                    "retryable": matches!(
+                        code,
+                        "JOB_DISPATCH_TIMEOUT" | "WORKER_START_TIMEOUT" | "WORKER_LOST"
+                    ),
+                }));
+            }
             job.status = status;
             job.stage = stage.to_string();
             job.progress = progress.min(100);
             job.message = message.to_string();
-            job.updated_at = unix_now();
+            job.updated_at = now;
             job.clone()
         };
         // Les versions précédentes étiquetaient aussi les générations comme
@@ -918,8 +979,69 @@ impl AppState {
         if let Err(error) = self.job_store.upsert(&updated).await {
             eprintln!("Persistance du job {} impossible : {error}", updated.id);
         }
+        match updated.status {
+            JobStatus::Dispatching => eprintln!("JOB_DISPATCH id={}", updated.id),
+            JobStatus::Running => eprintln!(
+                "JOB_PROGRESS id={} progress={} stage={}",
+                updated.id, updated.progress, updated.stage
+            ),
+            JobStatus::SavingOutput => eprintln!("JOB_OUTPUT_SAVING id={}", updated.id),
+            JobStatus::Completed => eprintln!("JOB_COMPLETED id={}", updated.id),
+            JobStatus::Failed => eprintln!(
+                "JOB_FAILED id={} code={}",
+                updated.id,
+                updated
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.get("code"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("JOB_FAILED")
+            ),
+            _ => {}
+        }
         self.emit(event, &updated);
         self.emit("queue.updated", &self.queue().await);
+    }
+
+    async fn set_job_result(&self, id: Uuid, result: serde_json::Value) {
+        let updated = {
+            let mut jobs = self.jobs.write().await;
+            let Some(job) = jobs.get_mut(&id) else { return };
+            job.result = Some(result);
+            job.updated_at = unix_now();
+            job.clone()
+        };
+        let _ = self.job_store.upsert(&updated).await;
+        self.emit("job.updated", &updated);
+    }
+
+    async fn classify_generation_error(&self, id: Uuid, video: bool, message: &str) -> String {
+        let candidate = message.split(':').next().unwrap_or_default().trim();
+        if !candidate.is_empty()
+            && candidate
+                .chars()
+                .all(|character| character.is_ascii_uppercase() || character == '_')
+        {
+            return message.to_owned();
+        }
+        let saving_output = self
+            .jobs
+            .read()
+            .await
+            .get(&id)
+            .is_some_and(|job| job.status == JobStatus::SavingOutput);
+        let code = if video
+            && (saving_output
+                || message.to_ascii_lowercase().contains("ffmpeg")
+                || message.to_ascii_lowercase().contains("ffprobe"))
+        {
+            "VIDEO_ENCODING_FAILED"
+        } else if saving_output {
+            "OUTPUT_WRITE_FAILED"
+        } else {
+            "GENERATION_FAILED"
+        };
+        format!("{code}: {message}")
     }
 
     async fn update_cache_progress(&self, id: Uuid, transfer: UploadProgress) {
@@ -933,6 +1055,7 @@ impl AppState {
             let mut jobs = self.jobs.write().await;
             let Some(job) = jobs.get_mut(&id) else { return };
             job.status = JobStatus::Running;
+            job.started_at.get_or_insert_with(unix_now);
             job.stage = "saving_cache".into();
             job.progress = overall;
             job.message = format!(
@@ -1002,11 +1125,14 @@ impl AppState {
     }
 
     async fn insert_job(&self, job: Job) -> Result<(), ApiError> {
+        let id = job.id;
+        let kind = job.kind.clone();
         self.job_store
             .upsert(&job)
             .await
             .map_err(ApiError::internal)?;
-        self.jobs.write().await.insert(job.id, job);
+        self.jobs.write().await.insert(id, job);
+        eprintln!("JOB_CREATE id={id} kind={kind:?}");
         self.emit("queue.updated", &self.queue().await);
         Ok(())
     }
@@ -1020,7 +1146,11 @@ impl AppState {
             .filter(|job| {
                 matches!(
                     job.status,
-                    JobStatus::Queued | JobStatus::Running | JobStatus::PendingRetry
+                    JobStatus::Queued
+                        | JobStatus::Dispatching
+                        | JobStatus::Running
+                        | JobStatus::SavingOutput
+                        | JobStatus::PendingRetry
                 )
             })
             .cloned()
@@ -1062,6 +1192,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/chats/{id}/messages", post(send_chat_message))
         .route("/models", get(get_models))
         .route("/models/catalog/refresh", post(refresh_models))
+        .route("/models/cloud", get(list_cloud_models))
+        .route("/models/cloud/restore", post(restore_cloud_models))
         // Les routes query/body sont la forme canonique : un ID Hugging Face
         // contient un slash et ne doit pas dépendre du décodage du reverse proxy.
         .route(
@@ -1569,7 +1701,15 @@ async fn get_resources(State(state): State<Arc<AppState>>) -> Json<ResourcesView
         worker_error,
         queue_active: jobs
             .values()
-            .filter(|job| matches!(job.status, JobStatus::Queued | JobStatus::Running))
+            .filter(|job| {
+                matches!(
+                    job.status,
+                    JobStatus::Queued
+                        | JobStatus::Dispatching
+                        | JobStatus::Running
+                        | JobStatus::SavingOutput
+                )
+            })
             .count(),
         queue_total: jobs.len(),
         loaded_models: state.runtime.read().await.len(),
@@ -2197,15 +2337,35 @@ async fn model_view_with_machine(
     let runtime_check = if entry.local || !machine.runtime_available {
         None
     } else if let Some(worker) = &state.worker {
-        worker
-            .compatibility(
-                entry.pipeline_class.as_deref(),
-                entry.library.as_deref(),
-                entry.pipeline_tag.as_deref(),
-                &entry.tags,
-            )
+        let cache_key = format!("{}@{}", entry.id, entry.revision);
+        let cached = state
+            .compatibility_cache
+            .read()
             .await
-            .ok()
+            .get(&cache_key)
+            .filter(|(created_at, _)| unix_now().saturating_sub(*created_at) < 300)
+            .map(|(_, compatibility)| compatibility.clone());
+        if cached.is_some() {
+            cached
+        } else {
+            let compatibility = worker
+                .compatibility(
+                    entry.pipeline_class.as_deref(),
+                    entry.library.as_deref(),
+                    entry.pipeline_tag.as_deref(),
+                    &entry.tags,
+                )
+                .await
+                .ok();
+            if let Some(value) = &compatibility {
+                state
+                    .compatibility_cache
+                    .write()
+                    .await
+                    .insert(cache_key, (unix_now(), value.clone()));
+            }
+            compatibility
+        }
     } else {
         None
     };
@@ -2276,6 +2436,9 @@ async fn model_view_with_machine(
         .as_ref()
         .map(|status| status.runtime_dependencies.clone())
         .unwrap_or_default();
+    let runtime_precision = worker_status
+        .as_ref()
+        .and_then(|status| status.precision_plan.clone());
     let cache_job = state
         .jobs
         .read()
@@ -2438,17 +2601,25 @@ async fn model_view_with_machine(
         && entry.quality_valid
         && (entry.local || machine.runtime_available);
 
+    let display_capabilities = if runtime_capabilities.is_empty() {
+        entry.capabilities.clone()
+    } else {
+        runtime_capabilities.clone()
+    };
     ModelView {
         id: entry.id.clone(),
         name: entry.name.clone(),
         description: entry.description.clone(),
         kind: entry.kind.clone(),
-        capabilities: entry.capabilities.clone(),
+        capabilities: display_capabilities.clone(),
+        declared_capabilities: entry.capabilities.clone(),
+        display_capabilities,
         variants: entry.variants.clone(),
         installed,
         cache_status,
         cache_error,
         runtime_dependencies,
+        runtime_precision,
         runtime_ready,
         installation_state,
         compatible,
@@ -2596,12 +2767,20 @@ async fn get_models(
         .iter()
         .filter(|entry| entry_matches_query(entry, &query))
         .collect::<Vec<_>>();
-    let candidates = futures_util::future::join_all(
-        matching
-            .into_iter()
-            .map(|entry| model_view_with_machine(&state, entry, &machine)),
-    )
-    .await;
+    // Les enrichissements Worker sont bornés : l'ouverture du catalogue ne
+    // peut pas lancer des dizaines de preflights en concurrence avec une
+    // génération réelle. Les décisions sont en outre mises en cache 5 minutes.
+    let mut candidates = Vec::with_capacity(matching.len());
+    for chunk in matching.chunks(4) {
+        candidates.extend(
+            futures_util::future::join_all(
+                chunk
+                    .iter()
+                    .map(|entry| model_view_with_machine(&state, entry, &machine)),
+            )
+            .await,
+        );
+    }
     let mut views = Vec::with_capacity(candidates.len());
     for view in candidates {
         if query
@@ -2654,6 +2833,7 @@ async fn get_models(
 
 async fn refresh_models(State(state): State<Arc<AppState>>) -> StatusCode {
     state.catalog.clear_cache().await;
+    state.compatibility_cache.write().await.clear();
     StatusCode::NO_CONTENT
 }
 
@@ -2752,6 +2932,8 @@ async fn start_model_install(
         id: Uuid::new_v4(),
         kind: JobKind::InstallModel,
         target_id: entry.id.clone(),
+        model_id: Some(entry.id.clone()),
+        capability: None,
         status: JobStatus::Queued,
         stage: "checking".into(),
         progress: 0,
@@ -2764,6 +2946,10 @@ async fn start_model_install(
             None
         },
         cache_error: None,
+        started_at: None,
+        completed_at: None,
+        error: None,
+        result: None,
         created_at: unix_now(),
         updated_at: unix_now(),
     };
@@ -2823,6 +3009,8 @@ async fn cache_model_from_body(
         id: Uuid::new_v4(),
         kind: JobKind::CacheModel,
         target_id: entry.id.clone(),
+        model_id: Some(entry.id.clone()),
+        capability: None,
         status: JobStatus::Queued,
         stage: "saving_cache".into(),
         progress: 90,
@@ -2831,6 +3019,10 @@ async fn cache_model_from_body(
         dependency: None,
         cache_status: Some("CACHE_PENDING".into()),
         cache_error: None,
+        started_at: None,
+        completed_at: None,
+        error: None,
+        result: None,
         created_at: unix_now(),
         updated_at: unix_now(),
     };
@@ -2888,6 +3080,358 @@ async fn cache_model_from_body(
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
 
+#[derive(Debug, Serialize)]
+struct CloudModelView {
+    repository: String,
+    revision: String,
+    name: String,
+    size_bytes: u64,
+    files: usize,
+    created_at: u64,
+    capabilities: Vec<String>,
+    cloud_state: &'static str,
+    local_state: &'static str,
+    local: bool,
+    cloud: bool,
+    valid: bool,
+    manifest_uri: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CloudModelsResponse {
+    items: Vec<CloudModelView>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudRestoreSelection {
+    repository: String,
+    revision: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudRestoreInput {
+    models: Vec<CloudRestoreSelection>,
+}
+
+fn select_cloud_manifests(
+    available: Vec<SnapshotManifest>,
+    requested: &[CloudRestoreSelection],
+) -> Result<Vec<SnapshotManifest>, String> {
+    let by_identity = available
+        .into_iter()
+        .map(|manifest| {
+            (
+                (manifest.repository.clone(), manifest.revision.clone()),
+                manifest,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::new();
+    requested
+        .iter()
+        .map(|selection| {
+            let identity = (selection.repository.clone(), selection.revision.clone());
+            if !seen.insert(identity.clone()) {
+                return Err(
+                    "CLOUD_SELECTION_DUPLICATE: snapshot sélectionné plusieurs fois".into(),
+                );
+            }
+            by_identity
+                .get(&identity)
+                .cloned()
+                .ok_or_else(|| "CLOUD_SNAPSHOT_NOT_FOUND: snapshot S3 valide inconnu".into())
+        })
+        .collect()
+}
+
+async fn list_cloud_models(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<CloudModelsResponse>, ApiError> {
+    if !state.object_storage.enabled() {
+        return Ok(Json(CloudModelsResponse { items: Vec::new() }));
+    }
+    let manifests = state
+        .object_storage
+        .list_snapshots()
+        .await
+        .map_err(ApiError::unavailable)?;
+    let settings = state.settings.get().await;
+    let ready_models = if let Some(worker) = &state.worker {
+        worker
+            .resources()
+            .await
+            .ok()
+            .map(|resources| {
+                resources
+                    .loaded_models
+                    .into_iter()
+                    .filter_map(|model| {
+                        let ready = model
+                            .get("state")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|value| value == "READY");
+                        ready.then(|| model.get("model_id")?.as_str().map(str::to_owned))?
+                    })
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default()
+    } else {
+        HashSet::new()
+    };
+    let restore_jobs = state
+        .jobs
+        .read()
+        .await
+        .values()
+        .filter(|job| job.kind == JobKind::RestoreModel)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut result = Vec::with_capacity(manifests.len());
+    for manifest in manifests {
+        let model_storage_id = storage_id(&manifest.repository);
+        let active_revision = fs::read(
+            settings
+                .models_dir
+                .join(&model_storage_id)
+                .join("active.json"),
+        )
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<InstalledPointer>(&bytes).ok())
+        .map(|pointer| pointer.revision);
+        let local_state = if ready_models.contains(&model_storage_id) {
+            "READY"
+        } else if active_revision.as_deref() == Some(manifest.revision.as_str()) {
+            "INSTALLED"
+        } else {
+            "ABSENT"
+        };
+        let cloud_state = restore_jobs
+            .iter()
+            .filter(|job| job.target_id == manifest.repository)
+            .max_by_key(|job| job.updated_at)
+            .map(|job| match job.status {
+                JobStatus::Queued
+                | JobStatus::Dispatching
+                | JobStatus::Running
+                | JobStatus::SavingOutput => "RESTORING",
+                JobStatus::Completed => "READY",
+                JobStatus::Failed | JobStatus::Interrupted => "FAILED",
+                JobStatus::Cancelled | JobStatus::PendingRetry => "AVAILABLE",
+            })
+            .unwrap_or("AVAILABLE");
+        result.push(CloudModelView {
+            name: manifest
+                .repository
+                .split('/')
+                .next_back()
+                .unwrap_or(&manifest.repository)
+                .to_owned(),
+            manifest_uri: state
+                .object_storage
+                .snapshot_uri(&manifest.repository, &manifest.revision)
+                .map_err(ApiError::internal)?,
+            repository: manifest.repository,
+            revision: manifest.revision,
+            size_bytes: manifest.total_size,
+            files: manifest.files.len(),
+            created_at: manifest.created_at,
+            capabilities: manifest.capabilities,
+            cloud_state,
+            local_state,
+            local: local_state != "ABSENT",
+            cloud: true,
+            valid: true,
+        });
+    }
+    Ok(Json(CloudModelsResponse { items: result }))
+}
+
+async fn restore_cloud_models(
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<CloudRestoreInput>,
+) -> Result<(StatusCode, Json<Vec<Job>>), ApiError> {
+    state.ensure_accepting_jobs().await?;
+    if !state.object_storage.enabled() {
+        return Err(ApiError::conflict("Le stockage S3 est désactivé."));
+    }
+    if input.models.is_empty() || input.models.len() > 20 {
+        return Err(ApiError::bad_request(
+            "Sélectionnez entre 1 et 20 snapshots.",
+        ));
+    }
+    let available = state
+        .object_storage
+        .list_snapshots()
+        .await
+        .map_err(ApiError::unavailable)?;
+    let selected =
+        select_cloud_manifests(available, &input.models).map_err(ApiError::bad_request)?;
+
+    let mut jobs = Vec::with_capacity(input.models.len());
+    for manifest in selected {
+        let job = Job {
+            id: Uuid::new_v4(),
+            kind: JobKind::RestoreModel,
+            target_id: manifest.repository.clone(),
+            model_id: Some(manifest.repository.clone()),
+            capability: None,
+            status: JobStatus::Queued,
+            stage: "queued".into(),
+            progress: 0,
+            message: "Restauration S3 ajoutée à la file".into(),
+            transfer: None,
+            dependency: None,
+            cache_status: Some("CLOUD_AVAILABLE".into()),
+            cache_error: None,
+            started_at: None,
+            completed_at: None,
+            error: None,
+            result: None,
+            created_at: unix_now(),
+            updated_at: unix_now(),
+        };
+        state.insert_job(job.clone()).await?;
+        let task_state = state.clone();
+        let task_job = job.clone();
+        tokio::spawn(async move {
+            run_cloud_restore(task_state, task_job, manifest).await;
+        });
+        jobs.push(job);
+    }
+    Ok((StatusCode::ACCEPTED, Json(jobs)))
+}
+
+async fn run_cloud_restore(state: Arc<AppState>, job: Job, manifest: SnapshotManifest) {
+    state
+        .update_job(
+            job.id,
+            JobStatus::Dispatching,
+            "dispatching",
+            2,
+            "Validation du manifeste S3",
+        )
+        .await;
+    let result: Result<serde_json::Value, String> = async {
+        let settings = state.settings.get().await;
+        let model_id = storage_id(&manifest.repository);
+        let model_root = settings.models_dir.join(&model_id);
+        let snapshot_root = model_root.join(&manifest.revision);
+        let (sender, mut receiver) = mpsc::unbounded_channel::<UploadProgress>();
+        let callback: TransferProgressCallback = Arc::new(move |progress| {
+            let _ = sender.send(progress);
+        });
+        let mut restore = Box::pin(state.object_storage.restore_snapshot(
+            &manifest.repository,
+            &manifest.revision,
+            &snapshot_root,
+            Some(callback),
+        ));
+        let restored = loop {
+            tokio::select! {
+                result = &mut restore => break result?,
+                progress = receiver.recv() => {
+                    if let Some(progress) = progress {
+                        let percent = progress.percent();
+                        let overall = (5.0 + percent * 0.8).round().clamp(5.0, 85.0) as u8;
+                        let updated = {
+                            let mut jobs = state.jobs.write().await;
+                            jobs.get_mut(&job.id).map(|current| {
+                                current.status = JobStatus::Running;
+                                current.stage = "restoring".into();
+                                current.progress = overall;
+                                current.message = format!("Restauration S3 · {:.2}%", percent);
+                                current.transfer = Some(progress);
+                                current.started_at.get_or_insert_with(unix_now);
+                                current.updated_at = unix_now();
+                                current.clone()
+                            })
+                        };
+                        if let Some(updated) = updated {
+                            let _ = state.job_store.upsert(&updated).await;
+                            state.emit("job.updated", &updated);
+                        }
+                    }
+                }
+            }
+        };
+        if !restored {
+            return Err("S3_SNAPSHOT_NOT_FOUND: manifeste absent".into());
+        }
+        fs::create_dir_all(&model_root)
+            .await
+            .map_err(|error| error.to_string())?;
+        let pointer = json!({
+            "model_id": model_id,
+            "repository": manifest.repository,
+            "revision": manifest.revision,
+        });
+        let temporary = model_root.join("active.json.tmp");
+        fs::write(
+            &temporary,
+            serde_json::to_vec_pretty(&pointer).map_err(|e| e.to_string())?,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        fs::rename(temporary, model_root.join("active.json"))
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let worker = state
+            .worker
+            .as_ref()
+            .ok_or("WORKER_UNAVAILABLE: worker GPU absent")?;
+        state
+            .update_job(
+                job.id,
+                JobStatus::Running,
+                "validating",
+                90,
+                "Validation locale du snapshot",
+            )
+            .await;
+        let installed = worker
+            .install(
+                &model_id,
+                &manifest.repository,
+                &manifest.revision,
+                &manifest.capabilities,
+            )
+            .await?;
+        if !installed.installed || !installed.weights_valid {
+            return Err("SNAPSHOT_INVALID: le worker a refusé les poids restaurés".into());
+        }
+        Ok(json!({
+            "repository": manifest.repository,
+            "revision": manifest.revision,
+            "model_id": model_id,
+            "local_state": "INSTALLED",
+            "cloud_state": "READY",
+        }))
+    }
+    .await;
+
+    match result {
+        Ok(value) => {
+            state.set_job_result(job.id, value).await;
+            state
+                .update_job(
+                    job.id,
+                    JobStatus::Completed,
+                    "completed",
+                    100,
+                    "Snapshot restauré et validé",
+                )
+                .await;
+        }
+        Err(error) => {
+            state
+                .update_job(job.id, JobStatus::Failed, "failed", 100, &error)
+                .await;
+        }
+    }
+}
+
 /// Mesure les octets effectivement présents dans le staging du Worker. Cette
 /// valeur alimente la progression pendant que `snapshot_download` s'exécute ;
 /// aucun compteur temporel ou pourcentage simulé n'est utilisé.
@@ -2928,7 +3472,7 @@ async fn restore_model_cache(
     let snapshot_root = model_root.join(&entry.revision);
     let restored = state
         .object_storage
-        .restore_snapshot(&entry.repository, &entry.revision, &snapshot_root)
+        .restore_snapshot(&entry.repository, &entry.revision, &snapshot_root, None)
         .await?;
     if !restored {
         return Ok(false);
@@ -3194,11 +3738,10 @@ async fn get_job(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Job>, ApiError> {
     state
-        .jobs
-        .read()
+        .job_store
+        .get(id)
         .await
-        .get(&id)
-        .cloned()
+        .map_err(ApiError::internal)?
         .map(Json)
         .ok_or_else(|| ApiError::not_found("Job inconnu."))
 }
@@ -4009,8 +4552,10 @@ async fn generate_image(
         ));
     }
 
+    let job_id = Uuid::new_v4();
     let generation = Generation {
         id: Uuid::new_v4(),
+        job_id: Some(job_id),
         kind: AssetKind::Image,
         mode: request.mode,
         capability: Some(requested_capability),
@@ -4044,9 +4589,14 @@ async fn generate_image(
         .await
         .insert(generation.id, generation.clone());
     let job = Job {
-        id: Uuid::new_v4(),
+        id: job_id,
         kind: JobKind::GenerateImage,
         target_id: generation.id.to_string(),
+        model_id: Some(generation.model_id.clone()),
+        capability: generation
+            .capability
+            .as_ref()
+            .map(|value| value.api_name().to_owned()),
         status: JobStatus::Queued,
         stage: "queued".into(),
         progress: 0,
@@ -4055,6 +4605,10 @@ async fn generate_image(
         dependency: None,
         cache_status: None,
         cache_error: None,
+        started_at: None,
+        completed_at: None,
+        error: None,
+        result: None,
         created_at: unix_now(),
         updated_at: unix_now(),
     };
@@ -4095,6 +4649,63 @@ async fn update_generation(state: &AppState, generation: Generation) {
     state.emit("generation.updated", &generation);
 }
 
+async fn await_worker_generation<F>(
+    state: &AppState,
+    job_id: Uuid,
+    request: F,
+) -> Result<GenerateResponse, String>
+where
+    F: Future<Output = Result<GenerateResponse, String>>,
+{
+    let worker = state
+        .worker
+        .as_ref()
+        .ok_or("WORKER_UNAVAILABLE: worker GPU absent")?;
+    let timeout_seconds = std::env::var("VIDIOAI_WORKER_START_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(30)
+        .clamp(5, 300);
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    let mut accepted = false;
+    let mut request = Box::pin(request);
+    loop {
+        tokio::select! {
+            result = &mut request => return result,
+            _ = sleep(Duration::from_millis(700)) => {
+                match worker.job_status(&job_id.to_string()).await {
+                    Ok(status) => {
+                        accepted = true;
+                        if status.state == "FAILED" {
+                            return Err(format!(
+                                "{}: {}",
+                                status.error_code.unwrap_or_else(|| "GENERATION_FAILED".into()),
+                                status.error.unwrap_or_else(|| "Le worker a échoué".into()),
+                            ));
+                        }
+                        state
+                            .update_job(
+                                job_id,
+                                JobStatus::Running,
+                                "generating",
+                                status.progress.min(95),
+                                "Inférence mesurée par le Worker",
+                            )
+                            .await;
+                    }
+                    Err(_) if !accepted && Instant::now() >= deadline => {
+                        let _ = worker.cancel(&job_id.to_string()).await;
+                        return Err(format!(
+                            "WORKER_START_TIMEOUT: job non accepté après {timeout_seconds} secondes"
+                        ));
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+}
+
 /// Pipeline commun T2I/I2I : charge le runtime, exécute le moteur, transforme le
 /// résultat en Asset persistant puis clôt la Generation et son Job.
 async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id: Uuid) {
@@ -4105,10 +4716,10 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
     state
         .update_job(
             job_id,
-            JobStatus::Running,
-            "loading",
+            JobStatus::Dispatching,
+            "dispatching",
             12,
-            "Chargement du moteur image",
+            "Dispatch vers le moteur image",
         )
         .await;
 
@@ -4150,8 +4761,10 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
                     .capability
                     .clone()
                     .unwrap_or(ModelCapability::TextToImage);
-                let worker_result = worker
-                    .generate_image(
+                let worker_result = await_worker_generation(
+                    &state,
+                    job_id,
+                    worker.generate_image(
                         image_endpoint(&capability),
                         &job_id.to_string(),
                         &storage_id(&generation.model_id),
@@ -4162,8 +4775,9 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
                         None,
                         None,
                         Some(capability.api_name()),
-                    )
-                    .await?;
+                    ),
+                )
+                .await?;
                 if worker_result.job_id != job_id.to_string()
                     || worker_result.state != "COMPLETED"
                     || worker_result.output_relative_path != relative.to_string_lossy()
@@ -4258,8 +4872,10 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
                     .capability
                     .clone()
                     .unwrap_or(ModelCapability::ImageToImage);
-                let worker_result = worker
-                    .generate_image(
+                let worker_result = await_worker_generation(
+                    &state,
+                    job_id,
+                    worker.generate_image(
                         image_endpoint(&capability),
                         &job_id.to_string(),
                         &storage_id(&generation.model_id),
@@ -4276,8 +4892,9 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
                             .map(|path| path.to_string_lossy())
                             .as_deref(),
                         Some(capability.api_name()),
-                    )
-                    .await?;
+                    ),
+                )
+                .await?;
                 if worker_result.job_id != job_id.to_string()
                     || worker_result.state != "COMPLETED"
                     || worker_result.output_relative_path != relative.to_string_lossy()
@@ -4321,8 +4938,8 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
         state
             .update_job(
                 job_id,
-                JobStatus::Running,
-                "saving",
+                JobStatus::SavingOutput,
+                "saving_output",
                 82,
                 "Enregistrement de l'asset final",
             )
@@ -4353,6 +4970,20 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
             generation.progress = 100;
             generation.updated_at = unix_now();
             update_generation(&state, generation.clone()).await;
+            state
+                .set_job_result(
+                    job_id,
+                    json!({
+                        "asset_id": asset.id,
+                        "url": asset.url,
+                        "mime_type": asset.mime_type,
+                        "width": asset.width,
+                        "height": asset.height,
+                        "asset": asset,
+                        "generation": generation,
+                    }),
+                )
+                .await;
             state
                 .update_job(
                     job_id,
@@ -4388,8 +5019,9 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
             generation.error = Some(error.clone());
             generation.updated_at = unix_now();
             update_generation(&state, generation.clone()).await;
+            let job_error = state.classify_generation_error(job_id, false, &error).await;
             state
-                .update_job(job_id, JobStatus::Failed, "failed", 100, &error)
+                .update_job(job_id, JobStatus::Failed, "failed", 100, &job_error)
                 .await;
         }
     }
@@ -4525,8 +5157,10 @@ async fn generate_video(
         }
     }
 
+    let job_id = Uuid::new_v4();
     let generation = Generation {
         id: Uuid::new_v4(),
+        job_id: Some(job_id),
         kind: AssetKind::Video,
         mode,
         capability: Some(requested_capability),
@@ -4556,9 +5190,14 @@ async fn generate_video(
     };
     update_generation(&state, generation.clone()).await;
     let job = Job {
-        id: Uuid::new_v4(),
+        id: job_id,
         kind: JobKind::GenerateVideo,
         target_id: generation.id.to_string(),
+        model_id: Some(generation.model_id.clone()),
+        capability: generation
+            .capability
+            .as_ref()
+            .map(|value| value.api_name().to_owned()),
         status: JobStatus::Queued,
         stage: "queued".into(),
         progress: 0,
@@ -4567,6 +5206,10 @@ async fn generate_video(
         dependency: None,
         cache_status: None,
         cache_error: None,
+        started_at: None,
+        completed_at: None,
+        error: None,
+        result: None,
         created_at: unix_now(),
         updated_at: unix_now(),
     };
@@ -4607,10 +5250,10 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
     state
         .update_job(
             job_id,
-            JobStatus::Running,
-            "preparing",
+            JobStatus::Dispatching,
+            "dispatching",
             8,
-            "Préparation des médias",
+            "Dispatch vers le moteur vidéo",
         )
         .await;
 
@@ -4727,8 +5370,10 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
                 )
                 .await;
 
-            let worker_result = worker
-                .generate_video(
+            let worker_result = await_worker_generation(
+                &state,
+                job_id,
+                worker.generate_video(
                     endpoint,
                     &job_id.to_string(),
                     &storage_id(&generation.model_id),
@@ -4747,8 +5392,9 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
                     &aspect_ratio,
                     duration,
                     requested_fps,
-                )
-                .await?;
+                ),
+            )
+            .await?;
 
             for path in temporary_inputs {
                 let _ = fs::remove_file(path).await;
@@ -4778,6 +5424,15 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
                 .await
                 .map_err(|error| format!("Copie sortie worker impossible : {error}"))?;
 
+            state
+                .update_job(
+                    job_id,
+                    JobStatus::SavingOutput,
+                    "saving_output",
+                    82,
+                    "Enregistrement du MP4 final",
+                )
+                .await;
             let mut asset = save_asset(
                 &state,
                 &bytes,
@@ -4807,8 +5462,10 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
         let source_path = if generation.mode == GenerationMode::TextToVideo {
             let worker = state.worker.as_ref().ok_or("Worker GPU absent")?;
             let relative = PathBuf::from("generations").join(format!("{}.png", generation.id));
-            let worker_result = worker
-                .generate_video(
+            let worker_result = await_worker_generation(
+                &state,
+                job_id,
+                worker.generate_video(
                     "/v1/generate/text-to-video",
                     &job_id.to_string(),
                     &storage_id(&generation.model_id),
@@ -4823,8 +5480,9 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
                     &aspect_ratio,
                     duration,
                     requested_fps,
-                )
-                .await?;
+                ),
+            )
+            .await?;
             if worker_result.job_id != job_id.to_string()
                 || worker_result.state != "COMPLETED"
                 || worker_result.output_relative_path != relative.to_string_lossy()
@@ -4929,6 +5587,15 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
         }
 
         let bytes = fs::read(&output_path).await.map_err(|error| error.to_string())?;
+        state
+            .update_job(
+                job_id,
+                JobStatus::SavingOutput,
+                "saving_output",
+                90,
+                "Enregistrement du MP4 final",
+            )
+            .await;
         let mut asset = save_asset(
             &state, &bytes, format!("generation-{}.mp4", generation.id),
             "video/mp4".into(), AssetKind::Video, Some((width, height)), "mp4",
@@ -4960,6 +5627,24 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
             generation.updated_at = unix_now();
             update_generation(&state, generation.clone()).await;
             state
+                .set_job_result(
+                    job_id,
+                    json!({
+                        "asset_id": asset.id,
+                        "url": asset.url,
+                        "mime_type": asset.mime_type,
+                        "width": asset.width,
+                        "height": asset.height,
+                        "duration": asset.duration_seconds,
+                        "fps": asset.fps,
+                        "frames": generation.actual_frames,
+                        "codec": "h264",
+                        "asset": asset,
+                        "generation": generation,
+                    }),
+                )
+                .await;
+            state
                 .update_job(
                     job_id,
                     JobStatus::Completed,
@@ -4989,13 +5674,14 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
             generation.error = Some(error.clone());
             generation.updated_at = unix_now();
             update_generation(&state, generation.clone()).await;
+            let job_error = state.classify_generation_error(job_id, true, &error).await;
             state
                 .update_job(
                     job_id,
                     JobStatus::Failed,
                     "failed",
                     generation.progress,
-                    &error,
+                    &job_error,
                 )
                 .await;
         }
@@ -5085,13 +5771,62 @@ async fn get_generation(
 #[cfg(test)]
 mod tests {
     use super::{
-        AppSettings, CanvasEngine, GenerateVideoRequest, GenerationMode, ModelCapability,
-        ModelIdQuery, image_endpoint, is_valid_image_capability_for_mode,
-        is_valid_video_capability_for_mode, local_runtime_models, procedural_video_dimensions,
-        video_endpoint, worker_runtime_flags,
+        AppSettings, CanvasEngine, CloudModelView, CloudRestoreSelection, GenerateVideoRequest,
+        GenerationMode, ModelCapability, ModelIdQuery, image_endpoint,
+        is_valid_image_capability_for_mode, is_valid_video_capability_for_mode,
+        local_runtime_models, procedural_video_dimensions, select_cloud_manifests, video_endpoint,
+        worker_runtime_flags,
     };
+    use crate::object_storage::{SnapshotFile, SnapshotManifest};
     use crate::worker::{WorkerModelStatus, WorkerReady};
     use serde_json::json;
+
+    #[test]
+    fn cloud_catalog_exposes_valid_manifest_and_restores_only_selection() {
+        let manifest = |repository: &str| SnapshotManifest {
+            repository: repository.into(),
+            revision: "revision-1".into(),
+            files: vec![SnapshotFile {
+                path: "model.safetensors".into(),
+                size: 42,
+                sha256: Some("a".repeat(64)),
+            }],
+            total_size: 42,
+            created_at: 1,
+            schema_version: 1,
+            capabilities: vec!["IMAGE_TO_VIDEO".into()],
+        };
+        let selected = select_cloud_manifests(
+            vec![manifest("owner/first"), manifest("owner/second")],
+            &[CloudRestoreSelection {
+                repository: "owner/second".into(),
+                revision: "revision-1".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].repository, "owner/second");
+
+        let view = CloudModelView {
+            repository: selected[0].repository.clone(),
+            revision: selected[0].revision.clone(),
+            name: "second".into(),
+            size_bytes: selected[0].total_size,
+            files: selected[0].files.len(),
+            created_at: selected[0].created_at,
+            capabilities: selected[0].capabilities.clone(),
+            cloud_state: "AVAILABLE",
+            local_state: "ABSENT",
+            local: false,
+            cloud: true,
+            valid: true,
+            manifest_uri: "s3://bucket/models/owner/second/revision-1/manifest.json".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(view).unwrap()["cloud_state"],
+            "AVAILABLE"
+        );
+    }
 
     #[test]
     fn query_model_ids_preserve_encoded_hugging_face_slashes() {
@@ -5345,6 +6080,7 @@ mod tests {
             error: None,
             benchmark: None,
             runtime_dependencies: vec![],
+            precision_plan: None,
         };
         assert!(!super::worker_reports_ready(&status));
     }
@@ -5364,6 +6100,7 @@ mod tests {
             error: None,
             benchmark: None,
             runtime_dependencies: vec![],
+            precision_plan: None,
         };
         assert!(super::worker_reports_ready(&status));
     }
@@ -5383,6 +6120,7 @@ mod tests {
             error: None,
             benchmark: None,
             runtime_dependencies: vec![],
+            precision_plan: None,
         };
         assert!(super::worker_reports_ready(&status));
     }

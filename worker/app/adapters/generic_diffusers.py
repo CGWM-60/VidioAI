@@ -111,6 +111,7 @@ class GenericDiffusersAdapter(RuntimeAdapter):
             "generator": runtime.get("generator"),
             "fps": values["fps"],
             "strength": request.get("strength"),
+            "callback_on_step_end": runtime.get("callback"),
         }
 
         assign_alias(kwargs, accepted, values["num_frames"], "num_frames", "video_length")

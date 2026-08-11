@@ -40,6 +40,8 @@ pub struct SnapshotManifest {
     pub total_size: u64,
     pub created_at: u64,
     pub schema_version: u32,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -95,6 +97,7 @@ fn snapshot_upload_complete(progress: &UploadProgress) -> bool {
 }
 
 pub type UploadProgressCallback = Arc<dyn Fn(UploadProgress) + Send + Sync>;
+pub type TransferProgressCallback = UploadProgressCallback;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UploadOutcome {
@@ -112,7 +115,9 @@ pub trait ObjectStorage: Send + Sync {
         repository: &str,
         revision: &str,
         local: &Path,
+        progress: Option<TransferProgressCallback>,
     ) -> Result<bool, String>;
+    async fn list_snapshots(&self) -> Result<Vec<SnapshotManifest>, String>;
     async fn upload_snapshot(
         &self,
         repository: &str,
@@ -225,6 +230,40 @@ impl S3Storage {
             );
         }
         Ok(())
+    }
+
+    pub fn snapshot_uri(&self, repository: &str, revision: &str) -> Result<String, String> {
+        Ok(format!(
+            "s3://{}/{}/{}",
+            self.bucket,
+            model_s3_prefix(repository, revision)?,
+            SNAPSHOT_MANIFEST_NAME
+        ))
+    }
+
+    async fn read_manifest(&self, key: &str) -> Result<SnapshotManifest, String> {
+        let temporary =
+            std::env::temp_dir().join(format!("vidioai-s3-manifest-{}.json.tmp", Uuid::new_v4()));
+        let result = self
+            .aws(&[
+                "s3api".into(),
+                "get-object".into(),
+                "--bucket".into(),
+                self.bucket.clone(),
+                "--key".into(),
+                key.into(),
+                temporary.to_string_lossy().into_owned(),
+            ])
+            .await;
+        if let Err(error) = result {
+            let _ = fs::remove_file(&temporary).await;
+            return Err(error);
+        }
+        let bytes = fs::read(&temporary)
+            .await
+            .map_err(|error| format!("S3_MANIFEST_INVALID: {error}"));
+        let _ = fs::remove_file(&temporary).await;
+        serde_json::from_slice(&bytes?).map_err(|error| format!("S3_MANIFEST_INVALID: {error}"))
     }
 
     async fn aws_output(&self, args: &[String]) -> Result<Vec<u8>, String> {
@@ -526,6 +565,23 @@ fn read_known_hashes(root: &Path) -> HashMap<String, String> {
         .collect()
 }
 
+fn read_snapshot_capabilities(root: &Path) -> Vec<String> {
+    let Ok(bytes) = std::fs::read(root.join("vidioai-model.json")) else {
+        return Vec::new();
+    };
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Vec::new();
+    };
+    payload
+        .get("capabilities")
+        .or_else(|| payload.get("requested_capabilities"))
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect()
+}
+
 async fn sha256_file(path: PathBuf) -> Result<String, String> {
     task::spawn_blocking(move || {
         let mut input = std::fs::File::open(path).map_err(|error| error.to_string())?;
@@ -588,6 +644,7 @@ impl ObjectStorage for S3Storage {
         repository: &str,
         revision: &str,
         local: &Path,
+        callback: Option<TransferProgressCallback>,
     ) -> Result<bool, String> {
         if !self.enabled {
             return Ok(false);
@@ -600,30 +657,26 @@ impl ObjectStorage for S3Storage {
         fs::create_dir_all(local)
             .await
             .map_err(|error| error.to_string())?;
-        let temporary_manifest = local.join(format!(".{SNAPSHOT_MANIFEST_NAME}.tmp"));
-        self.aws(&[
-            "s3api".into(),
-            "get-object".into(),
-            "--bucket".into(),
-            self.bucket.clone(),
-            "--key".into(),
-            manifest_key,
-            temporary_manifest.to_string_lossy().into_owned(),
-        ])
-        .await?;
-        let bytes = fs::read(&temporary_manifest)
-            .await
-            .map_err(|error| format!("S3_MANIFEST_INVALID: {error}"))?;
-        let _ = fs::remove_file(&temporary_manifest).await;
-        let manifest: SnapshotManifest = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("S3_MANIFEST_INVALID: {error}"))?;
+        let manifest = self.read_manifest(&manifest_key).await?;
         if manifest.schema_version != SNAPSHOT_MANIFEST_SCHEMA_VERSION
             || manifest.repository != repository
             || manifest.revision != revision
         {
             return Err("S3_MANIFEST_INVALID: identité ou schéma inattendu".into());
         }
+        let started = Instant::now();
+        let mut progress = UploadProgress {
+            direction: "download".into(),
+            provider: "s3".into(),
+            bytes_total: manifest.total_size,
+            files_total: manifest.files.len() as u64,
+            ..UploadProgress::default()
+        };
+        Self::emit_progress(&callback, &progress, started);
         for file in &manifest.files {
+            progress.current_file = Some(file.path.clone());
+            progress.current_file_size = file.size;
+            progress.current_file_bytes = 0;
             let destination = safe_manifest_path(local, &file.path)?;
             let mut already_valid = fs::metadata(&destination)
                 .await
@@ -671,9 +724,72 @@ impl ObjectStorage for S3Storage {
                 fs::rename(temporary, destination)
                     .await
                     .map_err(|error| error.to_string())?;
+                mark_transferred_bytes(&mut progress, file.size, file.size);
+                progress.files_completed += 1;
+            } else {
+                mark_existing_file(&mut progress, file.size);
             }
+            Self::emit_progress(&callback, &progress, started);
         }
         Ok(true)
+    }
+
+    async fn list_snapshots(&self) -> Result<Vec<SnapshotManifest>, String> {
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        let output = self
+            .aws_output(&[
+                "s3api".into(),
+                "list-objects-v2".into(),
+                "--bucket".into(),
+                self.bucket.clone(),
+                "--prefix".into(),
+                "models/".into(),
+                "--output".into(),
+                "json".into(),
+            ])
+            .await?;
+        let payload: serde_json::Value =
+            serde_json::from_slice(&output).map_err(|error| format!("S3_LIST_INVALID: {error}"))?;
+        let keys = payload
+            .get("Contents")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.get("Key")?.as_str())
+            .filter(|key| key.ends_with(&format!("/{SNAPSHOT_MANIFEST_NAME}")))
+            .map(str::to_owned)
+            .take(200)
+            .collect::<Vec<_>>();
+
+        let mut manifests = Vec::new();
+        for key in keys {
+            let Ok(manifest) = self.read_manifest(&key).await else {
+                continue;
+            };
+            let identity_valid = model_s3_prefix(&manifest.repository, &manifest.revision)
+                .is_ok_and(|prefix| key == format!("{prefix}/{SNAPSHOT_MANIFEST_NAME}"));
+            if manifest.schema_version != SNAPSHOT_MANIFEST_SCHEMA_VERSION || !identity_valid {
+                continue;
+            }
+            let prefix = model_s3_prefix(&manifest.repository, &manifest.revision)?;
+            let mut valid = !manifest.files.is_empty()
+                && manifest.total_size == manifest.files.iter().map(|file| file.size).sum::<u64>();
+            for file in &manifest.files {
+                if safe_manifest_path(Path::new("snapshot"), &file.path).is_err()
+                    || self.head_size(&format!("{prefix}/{}", file.path)).await? != Some(file.size)
+                {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                manifests.push(manifest);
+            }
+        }
+        manifests.sort_by_key(|manifest| std::cmp::Reverse(manifest.created_at));
+        Ok(manifests)
     }
 
     async fn upload_snapshot(
@@ -695,6 +811,7 @@ impl ObjectStorage for S3Storage {
                 .unwrap_or_default()
                 .as_secs(),
             schema_version: SNAPSHOT_MANIFEST_SCHEMA_VERSION,
+            capabilities: read_snapshot_capabilities(local),
         };
         let mut progress = UploadProgress {
             direction: "upload".into(),

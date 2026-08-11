@@ -6,6 +6,7 @@ import {
   BsBox,
   BsCardImage,
   BsChatDots,
+  BsCloudArrowDown,
   BsChevronDown,
   BsFolder,
   BsFolder2Open,
@@ -20,6 +21,7 @@ import {
 const navigation = [
   { href: "/", label: "Accueil", icon: BsHouse },
   { href: "/models", label: "Modèles", icon: BsBox },
+  { href: "/models/cloud", label: "Sauvegardes cloud", icon: BsCloudArrowDown },
   { href: "/projects", label: "Projets", icon: BsFolder },
   { href: "/generations", label: "Générations", icon: BsRobot },
   { href: "/images", label: "Images", icon: BsCardImage },
@@ -31,6 +33,9 @@ const navigation = [
 
 export default function Sidebar() {
   const pathname = usePathname();
+  const activeHref = navigation
+    .filter(({ href }) => href === "/" ? pathname === "/" : pathname === href || pathname.startsWith(`${href}/`))
+    .sort((left, right) => right.href.length - left.href.length)[0]?.href;
 
   return (
     <aside className="sidebar">
@@ -41,9 +46,7 @@ export default function Sidebar() {
 
       <nav className="sidebar-nav" aria-label="Navigation principale">
         {navigation.map(({ href, label, icon: Icon }) => {
-          const active = href === "/"
-            ? pathname === href
-            : pathname === href || pathname.startsWith(`${href}/`);
+          const active = href === activeHref;
 
           return (
             <Link

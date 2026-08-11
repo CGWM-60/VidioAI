@@ -9,6 +9,7 @@ import {
 } from "react-icons/bs";
 import { FaArrowsAlt } from "react-icons/fa";
 import { apiFetch, assetUrl, closeWebSocketSafely, eventsUrl } from "../lib/api";
+import { generationFromJob } from "../lib/generation-job-state.mjs";
 import styles from "../studio.module.css";
 
 const MODES = [
@@ -47,6 +48,7 @@ function GenerationsContent() {
   const [fps, setFps] = useState(24);
   const [audio, setAudio] = useState(false);
   const [generation, setGeneration] = useState(null);
+  const [activeJobId, setActiveJobId] = useState(() => typeof window === "undefined" ? "" : window.localStorage.getItem("vidioai.videos.activeJob") || "");
   const [history, setHistory] = useState([]);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState("");
@@ -91,16 +93,24 @@ function GenerationsContent() {
     const socket = new WebSocket(eventsUrl());
     socket.onmessage = (event) => {
       const envelope = JSON.parse(event.data);
-      if (envelope.data?.id !== generationId) return;
-      if (envelope.event.startsWith("generation.")) {
+      if (envelope.event === "job.updated" && envelope.data?.id === activeJobId) {
+        setGeneration((current) => generationFromJob(current, envelope.data));
+        if (TERMINAL_STATUSES.has(envelope.data.status)) void refreshHistory();
+      } else if (envelope.data?.id === generationId && envelope.event.startsWith("generation.")) {
         setGeneration(envelope.data);
         if (TERMINAL_STATUSES.has(envelope.data.status)) void refreshHistory();
       }
     };
     const interval = window.setInterval(async () => {
       try {
-        const current = await apiFetch(`/api/generations/${generationId}`);
+        const job = activeJobId ? await apiFetch(`/api/jobs/${activeJobId}`) : null;
+        const reconciled = job?.result?.generation || await apiFetch(`/api/generations/${generationId}`);
+        const current = job ? generationFromJob(reconciled, job) : reconciled;
         setGeneration(current);
+        if (job && TERMINAL_STATUSES.has(job.status)) {
+          window.localStorage.removeItem("vidioai.videos.activeJob");
+          setActiveJobId("");
+        }
         if (TERMINAL_STATUSES.has(current.status)) {
           window.clearInterval(interval);
           void refreshHistory();
@@ -110,7 +120,19 @@ function GenerationsContent() {
       }
     }, 700);
     return () => { closeWebSocketSafely(socket); window.clearInterval(interval); };
-  }, [generationId, generationStatus, refreshHistory]);
+  }, [activeJobId, generationId, generationStatus, refreshHistory]);
+
+  useEffect(() => {
+    if (!activeJobId || generationId) return;
+    let stopped = false;
+    apiFetch(`/api/jobs/${activeJobId}`)
+      .then((job) => job.result?.generation
+        ? job.result.generation
+        : apiFetch(`/api/generations/${job.target_id}`))
+      .then((current) => { if (!stopped) setGeneration(current); })
+      .catch((requestError) => { if (!stopped) setError(requestError.message); });
+    return () => { stopped = true; };
+  }, [activeJobId, generationId]);
 
   function chooseMode(nextMode) {
     setMode(nextMode);
@@ -180,6 +202,8 @@ function GenerationsContent() {
         body: JSON.stringify(payload),
       });
       setGeneration(created);
+      setActiveJobId(created.job_id);
+      window.localStorage.setItem("vidioai.videos.activeJob", created.job_id);
     } catch (requestError) {
       setError(requestError.message);
     }
