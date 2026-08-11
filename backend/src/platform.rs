@@ -972,12 +972,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/assets",
             get(list_assets)
                 .post(upload_asset)
-                .layer(
-                    DefaultBodyLimit::max(
-                        MAX_VIDEO_BYTES + 1024 * 1024,
-                    ),
-                ),
-)        .route("/assets/{id}", get(get_asset).delete(delete_asset))
+                .layer(DefaultBodyLimit::max(MAX_VIDEO_BYTES + 1024 * 1024)),
+        )
+        .route("/assets/{id}", get(get_asset).delete(delete_asset))
         .route("/images/generate", post(generate_image))
         .route("/videos/generate", post(generate_video))
         .route("/generations", get(list_generations))
@@ -2093,17 +2090,11 @@ async fn model_view_with_machine(
     let installed = if entry.local {
         true
     } else {
-        worker_status
-            .as_ref()
-            .is_some_and(|status| {
-                downloaded
-                    && status.installed
-                    && status.weights_valid
-                    && status.runtime_compatible
-            })
+        worker_status.as_ref().is_some_and(|status| {
+            downloaded && status.installed && status.weights_valid && status.runtime_compatible
+        })
     };
-    let runtime_ready = entry.local
-        || worker_status.as_ref().is_some_and(worker_reports_ready);
+    let runtime_ready = entry.local || worker_status.as_ref().is_some_and(worker_reports_ready);
     let available_ram = machine.available_ram_bytes;
     let available_vram = machine.available_vram_bytes;
     // Un benchmark attaché à cette révision remplace l'estimation du Hub. Une
@@ -3984,9 +3975,7 @@ async fn generate_video(
         ));
     }
     if !entry.runtime_capabilities.contains(&expected)
-        || !entry
-            .runtime_capabilities
-            .contains(&requested_capability)
+        || !entry.runtime_capabilities.contains(&requested_capability)
     {
         return Err(ApiError::conflict(
             "Ce modèle ne supporte pas le mode vidéo choisi.",
