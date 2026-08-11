@@ -15,7 +15,7 @@ case "${ID}" in
 esac
 
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y acl ca-certificates curl file gnupg jq git openssl pciutils rsync unzip
+DEBIAN_FRONTEND=noninteractive apt-get install -y acl ca-certificates curl ffmpeg file gnupg jq git openssl pciutils rsync unzip
 
 # Ubuntu Noble ne publie plus nécessairement le paquet `awscli`. L'installeur
 # officiel v2 est autonome et fonctionne aussi bien en x86_64 qu'en aarch64.

@@ -9,6 +9,17 @@ VERSION=${1:?Usage: build-release.sh <version-immuable>}
 REGISTRY=${VIDIOAI_REGISTRY:?VIDIOAI_REGISTRY requis}
 PLATFORM=${VIDIOAI_PLATFORM:-linux/amd64}
 
+for command_name in ffmpeg ffprobe; do
+  if ! command -v "${command_name}" >/dev/null 2>&1; then
+    echo "Dépendance média requise absente: ${command_name}" >&2
+    exit 1
+  fi
+done
+if ! ffmpeg -hide_banner -encoders 2>/dev/null | grep 'libx264' >/dev/null; then
+  echo "L'encodeur H.264 libx264 est requis pour tester et publier le Worker." >&2
+  exit 1
+fi
+
 if [[ "${VERSION}" == "latest" || ! "${VERSION}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]+$ ]]; then
   echo "Version immuable invalide: ${VERSION}" >&2
   exit 1

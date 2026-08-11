@@ -59,6 +59,18 @@ jobs:
           cache: pip
           cache-dependency-path: worker/requirements-test.txt
 
+      - name: Install Worker media dependencies
+        shell: bash
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ffmpeg
+          fi
+
+          ffmpeg -version
+          ffprobe -version
+          ffmpeg -hide_banner -encoders 2>/dev/null | grep 'libx264' >/dev/null
+
 
       # --------------------------------------------------------
       # 5. AWS CLI
@@ -97,6 +109,8 @@ jobs:
           pkg-config --version
           jq --version
           cmake --version
+          ffmpeg -version
+          ffprobe -version
 
           echo "=== DOCKER DISK USAGE ==="
           docker system df

@@ -129,6 +129,12 @@ else
 fi
 
 if [[ "${SKIP_TESTS}" != "true" ]]; then
+  command -v ffmpeg >/dev/null 2>&1 || fail "FFmpeg est requis pour les tests Worker."
+  command -v ffprobe >/dev/null 2>&1 || fail "FFprobe est requis pour les tests Worker."
+  if command -v ffmpeg >/dev/null 2>&1 \
+      && ! ffmpeg -hide_banner -encoders 2>/dev/null | grep 'libx264' >/dev/null; then
+    fail "L'encodeur H.264 libx264 est requis pour les tests Worker."
+  fi
   (cd "${PROJECT_DIR}" && pytest worker/tests -q) || fail "Tests Python worker en échec."
 
   if [[ -f "${PROJECT_DIR}/pyproject.toml" || -f "${PROJECT_DIR}/ruff.toml" || -f "${PROJECT_DIR}/.ruff.toml" ]]; then
