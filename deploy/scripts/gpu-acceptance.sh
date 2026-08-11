@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 PROJECT_DIR=${VIDIOAI_PROJECT_DIR:-/opt/vidioai}
 BASE_URL=${1:-http://127.0.0.1:8080}
-TARGET_VERSION=${VIDIOAI_GPU_ACCEPTANCE_VERSION:-2026.08.11-8}
+TARGET_VERSION=${VIDIOAI_GPU_ACCEPTANCE_VERSION:-2026.08.11-9}
 COMPOSE_FILE=${VIDIOAI_COMPOSE_FILE:-${PROJECT_DIR}/compose.production.yml}
 ENV_FILE=${VIDIOAI_ENV_FILE:-${PROJECT_DIR}/.env.production}
 source "${PROJECT_DIR}/deploy/scripts/lib/scratch-storage.sh"
@@ -163,6 +163,11 @@ poll_generation() {
   echo "Timeout de la génération ${generation_id}." >&2
   return 1
 }
+
+curl -fsS "${BASE_URL}/api/ready" \
+  | jq -e '.ready == true and .mode == "ACCEPTING_JOBS"' >/dev/null
+curl -fsS "${BASE_URL}/api/models/installed" \
+  | jq -e '.items | type == "array"' >/dev/null
 
 model=$(curl -fsS --get --data-urlencode "model_id=${MODEL_ID}" "${BASE_URL}/api/models/by-id")
 jq -e '

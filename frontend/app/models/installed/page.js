@@ -85,6 +85,7 @@ export default function InstalledModelsPage() {
   const gpu = payload.gpu || {};
   const memory = payload.memory || {};
   const ramUsed = Math.max(0, Number(memory.ram_total_bytes || 0) - Number(memory.ram_available_bytes || 0));
+  const vramFree = Math.max(0, Number(gpu.vram_total_bytes || 0) - Number(gpu.vram_used_bytes || 0));
   const items = useMemo(() => [...(payload.items || [])].sort((left, right) => Number(right.id === focus) - Number(left.id === focus)), [focus, payload.items]);
 
   return (
@@ -122,9 +123,11 @@ export default function InstalledModelsPage() {
                   <div><dt>Révision</dt><dd>{model.revision.slice(0, 12)}…</dd></div>
                   <div><dt>Runtime</dt><dd>{model.device || (plan.strategy === "FULL_GPU" ? "GPU" : plan.strategy || "AUTO")}</dd></div>
                   <div><dt>VRAM</dt><dd>{formatBytes(model.vram_bytes)} · pic {formatBytes(model.vram_peak_bytes)}</dd></div>
-                  <div><dt>RAM</dt><dd>pic {formatBytes(model.ram_peak_bytes)}</dd></div>
+                  <div><dt>VRAM machine</dt><dd>{formatBytes(gpu.vram_used_bytes)} / {formatBytes(gpu.vram_total_bytes)} · libre {formatBytes(vramFree)}</dd></div>
+                  <div><dt>RAM</dt><dd>disponible {formatBytes(memory.ram_available_bytes)} / {formatBytes(memory.ram_total_bytes)} · VidioAI {formatBytes(memory.vidioai_ram_bytes)} · pic {formatBytes(model.ram_peak_bytes)}</dd></div>
+                  <div><dt>Scratch disponible</dt><dd>{formatBytes(memory.scratch_available_bytes)}</dd></div>
                   <div><dt>Stratégie</dt><dd>{model.memory_strategy || plan.strategy || "À planifier"}</dd></div>
-                  <div><dt>Disponible</dt><dd>VRAM {formatBytes(plan.vram_free_bytes)} · RAM {formatBytes(plan.ram_available_bytes)}</dd></div>
+                  <div><dt>Memory plan</dt><dd>poids {formatBytes(plan.model_bytes)} · headroom {formatBytes(plan.inference_headroom_bytes)} · pipeline {formatBytes(plan.vram_pipeline_bytes)}</dd></div>
                   <div><dt>Offload CPU</dt><dd>{model.cpu_offload ? "Oui" : "Non"}</dd></div>
                   <div><dt>Offload disque</dt><dd>{model.disk_offload ? "Oui" : "Non"}</dd></div>
                 </dl>

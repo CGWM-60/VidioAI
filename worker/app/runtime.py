@@ -53,12 +53,13 @@ class WorkerError(RuntimeError):
         status_code: int = 409,
         *,
         code: str = "WORKER_ERROR",
-        retryable: bool = False,
+        retryable: bool | None = None,
     ) -> None:
         super().__init__(message)
-        self.status_code = status_code
+        resource_exhausted = code == "INSUFFICIENT_VRAM"
+        self.status_code = 409 if resource_exhausted and status_code == 500 else status_code
         self.code = code
-        self.retryable = retryable
+        self.retryable = resource_exhausted if retryable is None else retryable
 
 
 @dataclass(slots=True)
@@ -1621,6 +1622,8 @@ class RuntimeManager:
         width: int | None = None,
         height: int | None = None,
         frames: int | None = None,
+        vram_pipeline_bytes: int = 0,
+        current_strategy: str | None = None,
     ) -> MemoryPlan:
         gpu = self._nvidia_metrics() or {}
         total = int(gpu.get("vram_total_bytes") or 0)
@@ -1639,6 +1642,7 @@ class RuntimeManager:
             vram_total_bytes=total,
             vram_free_bytes=max(0, total - used),
             model_bytes=max(0, int(model_bytes)),
+            vram_pipeline_bytes=max(0, int(vram_pipeline_bytes)),
             ram_total_bytes=memory["ram_total_bytes"],
             ram_available_bytes=memory["ram_available_bytes"],
             vidioai_ram_bytes=memory["vidioai_ram_bytes"],
@@ -1649,6 +1653,7 @@ class RuntimeManager:
             width=int(width or profile.width),
             height=int(height or profile.height),
             frames=int(frames or (97 if is_video else 1)),
+            current_strategy=current_strategy,
         )
 
     @staticmethod
@@ -1667,6 +1672,15 @@ class RuntimeManager:
         path = getattr(pipeline, "_vidioai_disk_offload_dir", None)
         if path:
             shutil.rmtree(path, ignore_errors=True)
+
+    @staticmethod
+    def _remove_offload_hooks(pipeline: Any) -> None:
+        try:
+            from accelerate.hooks import remove_hook_from_module
+
+            remove_hook_from_module(pipeline, recurse=True)
+        except (ImportError, RuntimeError, TypeError, ValueError):
+            pass
 
     def _apply_memory_plan(self, pipeline: Any, plan: MemoryPlan, device: str) -> Any:
         if not plan.feasible:
@@ -2389,17 +2403,24 @@ class RuntimeManager:
         if loaded.device != "cuda" or loaded.precision_plan is None:
             return
         model_bytes = loaded.memory_plan.model_bytes if loaded.memory_plan is not None else 0
+        vram_after_load = int(loaded.load_benchmark.get("vram_after_load_bytes", 0))
+        vram_idle = int(loaded.load_benchmark.get("vram_idle_bytes", 0))
+        pipeline_vram_bytes = max(0, vram_after_load - vram_idle)
+        current_strategy = (
+            loaded.memory_plan.strategy if loaded.memory_plan is not None else "FULL_GPU"
+        )
         request_plan = self._memory_plan(
             torch,
             loaded.metadata or {},
             capability,
             loaded.precision_plan,
-            0,
+            model_bytes,
             width=int(prepared_request.get("width") or 1024),
             height=int(prepared_request.get("height") or 1024),
             frames=int(prepared_request.get("frames") or 1),
+            vram_pipeline_bytes=pipeline_vram_bytes,
+            current_strategy=current_strategy,
         )
-        request_plan.model_bytes = model_bytes
         if not request_plan.feasible:
             raise WorkerError(
                 "Chargement impossible : VRAM insuffisante pour cette résolution et ce nombre de frames.",
@@ -2413,8 +2434,9 @@ class RuntimeManager:
             "SEQUENTIAL_CPU_OFFLOAD": 2,
             "DISK_OFFLOAD": 3,
         }
-        current_strategy = loaded.memory_plan.strategy if loaded.memory_plan is not None else "FULL_GPU"
         if ranks.get(request_plan.strategy, 0) > ranks.get(current_strategy, 0):
+            self._cleanup_disk_offload(loaded.pipeline)
+            self._remove_offload_hooks(loaded.pipeline)
             if hasattr(loaded.pipeline, "to"):
                 loaded.pipeline.to("cpu")
             gc.collect()
@@ -2426,6 +2448,13 @@ class RuntimeManager:
             loaded.load_benchmark["memory_strategy"] = request_plan.strategy
             loaded.load_benchmark["cpu_offload"] = request_plan.strategy != "DISK_OFFLOAD"
             loaded.load_benchmark["disk_offload"] = request_plan.strategy == "DISK_OFFLOAD"
+        loaded.memory_plan = request_plan
+        loaded.load_benchmark["memory_plan"] = request_plan.as_dict()
+        with self._lock:
+            current = self._model_states.get(loaded.model_id)
+            if current is not None:
+                current["memory_plan"] = request_plan.as_dict()
+                current["memory_strategy"] = request_plan.strategy
 
     def _generate_with_adapter(
         self,
@@ -2677,12 +2706,24 @@ class RuntimeManager:
                 "error": None,
             }
         except Exception as error:
+            if isinstance(error, WorkerError):
+                message = str(error)
+                error_code = error.code
+                retryable = error.retryable
+                status_code = error.status_code
+            else:
+                message = "La génération a échoué dans le runtime Diffusers."
+                error_code = "GENERATION_FAILED"
+                retryable = False
+                status_code = 500
             result = {
                 "job_id": job_id,
                 "state": JobState.FAILED,
                 "progress": self._jobs[job_id]["progress"],
-                "error": f"{type(error).__name__}: {error}",
-                "error_code": getattr(error, "code", "GENERATION_FAILED"),
+                "error": message,
+                "error_code": error_code,
+                "retryable": retryable,
+                "status_code": status_code,
             }
         finally:
             with self._lock:

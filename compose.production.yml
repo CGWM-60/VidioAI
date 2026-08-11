@@ -58,6 +58,7 @@ services:
     environment:
       APP_ENV: GPU_PRODUCTION
       GPU_REQUIRED: "true"
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
       VIDIOAI_WORKER_TOKEN: ${VIDIOAI_WORKER_TOKEN:?worker token requis}
       VIDIOAI_MODELS_DIR: /models
       VIDIOAI_WORK_DIR: /worker-work

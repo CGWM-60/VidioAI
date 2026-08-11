@@ -16,9 +16,11 @@ cleanup() {
     docker run --rm \
       --user 0 \
       --entrypoint sh \
+      -e CLEANUP_UID="$(id -u)" \
+      -e CLEANUP_GID="$(id -g)" \
       -v "${SCRATCH_ROOT}:/scratch" \
       "${IMAGE}" \
-      -c 'chmod -R a+rwX /scratch' >/dev/null 2>&1 || true
+      -c 'chown -R "${CLEANUP_UID}:${CLEANUP_GID}" /scratch' >/dev/null 2>&1 || true
     rm -rf -- "${SCRATCH_ROOT}" || true
   fi
 }
@@ -86,7 +88,9 @@ docker run --rm --entrypoint sh "${IMAGE}" -ceu '
 
 SCRATCH_ROOT=$(mktemp -d /tmp/vidioai-worker-image.XXXXXX)
 mkdir -p "${SCRATCH_ROOT}/models" "${SCRATCH_ROOT}/cache" "${SCRATCH_ROOT}/work" "${SCRATCH_ROOT}/worker-work"
-chmod 0777 "${SCRATCH_ROOT}/models" "${SCRATCH_ROOT}/cache" "${SCRATCH_ROOT}/work" "${SCRATCH_ROOT}/worker-work"
+docker run --rm --user 0 --entrypoint sh \
+  -v "${SCRATCH_ROOT}:/scratch" "${IMAGE}" \
+  -c 'chown -R 10002:10002 /scratch && chmod -R u+rwX,go-rwx /scratch'
 
 docker run -d --name "${CONTAINER_NAME}" \
   -e APP_ENV=GPU_PRODUCTION \

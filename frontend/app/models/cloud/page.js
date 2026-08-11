@@ -22,6 +22,12 @@ function formatRate(bytes) {
   return `${(bytes / 1048576).toFixed(1)} Mo/s`;
 }
 
+function formatEta(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "ETA —";
+  const rounded = Math.round(seconds);
+  return `ETA ${Math.floor(rounded / 60)}:${String(rounded % 60).padStart(2, "0")}`;
+}
+
 function capabilityLabel(value) {
   return ({ TEXT_TO_IMAGE: "T2I", IMAGE_TO_IMAGE: "I2I", TEXT_TO_VIDEO: "T2V", IMAGE_TO_VIDEO: "I2V", VIDEO_TO_VIDEO: "V2V" })[value] || value.replaceAll("_", " ");
 }
@@ -174,8 +180,8 @@ export default function CloudModelsPage() {
                 <div><strong>{job.model_id}</strong><span>{view.failed ? "Échec de restauration" : view.completed ? "Restauré" : "Restauration depuis S3"}</span></div>
                 {!view.failed && <strong>{view.progress}%</strong>}
               </div>
-              {view.restoring && <><div className={styles.restoreProgress}><span style={{ width: `${view.progress}%` }} /></div><div className={styles.restoreMetrics}><span>{formatBytes(transfer?.bytes_transferred || 0)} / {formatBytes(transfer?.bytes_total || 0)}</span><span>{formatRate(transfer?.bytes_per_second)}</span><span>{transfer?.current_file || job.stage}</span></div></>}
-              {view.failed && <div className={styles.restoreError}><strong>{view.errorCode}</strong><span>{view.errorMessage}</span><button className={styles.secondaryButton} onClick={() => void restore(models.filter((model) => model.repository === job.model_id))}>Réessayer</button></div>}
+              {view.restoring && <><div className={styles.restoreProgress}><span style={{ width: `${view.progress}%` }} /></div><div className={styles.restoreMetrics}><span>{formatBytes(transfer?.bytes_transferred || 0)} / {formatBytes(transfer?.bytes_total || 0)}</span><span>{transfer?.files_completed || 0} / {transfer?.files_total || 0} fichiers</span><span>{formatRate(transfer?.bytes_per_second)}</span><span>{formatEta(transfer?.eta_seconds)}</span><span>{transfer?.current_file || job.stage}</span></div></>}
+              {view.failed && <div className={styles.restoreError}><strong>{view.errorCode}</strong><span>{view.errorMessage}</span><button className={styles.secondaryButton} onClick={() => void restore(models.filter((model) => `${model.repository}@${model.revision}` === job.target_id))}>Réessayer</button></div>}
               {installedHref && <Link className={styles.secondaryButton} href={installedHref}>Voir le modèle</Link>}
             </article>
           );
@@ -186,7 +192,7 @@ export default function CloudModelsPage() {
         <div className={styles.cloudGrid}>
           {models.map((model) => {
             const identity = `${model.repository}@${model.revision}`;
-            const active = jobs.some((job) => job.model_id === model.repository && !CLOUD_TERMINAL_STATUSES.has(job.status));
+            const active = jobs.some((job) => job.target_id === identity && !CLOUD_TERMINAL_STATUSES.has(job.status));
             return (
               <article className={`${styles.cloudCard} ${selected.includes(identity) ? styles.cloudCardSelected : ""}`} key={identity}>
                 <div className={styles.cloudCardHeading}><label><input type="checkbox" checked={selected.includes(identity)} onChange={() => toggle(model)} /><span>{model.repository}</span></label><BsHddStack /></div>

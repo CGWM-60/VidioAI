@@ -74,12 +74,21 @@ EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
 url="${*: -1}"
+echo "${url}" >>"${VIDIOAI_TEST_STATE_DIR}/curl.log"
 if [[ "${url}" == *"/system" ]]; then
   echo '{"source":"host"}'
   exit 0
 fi
 if [[ "${url}" == *"/api/admin/drain" ]]; then
-  echo '{}'
+  echo '{"mode":"DRAINING"}'
+  exit 0
+fi
+if [[ "${url}" == *"/api/admin/resume" ]]; then
+  echo '{"mode":"ACCEPTING_JOBS"}'
+  exit 0
+fi
+if [[ "${url}" == *"/api/ready" ]]; then
+  echo '{"ready":true,"mode":"ACCEPTING_JOBS"}'
   exit 0
 fi
 echo '{}'
@@ -340,5 +349,13 @@ VIDIOAI_SKIP_SMOKE_TEST=true \
 
 assert_file_contains "${project_ok}/.current-version" "V1"
 assert_file_contains "${project_ok}/.previous-version" "V1"
+grep -Fq "/api/models/installed" "${state_ok}/curl.log" || {
+  echo "Le déploiement n'a pas validé la route statique /api/models/installed." >&2
+  exit 1
+}
+grep -Fq "/api/admin/resume" "${state_ok}/curl.log" || {
+  echo "Le déploiement n'a pas quitté le mode DRAINING." >&2
+  exit 1
+}
 
 echo "Deploy recovery/idempotence tests: OK"

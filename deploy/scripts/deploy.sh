@@ -158,6 +158,38 @@ if [[ -n "${CALLER_SCRATCH_SET}" && "${CALLER_SCRATCH_VALUE}" != "${VIDIOAI_SCRA
   exit 1
 fi
 vidioai_require_production_scratch "${ENV_FILE}"
+
+prepare_scratch_permissions() {
+  local directories=(models cache work worker-work)
+  if [[ -n "${VIDIOAI_TEST_STATE_DIR:-}" ]]; then
+    return 0
+  fi
+  [[ "${EUID}" -eq 0 ]] || {
+    echo "Le déploiement doit préparer les ACL Scratch en root." >&2
+    return 1
+  }
+  command -v setfacl >/dev/null 2>&1 || {
+    echo "setfacl est requis pour partager le Scratch entre les UID 10001 et 10002." >&2
+    return 1
+  }
+  install -d -m 0770 -o root -g docker \
+    "${VIDIOAI_SCRATCH_DIR}/models" \
+    "${VIDIOAI_SCRATCH_DIR}/cache" \
+    "${VIDIOAI_SCRATCH_DIR}/work" \
+    "${VIDIOAI_SCRATCH_DIR}/worker-work"
+  setfacl -Rm u:10001:rwx,u:10002:rwx \
+    "${VIDIOAI_SCRATCH_DIR}/models" \
+    "${VIDIOAI_SCRATCH_DIR}/cache" \
+    "${VIDIOAI_SCRATCH_DIR}/work" \
+    "${VIDIOAI_SCRATCH_DIR}/worker-work"
+  setfacl -Rdm u:10001:rwx,u:10002:rwx \
+    "${VIDIOAI_SCRATCH_DIR}/models" \
+    "${VIDIOAI_SCRATCH_DIR}/cache" \
+    "${VIDIOAI_SCRATCH_DIR}/work" \
+    "${VIDIOAI_SCRATCH_DIR}/worker-work"
+}
+
+prepare_scratch_permissions
 mkdir -p "${BACKUP_DIR}"
 cp "${ENV_FILE}" "${BACKUP_DIR}/env-$(date +%Y%m%d-%H%M%S)"
 
@@ -208,8 +240,22 @@ if [[ "${VIDIOAI_SKIP_SMOKE_TEST:-false}" != "true" ]]; then
 fi
 
 check_proxy_route "/api/health" "200"
+check_proxy_route "/api/models/installed" "200"
 check_proxy_route "/" "200"
 check_proxy_route "/models" "200"
+
+resume_payload=$(curl -fsS -X POST \
+  -H "Authorization: Bearer ${VIDIOAI_ADMIN_TOKEN}" \
+  "http://127.0.0.1:${VIDIOAI_HTTP_PORT:-8080}/api/admin/resume")
+jq -e '.mode == "ACCEPTING_JOBS"' <<<"${resume_payload}" >/dev/null || {
+  echo "Le backend n'a pas confirmé ACCEPTING_JOBS après déploiement." >&2
+  exit 1
+}
+ready_payload=$(curl -fsS "http://127.0.0.1:${VIDIOAI_HTTP_PORT:-8080}/api/ready")
+jq -e '.ready == true and .mode == "ACCEPTING_JOBS"' <<<"${ready_payload}" >/dev/null || {
+  echo "État final invalide: ready=true et ACCEPTING_JOBS sont obligatoires." >&2
+  exit 1
+}
 
 printf '%s\n' "${VERSION}" > .current-version
 echo "Déploiement ${VERSION} validé."

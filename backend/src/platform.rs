@@ -32,8 +32,9 @@ use std::{
 };
 use tokio::{
     fs,
+    io::AsyncReadExt,
     process::Command,
-    sync::{RwLock, broadcast, mpsc},
+    sync::{Mutex, RwLock, broadcast, mpsc},
     time::{Duration, Instant, sleep},
 };
 use uuid::Uuid;
@@ -51,7 +52,7 @@ use crate::huggingface_catalog::{
 use crate::job_store::JobStore;
 use crate::object_storage::{
     ObjectStorage, S3Storage, SnapshotManifest, TransferProgressCallback, UploadProgress,
-    UploadProgressCallback, model_s3_prefix,
+    UploadProgressCallback, is_snapshot_file, model_s3_prefix,
 };
 use crate::worker::{
     GenerateResponse, WorkerBenchmarkObservation, WorkerClient, WorkerCompatibility, WorkerReady,
@@ -755,6 +756,8 @@ pub struct AppState {
     catalog: HuggingFaceCatalogService,
     compatibility_cache: RwLock<HashMap<String, (u64, WorkerCompatibility)>>,
     jobs: RwLock<HashMap<Uuid, Job>>,
+    /// Réservation atomique des restaurations par repository@revision.
+    restore_claims: Mutex<HashMap<String, Uuid>>,
     runtime: RwLock<HashMap<String, RuntimeEntry>>,
     generations: RwLock<HashMap<Uuid, Generation>>,
     projects: RwLock<HashMap<Uuid, Project>>,
@@ -826,6 +829,7 @@ impl AppState {
             catalog,
             compatibility_cache: RwLock::new(HashMap::new()),
             jobs: RwLock::new(jobs),
+            restore_claims: Mutex::new(HashMap::new()),
             runtime: RwLock::new(HashMap::new()),
             generations: RwLock::new(generations),
             projects: RwLock::new(projects),
@@ -3323,6 +3327,10 @@ struct CloudRestoreInput {
     models: Vec<CloudRestoreSelection>,
 }
 
+fn restore_identity(repository: &str, revision: &str) -> String {
+    format!("{repository}@{revision}")
+}
+
 fn select_cloud_manifests(
     available: Vec<SnapshotManifest>,
     requested: &[CloudRestoreSelection],
@@ -3418,7 +3426,9 @@ async fn list_cloud_models(
         };
         let cloud_state = restore_jobs
             .iter()
-            .filter(|job| job.target_id == manifest.repository)
+            .filter(|job| {
+                job.target_id == restore_identity(&manifest.repository, &manifest.revision)
+            })
             .max_by_key(|job| job.updated_at)
             .map(|job| match job.status {
                 JobStatus::Queued
@@ -3470,29 +3480,6 @@ async fn restore_cloud_models(
             "Sélectionnez entre 1 et 20 snapshots.",
         ));
     }
-    let active_restores = state
-        .jobs
-        .read()
-        .await
-        .values()
-        .filter(|job| {
-            job.kind == JobKind::RestoreModel
-                && matches!(
-                    job.status,
-                    JobStatus::Queued | JobStatus::Dispatching | JobStatus::Running
-                )
-        })
-        .map(|job| job.target_id.clone())
-        .collect::<HashSet<_>>();
-    if input
-        .models
-        .iter()
-        .any(|selection| active_restores.contains(&selection.repository))
-    {
-        return Err(ApiError::conflict(
-            "CLOUD_RESTORE_ALREADY_RUNNING: une restauration est déjà active pour ce modèle.",
-        ));
-    }
     let available = state
         .object_storage
         .list_snapshots()
@@ -3501,41 +3488,181 @@ async fn restore_cloud_models(
     let selected =
         select_cloud_manifests(available, &input.models).map_err(ApiError::bad_request)?;
 
-    let mut jobs = Vec::with_capacity(input.models.len());
-    for manifest in selected {
-        let job = Job {
-            id: Uuid::new_v4(),
-            kind: JobKind::RestoreModel,
-            target_id: manifest.repository.clone(),
-            model_id: Some(manifest.repository.clone()),
-            capability: None,
-            status: JobStatus::Queued,
-            stage: "queued".into(),
-            progress: 0,
-            message: "Restauration S3 ajoutée à la file".into(),
-            transfer: None,
-            dependency: None,
-            cache_status: Some("CLOUD_AVAILABLE".into()),
-            cache_error: None,
-            started_at: None,
-            completed_at: None,
-            error: None,
-            result: None,
-            created_at: unix_now(),
-            updated_at: unix_now(),
-        };
-        state.insert_job(job.clone()).await?;
+    let pending = selected
+        .into_iter()
+        .map(|manifest| {
+            let identity = restore_identity(&manifest.repository, &manifest.revision);
+            let job = Job {
+                id: Uuid::new_v4(),
+                kind: JobKind::RestoreModel,
+                target_id: identity.clone(),
+                model_id: Some(manifest.repository.clone()),
+                capability: None,
+                status: JobStatus::Queued,
+                stage: "queued".into(),
+                progress: 0,
+                message: "Restauration S3 ajoutée à la file".into(),
+                transfer: None,
+                dependency: None,
+                cache_status: Some("CLOUD_AVAILABLE".into()),
+                cache_error: None,
+                started_at: None,
+                completed_at: None,
+                error: None,
+                result: None,
+                created_at: unix_now(),
+                updated_at: unix_now(),
+            };
+            (identity, job, manifest)
+        })
+        .collect::<Vec<_>>();
+
+    {
+        let mut claims = state.restore_claims.lock().await;
+        if pending
+            .iter()
+            .any(|(identity, _, _)| claims.contains_key(identity))
+        {
+            return Err(ApiError::conflict(
+                "RESTORE_ALREADY_RUNNING: une restauration est déjà active pour ce repository@revision.",
+            ));
+        }
+        for (identity, job, _) in &pending {
+            claims.insert(identity.clone(), job.id);
+        }
+    }
+
+    for (_, job, _) in &pending {
+        if let Err(error) = state.insert_job(job.clone()).await {
+            let mut claims = state.restore_claims.lock().await;
+            for (identity, _, _) in &pending {
+                claims.remove(identity);
+            }
+            return Err(error);
+        }
+    }
+
+    let mut jobs = Vec::with_capacity(pending.len());
+    for (identity, job, manifest) in pending {
         let task_state = state.clone();
         let task_job = job.clone();
         tokio::spawn(async move {
-            run_cloud_restore(task_state, task_job, manifest).await;
+            run_cloud_restore(task_state, task_job, manifest, identity).await;
         });
         jobs.push(job);
     }
     Ok((StatusCode::ACCEPTED, Json(jobs)))
 }
 
-async fn run_cloud_restore(state: Arc<AppState>, job: Job, manifest: SnapshotManifest) {
+async fn snapshot_file_sha256(path: &FilePath) -> Result<String, String> {
+    let mut file = fs::File::open(path)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .await
+            .map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+async fn snapshot_matches_manifest(root: &FilePath, manifest: &SnapshotManifest) -> bool {
+    for file in &manifest.files {
+        let relative = FilePath::new(&file.path);
+        if !is_snapshot_file(relative) {
+            return false;
+        }
+        let path = root.join(relative);
+        if !fs::metadata(&path)
+            .await
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == file.size)
+        {
+            return false;
+        }
+        if let Some(expected) = &file.sha256
+            && snapshot_file_sha256(&path).await.as_deref() != Ok(expected.as_str())
+        {
+            return false;
+        }
+    }
+    true
+}
+
+async fn seed_restore_staging(
+    source: &FilePath,
+    staging: &FilePath,
+    manifest: &SnapshotManifest,
+) -> Result<(), String> {
+    for file in &manifest.files {
+        let relative = FilePath::new(&file.path);
+        if !is_snapshot_file(relative) {
+            return Err("S3_MANIFEST_PATH_INVALID: chemin de fichier invalide".into());
+        }
+        let existing = source.join(relative);
+        if !fs::metadata(&existing)
+            .await
+            .is_ok_and(|metadata| metadata.is_file())
+        {
+            continue;
+        }
+        let target = staging.join(relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        if fs::hard_link(&existing, &target).await.is_err() {
+            fs::copy(&existing, &target)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+async fn promote_restored_snapshot(
+    staging: &FilePath,
+    final_path: &FilePath,
+    quarantine: &FilePath,
+    manifest: &SnapshotManifest,
+) -> Result<(), String> {
+    if snapshot_matches_manifest(final_path, manifest).await {
+        fs::remove_dir_all(staging)
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    let had_previous = fs::metadata(final_path).await.is_ok();
+    if had_previous {
+        fs::rename(final_path, quarantine)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    if let Err(error) = fs::rename(staging, final_path).await {
+        if had_previous {
+            let _ = fs::rename(quarantine, final_path).await;
+        }
+        return Err(error.to_string());
+    }
+    if had_previous {
+        let _ = fs::remove_dir_all(quarantine).await;
+    }
+    Ok(())
+}
+
+async fn run_cloud_restore(
+    state: Arc<AppState>,
+    job: Job,
+    manifest: SnapshotManifest,
+    identity: String,
+) {
     state
         .update_job(
             job.id,
@@ -3550,6 +3677,18 @@ async fn run_cloud_restore(state: Arc<AppState>, job: Job, manifest: SnapshotMan
         let model_id = storage_id(&manifest.repository);
         let model_root = settings.models_dir.join(&model_id);
         let snapshot_root = model_root.join(&manifest.revision);
+        let restore_root = settings
+            .models_dir
+            .join(".restore")
+            .join(job.id.to_string());
+        let quarantine = settings
+            .models_dir
+            .join(".restore")
+            .join(format!("{}.previous", job.id));
+        fs::create_dir_all(&restore_root)
+            .await
+            .map_err(|error| error.to_string())?;
+        seed_restore_staging(&snapshot_root, &restore_root, &manifest).await?;
         let (sender, mut receiver) = mpsc::unbounded_channel::<UploadProgress>();
         let callback: TransferProgressCallback = Arc::new(move |progress| {
             let _ = sender.send(progress);
@@ -3557,7 +3696,7 @@ async fn run_cloud_restore(state: Arc<AppState>, job: Job, manifest: SnapshotMan
         let mut restore = Box::pin(state.object_storage.restore_snapshot(
             &manifest.repository,
             &manifest.revision,
-            &snapshot_root,
+            &restore_root,
             Some(callback),
         ));
         let restored = loop {
@@ -3594,11 +3733,14 @@ async fn run_cloud_restore(state: Arc<AppState>, job: Job, manifest: SnapshotMan
         fs::create_dir_all(&model_root)
             .await
             .map_err(|error| error.to_string())?;
+        promote_restored_snapshot(&restore_root, &snapshot_root, &quarantine, &manifest).await?;
         let pointer = json!({
             "model_id": model_id,
             "repository": manifest.repository,
             "revision": manifest.revision,
         });
+        let active_pointer = model_root.join("active.json");
+        let previous_pointer = fs::read(&active_pointer).await.ok();
         let temporary = model_root.join(format!("active.json.{}.tmp", job.id));
         fs::write(
             &temporary,
@@ -3606,7 +3748,7 @@ async fn run_cloud_restore(state: Arc<AppState>, job: Job, manifest: SnapshotMan
         )
         .await
         .map_err(|error| error.to_string())?;
-        fs::rename(temporary, model_root.join("active.json"))
+        fs::rename(temporary, &active_pointer)
             .await
             .map_err(|error| error.to_string())?;
 
@@ -3623,17 +3765,37 @@ async fn run_cloud_restore(state: Arc<AppState>, job: Job, manifest: SnapshotMan
                 "Validation locale du snapshot",
             )
             .await;
-        let installed = worker
+        let installed_result = worker
             .install(
                 &model_id,
                 &manifest.repository,
                 &manifest.revision,
                 &manifest.capabilities,
             )
-            .await?;
-        if !installed.installed || !installed.weights_valid {
-            return Err("SNAPSHOT_INVALID: le worker a refusé les poids restaurés".into());
-        }
+            .await;
+        let _installed = match installed_result {
+            Ok(installed) if installed.installed && installed.weights_valid => installed,
+            Ok(_) => {
+                if let Some(previous) = previous_pointer {
+                    fs::write(&active_pointer, previous)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                } else {
+                    let _ = fs::remove_file(&active_pointer).await;
+                }
+                return Err("SNAPSHOT_INVALID: le worker a refusé les poids restaurés".into());
+            }
+            Err(error) => {
+                if let Some(previous) = previous_pointer {
+                    fs::write(&active_pointer, previous)
+                        .await
+                        .map_err(|restore_error| restore_error.to_string())?;
+                } else {
+                    let _ = fs::remove_file(&active_pointer).await;
+                }
+                return Err(error);
+            }
+        };
         Ok(json!({
             "repository": manifest.repository,
             "revision": manifest.revision,
@@ -3670,6 +3832,15 @@ async fn run_cloud_restore(state: Arc<AppState>, job: Job, manifest: SnapshotMan
                 .await;
         }
     }
+    let settings = state.settings.get().await;
+    let _ = fs::remove_dir_all(
+        settings
+            .models_dir
+            .join(".restore")
+            .join(job.id.to_string()),
+    )
+    .await;
+    state.restore_claims.lock().await.remove(&identity);
 }
 
 /// Mesure les octets effectivement présents dans le staging du Worker. Cette
@@ -6074,7 +6245,8 @@ mod tests {
         AppSettings, CanvasEngine, CloudModelView, CloudRestoreSelection, GenerateVideoRequest,
         GenerationMode, ModelCapability, ModelIdQuery, image_endpoint,
         is_valid_image_capability_for_mode, is_valid_video_capability_for_mode,
-        local_runtime_models, procedural_video_dimensions, select_cloud_manifests, video_endpoint,
+        local_runtime_models, procedural_video_dimensions, promote_restored_snapshot,
+        restore_identity, seed_restore_staging, select_cloud_manifests, video_endpoint,
         worker_runtime_flags,
     };
     use crate::object_storage::{SnapshotFile, SnapshotManifest};
@@ -6126,6 +6298,66 @@ mod tests {
             serde_json::to_value(view).unwrap()["cloud_state"],
             "AVAILABLE"
         );
+    }
+
+    #[test]
+    fn cloud_restore_lock_identity_includes_the_exact_revision() {
+        assert_eq!(
+            restore_identity("owner/model", "revision-1"),
+            "owner/model@revision-1"
+        );
+        assert_ne!(
+            restore_identity("owner/model", "revision-1"),
+            restore_identity("owner/model", "revision-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_restore_staging_is_unique_and_promoted_only_when_complete() {
+        use sha2::{Digest, Sha256};
+
+        let root = std::env::temp_dir().join(format!("vidioai-restore-{}", uuid::Uuid::new_v4()));
+        let final_path = root.join("model/revision");
+        let staging = root.join(".restore/job-id");
+        let quarantine = root.join(".restore/job-id.previous");
+        tokio::fs::create_dir_all(&final_path).await.unwrap();
+        tokio::fs::write(final_path.join("model.safetensors"), b"old")
+            .await
+            .unwrap();
+        let expected = format!("{:x}", Sha256::digest(b"new-valid-weights"));
+        let manifest = SnapshotManifest {
+            repository: "owner/model".into(),
+            revision: "revision".into(),
+            files: vec![SnapshotFile {
+                path: "model.safetensors".into(),
+                size: 17,
+                sha256: Some(expected),
+            }],
+            total_size: 17,
+            created_at: 1,
+            schema_version: 1,
+            capabilities: vec![],
+        };
+
+        seed_restore_staging(&final_path, &staging, &manifest)
+            .await
+            .unwrap();
+        tokio::fs::write(staging.join("model.safetensors"), b"new-valid-weights")
+            .await
+            .unwrap();
+        promote_restored_snapshot(&staging, &final_path, &quarantine, &manifest)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read(final_path.join("model.safetensors"))
+                .await
+                .unwrap(),
+            b"new-valid-weights"
+        );
+        assert!(tokio::fs::metadata(&staging).await.is_err());
+        assert!(tokio::fs::metadata(&quarantine).await.is_err());
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 
     #[test]
