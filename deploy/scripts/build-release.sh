@@ -37,16 +37,24 @@ assert_registry_tag_absent() {
 }
 
 assert_s3_object_absent() {
-  local uri=${1:?URI S3 requise}
-  local listing
-  if ! listing=$(aws s3 ls "${uri}" "${AWS_ENDPOINT_ARGS[@]}" 2>&1); then
-    echo "Impossible de vérifier l'immuabilité S3 de ${uri}: ${listing}" >&2
-    return 1
-  fi
-  if [[ -n "${listing}" ]]; then
+  local bucket=${1:?bucket requis}
+  local key=${2:?clé requise}
+  local uri="s3://${bucket}/${key}"
+  local diagnostic
+  if diagnostic=$(aws s3api head-object \
+    --bucket "${bucket}" \
+    --key "${key}" \
+    "${AWS_ENDPOINT_ARGS[@]}" 2>&1); then
     echo "Release immutable refusée: l'objet existe déjà: ${uri}" >&2
     return 1
   fi
+  case "${diagnostic}" in
+    *"NoSuchKey"*|*"Not Found"*|*"404"*) return 0 ;;
+    *)
+      echo "Impossible de vérifier l'immuabilité S3 de ${uri}: ${diagnostic}" >&2
+      return 1
+      ;;
+  esac
 }
 
 for service in backend frontend worker; do
@@ -60,8 +68,8 @@ fi
 
 if [[ -n "${AWS_S3_BUCKET:-}" ]]; then
   vidioai_validate_s3_bucket "${AWS_S3_BUCKET}"
-  assert_s3_object_absent "$(vidioai_release_uri "${AWS_S3_BUCKET}" "${VERSION}" deployment.tar.gz)"
-  assert_s3_object_absent "$(vidioai_release_uri "${AWS_S3_BUCKET}" "${VERSION}" release.json)"
+  assert_s3_object_absent "${AWS_S3_BUCKET}" "releases/${VERSION}/deployment.tar.gz"
+  assert_s3_object_absent "${AWS_S3_BUCKET}" "releases/${VERSION}/release.json"
 fi
 
 cd "${PROJECT_DIR}"
@@ -136,8 +144,8 @@ if [[ -n "${AWS_S3_BUCKET:-}" ]]; then
   vidioai_validate_s3_bucket "${AWS_S3_BUCKET}"
   DEPLOYMENT_URI=$(vidioai_release_uri "${AWS_S3_BUCKET}" "${VERSION}" deployment.tar.gz)
   MANIFEST_URI=$(vidioai_release_uri "${AWS_S3_BUCKET}" "${VERSION}" release.json)
-  assert_s3_object_absent "${DEPLOYMENT_URI}"
-  assert_s3_object_absent "${MANIFEST_URI}"
+  assert_s3_object_absent "${AWS_S3_BUCKET}" "releases/${VERSION}/deployment.tar.gz"
+  assert_s3_object_absent "${AWS_S3_BUCKET}" "releases/${VERSION}/release.json"
   aws s3 cp "${RELEASE_ARCHIVE}" \
     "${DEPLOYMENT_URI}" \
     --storage-class "${AWS_S3_STORAGE_CLASS:-STANDARD}" \
