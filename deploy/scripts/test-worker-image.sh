@@ -9,7 +9,17 @@ SCRATCH_ROOT=""
 cleanup() {
   docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
   if [[ -n "${SCRATCH_ROOT}" && -d "${SCRATCH_ROOT}" ]]; then
-    rm -rf -- "${SCRATCH_ROOT}"
+    # Le Worker (UID 10002) crée notamment runtime-deps avec des répertoires
+    # non inscriptibles par l'utilisateur du runner CI. Nettoyer le bind mount
+    # depuis l'image en root avant de retirer le dossier hôte évite qu'un test
+    # entièrement vert échoue uniquement dans le trap EXIT.
+    docker run --rm \
+      --user 0 \
+      --entrypoint sh \
+      -v "${SCRATCH_ROOT}:/scratch" \
+      "${IMAGE}" \
+      -c 'chmod -R a+rwX /scratch' >/dev/null 2>&1 || true
+    rm -rf -- "${SCRATCH_ROOT}" || true
   fi
 }
 trap cleanup EXIT
