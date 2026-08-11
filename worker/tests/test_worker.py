@@ -1235,6 +1235,172 @@ def test_install_model_public_repository_works_with_token(
     assert observed["download_token"] == "hf_valid_token"
 
 
+def test_preflight_keeps_model_index_when_optional_root_config_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+    attempted: list[str] = []
+
+    class RemoteEntryNotFoundError(Exception):
+        pass
+
+    class LTXPipeline:
+        def __call__(self, prompt: str, num_frames: int = 9) -> None:
+            del prompt, num_frames
+
+    def fake_hf_hub_download(**kwargs) -> str:
+        filename = str(kwargs["filename"])
+        attempted.append(filename)
+        if filename == "config.json":
+            raise RemoteEntryNotFoundError("optional root config is absent")
+        destination = Path(kwargs["local_dir"]) / filename
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            json.dumps(
+                {
+                    "_class_name": "LTXPipeline",
+                    "library_name": "diffusers",
+                    "pipeline_tag": "text-to-video",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return str(destination)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(hf_hub_download=fake_hf_hub_download),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "diffusers",
+        SimpleNamespace(LTXPipeline=LTXPipeline),
+    )
+
+    metadata = manager._preflight_remote_metadata(
+        "example/valid-video",
+        "valid-revision",
+        tmp_path / "remote-metadata",
+        None,
+    )
+
+    assert attempted == ["model_index.json", "config.json"]
+    assert metadata is not None
+    assert metadata["class_name"] == "LTXPipeline"
+    assert metadata["compatibility_status"] == "SUPPORTED"
+    assert metadata["runtime_supported"] is True
+
+
+def test_install_model_repository_not_found_uses_precise_error_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+
+    class RepositoryNotFoundError(Exception):
+        pass
+
+    class FakeHfApi:
+        def __init__(self, token: str | None = None) -> None:
+            del token
+
+        def model_info(self, repository: str, revision: str = "main") -> None:
+            del repository, revision
+            raise RepositoryNotFoundError("repository lookup failed")
+
+    monkeypatch.setattr(
+        manager,
+        "_imports",
+        lambda: _fake_runtime_imports(
+            cuda_available=False,
+            hf_api=FakeHfApi,
+            snapshot_download=lambda **_kwargs: pytest.fail(
+                "Aucun téléchargement ne doit démarrer."
+            ),
+        ),
+    )
+
+    with pytest.raises(WorkerError) as error:
+        manager.install_model(
+            "missing-model",
+            "example/missing-model",
+            "main",
+            ["TEXT_TO_VIDEO"],
+        )
+    assert error.value.code == "HF_MODEL_NOT_FOUND"
+
+
+def test_install_model_revision_not_found_uses_precise_error_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+
+    class RevisionNotFoundError(Exception):
+        pass
+
+    class FakeHfApi:
+        def __init__(self, token: str | None = None) -> None:
+            del token
+
+        def model_info(self, repository: str, revision: str = "main") -> None:
+            del repository, revision
+            raise RevisionNotFoundError("revision lookup failed")
+
+    monkeypatch.setattr(
+        manager,
+        "_imports",
+        lambda: _fake_runtime_imports(
+            cuda_available=False,
+            hf_api=FakeHfApi,
+            snapshot_download=lambda **_kwargs: pytest.fail(
+                "Aucun téléchargement ne doit démarrer."
+            ),
+        ),
+    )
+
+    with pytest.raises(WorkerError) as error:
+        manager.install_model(
+            "missing-revision",
+            "example/valid-model",
+            "missing-revision",
+            ["TEXT_TO_VIDEO"],
+        )
+    assert error.value.code == "HF_REVISION_NOT_FOUND"
+
+
+def test_preflight_with_no_optional_metadata_stays_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = RuntimeManager(settings(tmp_path))
+    attempted: list[str] = []
+
+    class EntryNotFoundError(Exception):
+        pass
+
+    def fake_hf_hub_download(**kwargs) -> None:
+        attempted.append(str(kwargs["filename"]))
+        raise EntryNotFoundError("optional metadata is absent")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(hf_hub_download=fake_hf_hub_download),
+    )
+
+    metadata = manager._preflight_remote_metadata(
+        "example/valid-model",
+        "valid-revision",
+        tmp_path / "empty-remote-metadata",
+        None,
+    )
+
+    assert attempted == ["model_index.json", "config.json"]
+    assert metadata is not None
+    assert metadata["compatibility_status"] == "UNKNOWN"
+    assert metadata["runtime_supported"] is False
+    assert "Repository Hugging Face introuvable" not in metadata["runtime_reason"]
+
+
 def test_install_model_gated_without_token_returns_access_required_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1281,7 +1447,9 @@ def test_install_model_private_without_token_returns_access_required_error(
     manager = RuntimeManager(settings(tmp_path))
 
     class PrivateRepoError(Exception):
-        pass
+        def __init__(self, message: str) -> None:
+            super().__init__(message)
+            self.response = SimpleNamespace(status_code=401)
 
     class FakeHfApi:
         def __init__(self, token: str | None = None) -> None:

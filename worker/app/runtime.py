@@ -388,37 +388,25 @@ class RuntimeManager:
         return cleaned or None
 
     @staticmethod
-    def _looks_like_hf_auth_error(error: Exception) -> bool:
-        name = type(error).__name__
-        if name in {"GatedRepoError", "HfHubHTTPError"}:
-            return True
+    def _hf_exception_type_names(error: Exception) -> set[str]:
+        """Retourne les types HF sans importer huggingface_hub au démarrage."""
+        return {error_type.__name__ for error_type in type(error).__mro__}
+
+    @classmethod
+    def _classify_hf_error(cls, error: Exception) -> str | None:
+        """Classe une erreur HF par son type, jamais par son message traduit."""
+        names = cls._hf_exception_type_names(error)
         response = getattr(error, "response", None)
         status_code = getattr(response, "status_code", None)
-        if status_code in {401, 403}:
-            return True
-        message = str(error).lower()
-        return any(
-            fragment in message
-            for fragment in [
-                "gated",
-                "private",
-                "authentication",
-                "forbidden",
-                "access",
-            ]
-        )
-
-    @staticmethod
-    def _looks_like_hf_not_found(error: Exception) -> bool:
-        message = str(error).lower()
-        return "404" in message and (
-            "repository" in message or "repo" in message or "not found" in message
-        )
-
-    @staticmethod
-    def _looks_like_hf_revision_not_found(error: Exception) -> bool:
-        message = str(error).lower()
-        return "revision" in message and "not found" in message
+        if "GatedRepoError" in names or status_code in {401, 403}:
+            return "HF_ACCESS_DENIED"
+        if "RevisionNotFoundError" in names:
+            return "HF_REVISION_NOT_FOUND"
+        if "RepositoryNotFoundError" in names:
+            return "HF_MODEL_NOT_FOUND"
+        if names.intersection({"RemoteEntryNotFoundError", "EntryNotFoundError"}):
+            return "HF_FILE_NOT_FOUND"
+        return None
 
     @staticmethod
     def _looks_like_timeout(error: Exception) -> bool:
@@ -617,12 +605,26 @@ class RuntimeManager:
                 )
                 downloaded = True
             except Exception as error:
-                # Un JSON peut legitimement manquer; les erreurs d'acces et de
-                # repository sont classees par le chemin d'installation global.
-                if self._looks_like_hf_auth_error(error) or self._looks_like_hf_not_found(error):
-                    raise
+                # Ces deux fichiers sont optionnels et indépendants. Un 404 de
+                # fichier ne dit rien sur l'existence du repository, déjà
+                # confirmée par HfApi.model_info(). Toute autre erreur remonte.
+                if self._classify_hf_error(error) == "HF_FILE_NOT_FOUND":
+                    continue
+                raise
         if not downloaded:
-            return None
+            return {
+                "repository": repository,
+                "revision": revision,
+                "capabilities": [],
+                "library_name": "diffusers",
+                "class_name": None,
+                "compatibility_status": CompatibilityStatus.UNKNOWN,
+                "runtime_supported": False,
+                "runtime_reason": (
+                    "Métadonnées publiques optionnelles absentes; "
+                    "validation du snapshot requise."
+                ),
+            }
 
         metadata = inspect_model_metadata(local_dir)
         if self._pipeline_resolver.requires_remote_code(metadata):
@@ -1182,7 +1184,8 @@ class RuntimeManager:
             raise
 
         except Exception as error:
-            if self._hf_token() is None and self._looks_like_hf_auth_error(error):
+            hf_error_code = self._classify_hf_error(error)
+            if hf_error_code == "HF_ACCESS_DENIED":
                 worker_error = WorkerError(
                     "Accès Hugging Face requis: ce repository est protégé "
                     "(gated/private) et nécessite un HF_TOKEN valide.",
@@ -1190,18 +1193,25 @@ class RuntimeManager:
                     code="HF_ACCESS_DENIED",
                     retryable=False,
                 )
-            elif self._looks_like_hf_revision_not_found(error):
+            elif hf_error_code == "HF_REVISION_NOT_FOUND":
                 worker_error = WorkerError(
                     "Révision Hugging Face introuvable pour ce repository.",
                     404,
                     code="HF_REVISION_NOT_FOUND",
                     retryable=False,
                 )
-            elif self._looks_like_hf_not_found(error):
+            elif hf_error_code == "HF_MODEL_NOT_FOUND":
                 worker_error = WorkerError(
                     "Repository Hugging Face introuvable.",
                     404,
                     code="HF_MODEL_NOT_FOUND",
+                    retryable=False,
+                )
+            elif hf_error_code == "HF_FILE_NOT_FOUND":
+                worker_error = WorkerError(
+                    "Fichier Hugging Face obligatoire introuvable.",
+                    404,
+                    code="HF_FILE_NOT_FOUND",
                     retryable=False,
                 )
             elif self._looks_like_timeout(error):
