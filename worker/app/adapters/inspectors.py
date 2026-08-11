@@ -207,7 +207,22 @@ def inspect_model_metadata(snapshot: str | Path) -> dict[str, Any]:
     capabilities: list[str] = []
 
     # Images
-    if any(token in tag_values for token in {"text-to-image", "stable-diffusion", "diffusion"}):
+    # Certains snapshots/tests minimaux ne contiennent que _class_name.
+    # StableDiffusionPipeline reste une preuve suffisante de TEXT_TO_IMAGE,
+    # sans injecter aveuglément les capacités demandées par le backend.
+    stable_text_to_image_classes = {
+        "stablediffusionpipeline",
+        "stablediffusionxlpipeline",
+        "stablediffusion3pipeline",
+        "fluxpipeline",
+    }
+    if (
+        class_name in stable_text_to_image_classes
+        or any(
+            token in tag_values
+            for token in {"text-to-image", "stable-diffusion", "diffusion"}
+        )
+    ):
         capabilities.append("TEXT_TO_IMAGE")
     if any(token in tag_values for token in {"image-to-image", "img2img", "inpainting"}):
         capabilities.extend(["IMAGE_TO_IMAGE", "TEXT_TO_IMAGE"])
