@@ -90,7 +90,7 @@ SCRATCH_ROOT=$(mktemp -d /tmp/vidioai-worker-image.XXXXXX)
 mkdir -p "${SCRATCH_ROOT}/models" "${SCRATCH_ROOT}/cache" "${SCRATCH_ROOT}/work" "${SCRATCH_ROOT}/worker-work"
 docker run --rm --user 0 --entrypoint sh \
   -v "${SCRATCH_ROOT}:/scratch" "${IMAGE}" \
-  -c 'chown -R 10002:10002 /scratch && chmod -R u+rwX,go-rwx /scratch'
+  -c 'chown -R 10002:10002 /scratch/models /scratch/cache /scratch/work /scratch/worker-work && chmod -R u+rwX,go-rwx /scratch/models /scratch/cache /scratch/work /scratch/worker-work'
 
 docker run -d --name "${CONTAINER_NAME}" \
   -e APP_ENV=GPU_PRODUCTION \
