@@ -78,6 +78,13 @@ jobs:
           cache: pip
           cache-dependency-path: worker/requirements-test.txt
 
+      - name: Install Worker media dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version
+          ffprobe -version
+
       - run: pip install -r requirements-test.txt
         working-directory: worker
 
