@@ -92,17 +92,10 @@ class TextToVideoAdapter(RuntimeAdapter):
         guidance = request.get("guidance_scale")
 
         if is_wan:
-            if width >= height:
-                width, height = 1280, 704
-            else:
-                width, height = 704, 1280
-            fps = 24
             if not frames or int(frames) <= 8:
                 frames = duration * fps + 1
             frames = int(frames)
-            remainder = (frames - 1) % 4
-            if remainder:
-                frames -= remainder
+            frames = round((frames - 1) / 4) * 4 + 1
             frames = max(5, frames)
             if not steps or int(steps) <= 4:
                 steps = 50

@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 from typing import Any
 
+from ..capability_resolver import CapabilityResolver
+from ..pipeline_resolver import PipelineResolver
+
 
 def _read_json(path: Path) -> dict[str, Any]:
     try:
@@ -109,43 +112,6 @@ def _infer_library_name(
     return None
 
 
-def _is_wan_ti2v(
-    model_index: dict[str, Any],
-    class_name: str,
-    architectures: list[str],
-    base_models: list[str],
-) -> bool:
-    class_lower = class_name.lower()
-    architecture_tokens = {str(value).lower() for value in architectures}
-
-    is_wan = (
-        "wanpipeline" in class_lower
-        or "wantransformer3dmodel" in architecture_tokens
-    )
-    if not is_wan:
-        return False
-
-    # Les dérivés/quantifiés peuvent ne pas recopier expand_timesteps dans leur
-    # model_index mais déclarer explicitement le modèle TI2V-5B comme base.
-    if any(
-        "wan2.2-ti2v-5b" in str(base_model).lower()
-        or "ti2v-5b" in str(base_model).lower()
-        for base_model in base_models
-    ):
-        return True
-
-    expand_timesteps = model_index.get("expand_timesteps") is True
-    transformer_2 = model_index.get("transformer_2")
-    no_second_transformer = (
-        transformer_2 is None
-        or (
-            isinstance(transformer_2, list)
-            and all(item is None for item in transformer_2)
-        )
-    )
-    return expand_timesteps and no_second_transformer
-
-
 def inspect_model_metadata(snapshot: str | Path) -> dict[str, Any]:
     root = Path(snapshot)
     metadata: dict[str, Any] = {
@@ -188,129 +154,24 @@ def inspect_model_metadata(snapshot: str | Path) -> dict[str, Any]:
         if path.is_file()
     ]
 
-    tag_values = set(metadata["raw_tags"])
-    pipeline_tag = str(metadata["pipeline_tag"] or "").lower()
-    library_name = str(metadata["library_name"] or "").lower()
-    class_name = str(metadata["class_name"] or "").lower()
-    architecture_tokens = [str(value).lower() for value in metadata["architectures"]]
-    base_model_tokens = [str(value).lower() for value in metadata["base_models"]]
-
-    if pipeline_tag:
-        tag_values.add(pipeline_tag)
-    if library_name:
-        tag_values.add(library_name)
-    if class_name:
-        tag_values.add(class_name)
-    tag_values.update(architecture_tokens)
-    tag_values.update(base_model_tokens)
-
-    capabilities: list[str] = []
-
-    # Images
-    # Certains snapshots/tests minimaux ne contiennent que _class_name.
-    # StableDiffusionPipeline reste une preuve suffisante de TEXT_TO_IMAGE,
-    # sans injecter aveuglément les capacités demandées par le backend.
-    stable_text_to_image_classes = {
-        "stablediffusionpipeline",
-        "stablediffusionxlpipeline",
-        "stablediffusion3pipeline",
-        "fluxpipeline",
-    }
-    if (
-        class_name in stable_text_to_image_classes
-        or any(
-            token in tag_values
-            for token in {"text-to-image", "stable-diffusion", "diffusion"}
-        )
+    # Un model_index Diffusers standard peut omettre library_name. La structure
+    # du manifest et la classe Pipeline constituent alors la preuve, sans
+    # consulter le nom du repository.
+    if not metadata["library_name"] and (
+        model_index_path.is_file()
+        and str(metadata.get("class_name") or "").endswith("Pipeline")
     ):
-        capabilities.append("TEXT_TO_IMAGE")
-    if any(token in tag_values for token in {"image-to-image", "img2img", "inpainting"}):
-        capabilities.extend(["IMAGE_TO_IMAGE", "TEXT_TO_IMAGE"])
-    if "inpainting" in tag_values or "image-inpainting" in tag_values or "inpaint" in class_name:
-        capabilities.extend(["INPAINTING", "IMAGE_TO_IMAGE"])
-    if "outpainting" in tag_values or "image-outpainting" in tag_values or "outpaint" in class_name:
-        capabilities.extend(["OUTPAINTING", "IMAGE_TO_IMAGE"])
-    if "image-variation" in tag_values or "variation" in tag_values or "variation" in class_name:
-        capabilities.extend(["IMAGE_VARIATION", "IMAGE_TO_IMAGE"])
-    if (
-        "super-resolution" in tag_values
-        or "upscale" in tag_values
-        or "image-upscale" in tag_values
-        or "upscale" in class_name
-    ):
-        capabilities.extend(["IMAGE_UPSCALE", "IMAGE_TO_IMAGE"])
-    if "controlnet" in tag_values or "controlled-image-generation" in tag_values or "control" in class_name:
-        capabilities.extend(["CONTROLLED_IMAGE_GENERATION", "IMAGE_TO_IMAGE"])
+        metadata["library_name"] = "diffusers"
 
-    # Vidéos génériques
-    if any(token in tag_values for token in {"text-to-video", "video-generation"}):
-        capabilities.append("TEXT_TO_VIDEO")
-    if any(token in tag_values for token in {"image-to-video", "img2vid"}):
-        capabilities.append("IMAGE_TO_VIDEO")
-    if "multi-image-to-video" in tag_values:
-        capabilities.append("MULTI_IMAGE_TO_VIDEO")
-    if "start-end-image-to-video" in tag_values:
-        capabilities.append("START_END_IMAGE_TO_VIDEO")
-    if "keyframes-to-video" in tag_values:
-        capabilities.append("KEYFRAMES_TO_VIDEO")
-    if any(token in tag_values for token in {"video-to-video", "vid2vid"}):
-        capabilities.append("VIDEO_TO_VIDEO")
+    pipeline_cls = None
+    try:
+        resolution = PipelineResolver().resolve_class(metadata)
+        pipeline_cls = resolution.pipeline_cls
+        metadata["runtime_supported"] = resolution.runtime_supported
+        metadata["runtime_reason"] = resolution.runtime_reason
+    except Exception as error:
+        metadata["runtime_supported"] = False
+        metadata["runtime_reason"] = f"{type(error).__name__}: {error}"
 
-    # Diffusers / Wan
-    if library_name == "diffusers":
-        wan_ti2v = _is_wan_ti2v(
-            model_index,
-            class_name,
-            metadata["architectures"],
-            metadata["base_models"],
-        )
-
-        if class_name == "wanpipeline":
-            capabilities.append("TEXT_TO_VIDEO")
-            if wan_ti2v:
-                capabilities.append("IMAGE_TO_VIDEO")
-        elif class_name == "wanimagetovideopipeline":
-            capabilities.append("IMAGE_TO_VIDEO")
-        elif any("wantransformer3dmodel" in value for value in architecture_tokens):
-            capabilities.append("TEXT_TO_VIDEO")
-            if wan_ti2v:
-                capabilities.append("IMAGE_TO_VIDEO")
-
-        if any("ltx" in value for value in [class_name, *architecture_tokens]):
-            if "image-to-video" in tag_values:
-                capabilities.append("IMAGE_TO_VIDEO")
-        if any("cogvideo" in value for value in [class_name, *architecture_tokens]):
-            if "image-to-video" in tag_values:
-                capabilities.append("IMAGE_TO_VIDEO")
-
-    if (
-        "video-inpainting" in tag_values
-        or "inpainting-video" in tag_values
-        or ("video" in class_name and "inpaint" in class_name)
-    ):
-        capabilities.extend(["VIDEO_INPAINTING", "VIDEO_TO_VIDEO"])
-
-    if (
-        "video-upscale" in tag_values
-        or "video-super-resolution" in tag_values
-        or ("video" in class_name and "upscale" in class_name)
-    ):
-        capabilities.extend(["VIDEO_UPSCALE", "VIDEO_TO_VIDEO"])
-
-    if not capabilities:
-        model_type = str(metadata["model_type"] or "").lower()
-        if model_type in {"stable-diffusion", "sdxl"}:
-            capabilities.append("TEXT_TO_IMAGE")
-        if model_type in {"ltx", "wan", "skyreels", "cogvideox"}:
-            capabilities.append("TEXT_TO_VIDEO")
-
-    seen: set[str] = set()
-    deduplicated: list[str] = []
-    for capability in capabilities:
-        if capability in seen:
-            continue
-        seen.add(capability)
-        deduplicated.append(capability)
-
-    metadata["capabilities"] = deduplicated
+    metadata["capabilities"] = CapabilityResolver().resolve(metadata, pipeline_cls)
     return metadata

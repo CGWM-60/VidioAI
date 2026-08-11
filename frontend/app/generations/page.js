@@ -42,7 +42,9 @@ function GenerationsContent() {
   const [modelId, setModelId] = useState("vidio-motion-local");
   const [prompt, setPrompt] = useState("Une voiture volante traverse une ville futuriste au coucher du soleil, mouvement de caméra cinématographique.");
   const [duration, setDuration] = useState(6);
-  const [resolution, setResolution] = useState("720p");
+  const [quality, setQuality] = useState("480p");
+  const [aspectRatio, setAspectRatio] = useState("16:9");
+  const [fps, setFps] = useState(24);
   const [audio, setAudio] = useState(false);
   const [generation, setGeneration] = useState(null);
   const [history, setHistory] = useState([]);
@@ -168,7 +170,9 @@ function GenerationsContent() {
         input_asset_id: activeMode.inputKind === "image" && visibleInputImages.length ? visibleInputImages[0].asset_id : inputAsset?.id,
         input_images: activeMode.inputKind === "image" ? visibleInputImages : [],
         duration_seconds: Number(duration),
-        resolution,
+        quality,
+        aspect_ratio: aspectRatio,
+        fps: Number(fps),
         audio,
       };
       const created = await apiFetch("/api/videos/generate", {
@@ -288,7 +292,9 @@ function GenerationsContent() {
 
           <div className={styles.videoSettingsRow}>
             <label className={styles.formGroup}><span>Durée</span><select value={duration} onChange={(event) => setDuration(event.target.value)}><option value="4">4 secondes</option><option value="6">6 secondes</option><option value="10">10 secondes</option><option value="15">15 secondes</option></select></label>
-            <label className={styles.formGroup}><span>Qualité</span><select value={resolution} onChange={(event) => setResolution(event.target.value)}><option value="720p">HD 720p</option><option value="1080p">Full HD 1080p</option></select></label>
+            <label className={styles.formGroup}><span>Qualité</span><select value={quality} onChange={(event) => setQuality(event.target.value)}><option value="480p">Rapide 480p</option><option value="720p">HD 720p</option><option value="1080p">Full HD 1080p</option></select></label>
+            <label className={styles.formGroup}><span>Ratio</span><select value={aspectRatio} onChange={(event) => setAspectRatio(event.target.value)}><option value="16:9">16:9 paysage</option><option value="9:16">9:16 portrait</option><option value="1:1">1:1 carré</option></select></label>
+            <label className={styles.formGroup}><span>Cadence</span><select value={fps} onChange={(event) => setFps(event.target.value)}><option value="12">12 fps</option><option value="24">24 fps</option><option value="30">30 fps</option></select></label>
           </div>
           <div className={styles.audioSetting}><span><strong>Ajouter une piste audio silencieuse</strong><small>Crée une piste AAC vide prête pour un mixage ultérieur.</small></span><button type="button" role="switch" aria-checked={audio} onClick={() => setAudio((value) => !value)} className={`${styles.toggle} ${audio ? styles.toggleOn : ""}`}><span /></button></div>
           <button type="button" className={styles.generateButton} disabled={isRunning || !modelId || prompt.trim().length < 3} onClick={submitGeneration}><BsStars /> {isRunning ? "Génération en cours…" : "Générer la vidéo"}</button>
@@ -313,7 +319,7 @@ function GenerationsContent() {
         <div className={styles.sectionTitle}><div><strong>Résultats récents</strong><span>{history.length} génération(s)</span></div></div>
         <div className={styles.videoHistoryGrid}>
           {history.map((item) => <button type="button" key={item.id} onClick={() => setGeneration(item)} className={styles.historyCard}>
-            <div><BsPlayCircle /><span>{item.duration_seconds || "—"}s</span></div><strong>{item.prompt}</strong><small>{item.status} · {item.resolution || "—"}</small>
+            <div><BsPlayCircle /><span>{item.duration_seconds || "—"}s</span></div><strong>{item.prompt}</strong><small>{item.status} · {item.requested_quality || item.resolution || "—"} · {item.requested_aspect_ratio || "—"}{item.actual_width && item.actual_height ? ` · ${item.actual_width}×${item.actual_height}` : ""}</small>
           </button>)}
           {!history.length && <div className={styles.emptyHistory}><BsFilm /> Aucune vidéo générée pour le moment.</div>}
         </div>

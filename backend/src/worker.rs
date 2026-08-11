@@ -55,6 +55,18 @@ pub struct WorkerModelStatus {
     pub benchmark: Option<WorkerBenchmarkObservation>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerCompatibility {
+    pub runtime_supported: bool,
+    #[serde(default)]
+    pub runtime_capabilities: Vec<String>,
+    pub pipeline_class: Option<String>,
+    pub runtime_reason: String,
+    pub error_code: Option<String>,
+    #[serde(default)]
+    pub dependency: Option<String>,
+}
+
 /// Mesure brute du worker. Le backend ajoute l'identifiant public, la révision
 /// exacte et l'horodatage avant de la persister.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +131,16 @@ struct InstallModelRequest<'a> {
     capabilities: Vec<&'a str>,
 }
 
+#[derive(Debug, Serialize)]
+struct CompatibilityRequest<'a> {
+    pipeline_class: Option<&'a str>,
+    library_name: Option<&'a str>,
+    pipeline_tag: Option<&'a str>,
+    tags: &'a [String],
+    architectures: Vec<&'a str>,
+    base_models: Vec<&'a str>,
+}
+
 #[derive(Debug, Deserialize)]
 struct WorkerErrorPayload {
     error: String,
@@ -135,6 +157,18 @@ pub struct GenerateResponse {
     pub output_relative_path: String,
     pub width: u32,
     pub height: u32,
+    #[serde(default)]
+    pub requested_quality: Option<String>,
+    #[serde(default)]
+    pub requested_aspect_ratio: Option<String>,
+    #[serde(default)]
+    pub actual_width: Option<u32>,
+    #[serde(default)]
+    pub actual_height: Option<u32>,
+    #[serde(default)]
+    pub actual_fps: Option<f64>,
+    #[serde(default)]
+    pub actual_frames: Option<u32>,
     pub sha256: String,
     #[serde(default)]
     pub benchmark: Option<WorkerBenchmarkObservation>,
@@ -235,6 +269,28 @@ impl WorkerClient {
         .await
     }
 
+    pub async fn compatibility(
+        &self,
+        pipeline_class: Option<&str>,
+        library_name: Option<&str>,
+        pipeline_tag: Option<&str>,
+        tags: &[String],
+    ) -> Result<WorkerCompatibility, String> {
+        self.json(
+            self.request(reqwest::Method::POST, "/v1/models/compatibility")
+                .timeout(Duration::from_secs(15))
+                .json(&CompatibilityRequest {
+                    pipeline_class,
+                    library_name,
+                    pipeline_tag,
+                    tags,
+                    architectures: pipeline_class.into_iter().collect(),
+                    base_models: Vec::new(),
+                }),
+        )
+        .await
+    }
+
     pub async fn load(
         &self,
         model_id: &str,
@@ -279,10 +335,6 @@ impl WorkerClient {
             "model_id": model_id,
             "prompt": prompt,
             "negative_prompt": negative_prompt,
-            "width": 1024,
-            "height": 1024,
-            "steps": 4,
-            "guidance_scale": 0.0,
             "seed": null,
             "output_relative_path": relative,
         });
@@ -319,8 +371,8 @@ impl WorkerClient {
         input_images: Option<serde_json::Value>,
         mask_path: Option<&str>,
         capability: Option<&str>,
-        width: u32,
-        height: u32,
+        quality: &str,
+        aspect_ratio: &str,
         duration_seconds: u32,
         fps: u32,
     ) -> Result<GenerateResponse, String> {
@@ -328,20 +380,15 @@ impl WorkerClient {
             .to_str()
             .ok_or_else(|| "Chemin worker non UTF-8".to_owned())?;
 
-        let frames = duration_seconds.saturating_mul(fps).saturating_add(1);
-
         let mut payload = serde_json::json!({
             "job_id": job_id,
             "model_id": model_id,
             "prompt": prompt,
             "negative_prompt": negative_prompt,
-            "width": width,
-            "height": height,
-            "steps": 4,
-            "guidance_scale": 0.0,
+            "quality": quality,
+            "aspect_ratio": aspect_ratio,
             "duration_seconds": duration_seconds,
             "fps": fps,
-            "frames": frames,
             "seed": null,
             "output_relative_path": relative,
         });

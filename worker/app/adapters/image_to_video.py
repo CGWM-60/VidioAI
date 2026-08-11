@@ -196,24 +196,10 @@ class ImageToVideoAdapter(RuntimeAdapter):
         guidance = request.get("guidance_scale")
 
         if is_wan:
-            # En production, l'image est un PIL.Image résolu par RuntimeManager.
-            image_size = getattr(image, "size", None)
-            if isinstance(image_size, tuple) and len(image_size) == 2:
-                image_width, image_height = image_size
-                if image_width >= image_height:
-                    width, height = 1280, 704
-                else:
-                    width, height = 704, 1280
-            else:
-                width, height = 1280, 704
-
-            fps = 24
             if not frames or int(frames) <= 8:
                 frames = duration * fps + 1
             frames = int(frames)
-            remainder = (frames - 1) % 4
-            if remainder:
-                frames -= remainder
+            frames = round((frames - 1) / 4) * 4 + 1
             frames = max(5, frames)
             if not steps or int(steps) <= 4:
                 steps = 50

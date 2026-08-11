@@ -33,20 +33,39 @@ export function closeWebSocketSafely(socket) {
  * les validations métier renvoyées par Rust.
  */
 export async function apiFetch(path, options = {}) {
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    cache: "no-store",
-    ...options,
-    headers: {
-      ...(options.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
-      ...options.headers,
-    },
-  });
+  const { timeoutMs = 30000, timeoutCode = "REQUEST_TIMEOUT", ...fetchOptions } = options;
+  const controller = !fetchOptions.signal && timeoutMs > 0 ? new AbortController() : null;
+  const timeout = controller
+    ? globalThis.setTimeout(() => controller.abort("VIDIOAI_REQUEST_TIMEOUT"), timeoutMs)
+    : null;
+
+  let response;
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      cache: "no-store",
+      ...fetchOptions,
+      signal: controller?.signal || fetchOptions.signal,
+      headers: {
+        ...(fetchOptions.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
+        ...fetchOptions.headers,
+      },
+    });
+  } catch (error) {
+    if (controller?.signal.aborted) {
+      throw new Error(`${timeoutCode}: délai de ${Math.round(timeoutMs / 1000)} s dépassé.`);
+    }
+    throw error;
+  } finally {
+    if (timeout) globalThis.clearTimeout(timeout);
+  }
 
   if (!response.ok) {
     let message = `Le serveur a répondu avec le statut ${response.status}.`;
     try {
       const payload = await response.json();
-      message = payload.error || message;
+      message = payload.error
+        ? `${payload.code ? `${payload.code}: ` : ""}${payload.error}`
+        : message;
     } catch {
       // Une réponse non JSON conserve le message HTTP générique ci-dessus.
     }

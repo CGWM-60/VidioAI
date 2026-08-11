@@ -194,7 +194,19 @@ validate_png() {
 
 validate_video() {
   local file=${1:?file requis}
-  ffprobe -v error -show_streams -show_format "${file}" >/dev/null
+  local probe
+  probe=$(ffprobe -v error -count_frames -select_streams v:0 \
+    -show_entries stream=width,height,nb_frames,nb_read_frames,avg_frame_rate:format=duration \
+    -of json "${file}")
+  jq -e '
+    (.streams[0].width // 0) > 0 and
+    (.streams[0].height // 0) > 0 and
+    ((try ((.format.duration // "0") | tonumber) catch 0) > 0) and
+    (([
+      .streams[0].nb_frames,
+      .streams[0].nb_read_frames
+    ] | map(select(. != null and . != "N/A") | tonumber) | first // 0) > 1)
+  ' <<<"${probe}" >/dev/null
 }
 
 echo "[gpu-acceptance] 1) Vérification NVIDIA"
@@ -215,6 +227,8 @@ video_asset=$(upload_asset "${WORKDIR}/source.mp4" "video/mp4")
 
 run_capability() {
   local capability=${1:?capabilité requise}
+  local quality=${2:-480p}
+  local aspect_ratio=${3:-16:9}
   local mode endpoint output_kind
   mode=$(mode_for_capability "${capability}")
   endpoint=$(endpoint_for_capability "${capability}")
@@ -227,7 +241,7 @@ run_capability() {
     return 0
   fi
 
-  echo "[gpu-acceptance] ${capability}: modèle ${model_id}"
+  echo "[gpu-acceptance] ${capability} ${quality} ${aspect_ratio}: modèle ${model_id}"
   install_or_load_model "${model_id}" || {
     echo "Installation/chargement impossible pour ${model_id} (${capability})" >&2
     return 1
@@ -275,6 +289,8 @@ run_capability() {
     --arg input_asset_id "${input_asset_id}" \
     --arg mask_asset_id "${mask_id}" \
     --arg control_asset_id "${control_id}" \
+    --arg quality "${quality}" \
+    --arg aspect_ratio "${aspect_ratio}" \
     --argjson input_images "${input_images_json}" \
     '{
       mode:$mode,
@@ -286,7 +302,9 @@ run_capability() {
       control_asset_id:(if ($control_asset_id|length) > 0 then $control_asset_id else null end),
       input_images:$input_images,
       duration_seconds:2,
-      resolution:"720p"
+      fps:24,
+      quality:$quality,
+      aspect_ratio:$aspect_ratio
     }')
 
   generation_id=$(curl -fsS -X POST -H 'Content-Type: application/json' --data-binary "${payload}" "${BASE_URL}${endpoint}" | jq -er '.id')
@@ -301,7 +319,19 @@ run_capability() {
       return 1
     }
   else
-    out_file="${WORKDIR}/${capability}.mp4"
+    jq -e --arg quality "${quality}" --arg aspect_ratio "${aspect_ratio}" '
+      .requested_quality == $quality and
+      .requested_aspect_ratio == $aspect_ratio and
+      (.actual_width // 0) > 0 and
+      (.actual_height // 0) > 0 and
+      (.actual_fps // 0) > 0 and
+      (.actual_frames // 0) > 1
+    ' <<<"${result}" >/dev/null || {
+      echo "Contrat réel ${capability} ${quality} incomplet." >&2
+      jq . <<<"${result}" >&2
+      return 1
+    }
+    out_file="${WORKDIR}/${capability}-${quality}.mp4"
     curl -fsS "${BASE_URL}/api/assets/${output_asset_id}" -o "${out_file}"
     validate_video "${out_file}" || {
       echo "Sortie ${capability} invalide (vidéo non lisible)." >&2
@@ -309,8 +339,13 @@ run_capability() {
     }
   fi
 
-  echo "[gpu-acceptance] ${capability}: OK"
+  echo "[gpu-acceptance] ${capability} ${quality} ${aspect_ratio}: OK"
 }
+
+echo "[gpu-acceptance] 2) Tests vidéo obligatoires 480p puis 720p"
+run_capability TEXT_TO_VIDEO 480p 16:9
+run_capability IMAGE_TO_VIDEO 480p 16:9
+run_capability TEXT_TO_VIDEO 720p 16:9
 
 for capability in \
   TEXT_TO_IMAGE \
@@ -320,8 +355,6 @@ for capability in \
   IMAGE_VARIATION \
   IMAGE_UPSCALE \
   CONTROLLED_IMAGE_GENERATION \
-  TEXT_TO_VIDEO \
-  IMAGE_TO_VIDEO \
   MULTI_IMAGE_TO_VIDEO \
   START_END_IMAGE_TO_VIDEO \
   KEYFRAMES_TO_VIDEO \

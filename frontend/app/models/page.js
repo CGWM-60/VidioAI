@@ -83,7 +83,7 @@ export default function ModelsPage() {
       if (["CHAT", "IMAGE", "VIDEO", "VISION", "AUDIO"].includes(filter)) parameters.set("category", filter);
       if (filter === "installed") parameters.set("installed", "true");
       if (filter === "compatible") parameters.set("compatible", "true");
-      const response = await apiFetch(`/api/models?${parameters}`);
+      const response = await apiFetch(`/api/models?${parameters}`, { timeoutMs: 15000, timeoutCode: "CATALOG_TIMEOUT" });
       // La forme tableau reste tolérée durant un rolling deploy backend/frontend.
       setModels(Array.isArray(response) ? response : response.items);
       setMeta(Array.isArray(response) ? { has_more: false, stale: false, total: response.length } : response);
@@ -147,7 +147,7 @@ export default function ModelsPage() {
         <button className={styles.secondaryButton} onClick={refreshCatalog}><BsArrowClockwise /> Actualiser</button>
       </div>
 
-      {error && <div className={styles.errorBanner} role="alert">{error}</div>}
+      {error && <div className={styles.errorBanner} role="alert"><strong>CATALOG_ERROR</strong> · {error} <button className={styles.secondaryButton} onClick={() => void loadModels()}>Réessayer</button></div>}
       {meta.stale && <div className={styles.warningBanner}>Hugging Face est momentanément indisponible : affichage du cache du {meta.last_sync ? new Date(meta.last_sync * 1000).toLocaleString("fr-FR") : "dernier accès"}.</div>}
       {loading ? <div className={styles.stateCard}>Chargement du catalogue réel…</div> : (
         <div className={styles.modelList}>

@@ -30,7 +30,7 @@ const GIB: u64 = 1024 * 1024 * 1024;
 // Toute modification d'un champ calculé (comme `runtime_reason`) doit invalider
 // les anciennes entrées, sinon l'interface continuerait à afficher un diagnostic
 // obsolète après la mise à jour du binaire.
-const CACHE_SCHEMA_VERSION: u32 = 5;
+const CACHE_SCHEMA_VERSION: u32 = 6;
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -1022,22 +1022,6 @@ fn normalize_capabilities(pipeline: &str, tags: &[String]) -> Vec<ModelCapabilit
     if values.is_empty() {
         values.insert(ModelCapability::CapabilityUnknown);
     }
-    if values.contains(&ModelCapability::ImageToImage) {
-        values.insert(ModelCapability::Inpainting);
-        values.insert(ModelCapability::Outpainting);
-        values.insert(ModelCapability::ImageVariation);
-        values.insert(ModelCapability::ImageUpscale);
-        values.insert(ModelCapability::ControlledImageGeneration);
-    }
-    if values.contains(&ModelCapability::ImageToVideo) {
-        values.insert(ModelCapability::MultiImageToVideo);
-        values.insert(ModelCapability::StartEndImageToVideo);
-        values.insert(ModelCapability::KeyframesToVideo);
-    }
-    if values.contains(&ModelCapability::VideoToVideo) {
-        values.insert(ModelCapability::VideoInpainting);
-        values.insert(ModelCapability::VideoUpscale);
-    }
     let order = [
         ModelCapability::Chat,
         ModelCapability::Vision,
@@ -1113,21 +1097,19 @@ fn primary_kind(capabilities: &[ModelCapability]) -> ModelKind {
 
 fn architecture_from_config(config: &Value) -> Option<String> {
     config
-        .get("architectures")
-        .and_then(Value::as_array)
-        .and_then(|values| values.first())
+        .get("_model_index")
+        .and_then(|value| value.get("_class_name"))
         .and_then(Value::as_str)
+        .or_else(|| config.get("_class_name").and_then(Value::as_str))
         .or_else(|| {
             config
                 .get("diffusers")
                 .and_then(|value| value.get("_class_name"))
                 .and_then(Value::as_str)
         })
-        // La fiche détaillée range les JSON téléchargés sous des clés privées
-        // afin de ne pas écraser le résumé renvoyé par l'API Hub.
         .or_else(|| {
             config
-                .get("_model_index")
+                .get("_root_config")
                 .and_then(|value| value.get("_class_name"))
                 .and_then(Value::as_str)
         })
@@ -1135,6 +1117,13 @@ fn architecture_from_config(config: &Value) -> Option<String> {
             config
                 .get("_root_config")
                 .and_then(|value| value.get("architectures"))
+                .and_then(Value::as_array)
+                .and_then(|values| values.first())
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            config
+                .get("architectures")
                 .and_then(Value::as_array)
                 .and_then(|values| values.first())
                 .and_then(Value::as_str)
@@ -1173,25 +1162,31 @@ fn runtime_match(
     let has_diffusers_index = files
         .iter()
         .any(|file| file.path.rsplit('/').next() == Some("model_index.json"));
-    if library == "diffusers" && has_safetensors && has_diffusers_index {
+    if library == "diffusers"
+        && has_safetensors
+        && has_diffusers_index
+        && architecture.is_some_and(|value| value.ends_with("Pipeline"))
+    {
         let runtime_capabilities = infer_runtime_capabilities(capabilities, architecture, files);
-        if !runtime_capabilities.is_empty() {
-            let detected =
-                architecture.unwrap_or("classe résolue depuis model_index.json au chargement");
-            let labels = runtime_capabilities
-                .iter()
-                .map(ModelCapability::api_name)
-                .collect::<Vec<_>>()
-                .join(", ");
-            return (
-                Some("Diffusers PipelineRegistry".into()),
-                true,
-                format!(
-                    "Pipeline Diffusers exécutable par le runtime dynamique VidioAI ({detected}) : {labels}."
-                ),
-                runtime_capabilities,
-            );
-        }
+        let detected = architecture.expect("architecture vérifiée ci-dessus");
+        let labels = runtime_capabilities
+            .iter()
+            .map(ModelCapability::api_name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return (
+            Some("Diffusers PipelineResolver".into()),
+            true,
+            format!(
+                "Pipeline Diffusers déclarée ({detected}); la présence de la classe et sa signature seront vérifiées par le Worker avant téléchargement{}.",
+                if labels.is_empty() {
+                    String::new()
+                } else {
+                    format!(" : {labels}")
+                }
+            ),
+            runtime_capabilities,
+        );
     }
     if capabilities.contains(&ModelCapability::Chat)
         && library == "transformers"
@@ -1262,10 +1257,6 @@ fn infer_runtime_capabilities(
         values.insert(ModelCapability::TextToVideo);
     }
 
-    if class_name.contains("wanpipeline") || class_name.contains("wantransformer3dmodel") {
-        values.insert(ModelCapability::TextToVideo);
-        values.insert(ModelCapability::ImageToVideo);
-    }
     if advertised.contains(&ModelCapability::ImageToVideo)
         || class_name.contains("image2video")
         || class_name.contains("img2vid")
@@ -1279,33 +1270,22 @@ fn infer_runtime_capabilities(
         values.insert(ModelCapability::VideoToVideo);
     }
 
-    if values.contains(&ModelCapability::ImageToImage)
-        || advertised.contains(&ModelCapability::Inpainting)
+    if advertised.contains(&ModelCapability::Inpainting)
         || class_name.contains("inpaint")
         || has_mask_files
     {
         values.insert(ModelCapability::Inpainting);
     }
-    if values.contains(&ModelCapability::ImageToImage)
-        || advertised.contains(&ModelCapability::Outpainting)
-        || class_name.contains("outpaint")
-    {
+    if advertised.contains(&ModelCapability::Outpainting) || class_name.contains("outpaint") {
         values.insert(ModelCapability::Outpainting);
     }
-    if values.contains(&ModelCapability::ImageToImage)
-        || advertised.contains(&ModelCapability::ImageVariation)
-        || class_name.contains("variation")
-    {
+    if advertised.contains(&ModelCapability::ImageVariation) || class_name.contains("variation") {
         values.insert(ModelCapability::ImageVariation);
     }
-    if values.contains(&ModelCapability::ImageToImage)
-        || advertised.contains(&ModelCapability::ImageUpscale)
-        || class_name.contains("upscale")
-    {
+    if advertised.contains(&ModelCapability::ImageUpscale) || class_name.contains("upscale") {
         values.insert(ModelCapability::ImageUpscale);
     }
-    if values.contains(&ModelCapability::ImageToImage)
-        || advertised.contains(&ModelCapability::ControlledImageGeneration)
+    if advertised.contains(&ModelCapability::ControlledImageGeneration)
         || class_name.contains("control")
     {
         values.insert(ModelCapability::ControlledImageGeneration);
@@ -1322,14 +1302,12 @@ fn infer_runtime_capabilities(
         values.insert(ModelCapability::KeyframesToVideo);
     }
 
-    if values.contains(&ModelCapability::VideoToVideo)
-        || advertised.contains(&ModelCapability::VideoInpainting)
+    if advertised.contains(&ModelCapability::VideoInpainting)
         || (class_name.contains("video") && class_name.contains("inpaint"))
     {
         values.insert(ModelCapability::VideoInpainting);
     }
-    if values.contains(&ModelCapability::VideoToVideo)
-        || advertised.contains(&ModelCapability::VideoUpscale)
+    if advertised.contains(&ModelCapability::VideoUpscale)
         || (class_name.contains("video") && class_name.contains("upscale"))
     {
         values.insert(ModelCapability::VideoUpscale);
@@ -1696,7 +1674,7 @@ mod tests {
             model.runtime_capabilities,
             vec![ModelCapability::TextToImage]
         );
-        assert!(model.runtime_reason.contains("runtime dynamique"));
+        assert!(model.runtime_reason.contains("Worker avant téléchargement"));
     }
 
     #[test]
@@ -1723,11 +1701,11 @@ mod tests {
                 .contains(&ModelCapability::ImageToVideo)
         );
         assert!(
-            model
+            !model
                 .runtime_capabilities
                 .contains(&ModelCapability::MultiImageToVideo)
         );
-        assert!(model.runtime_reason.contains("runtime dynamique"));
+        assert!(model.runtime_reason.contains("Worker avant téléchargement"));
     }
 
     #[test]
@@ -1745,11 +1723,27 @@ mod tests {
         .unwrap();
         let model = normalize_model(raw);
         assert!(model.runtime_supported);
-        assert!(
-            model
-                .runtime_capabilities
-                .contains(&ModelCapability::TextToVideo)
-        );
+        assert!(model.runtime_capabilities.is_empty());
+    }
+
+    #[test]
+    fn model_index_pipeline_class_has_priority_over_component_architecture() {
+        let raw: HfRawModel = serde_json::from_value(json!({
+            "id": "org/generic-video", "pipeline_tag": "text-to-video",
+            "library_name": "diffusers", "sha": "abc",
+            "siblings": [
+                {"rfilename": "model_index.json"},
+                {"rfilename": "transformer/model.safetensors", "size": 42}
+            ],
+            "config": {
+                "architectures": ["Transformer3DModel"],
+                "_model_index": {"_class_name": "FutureVideoPipeline"}
+            }
+        }))
+        .unwrap();
+        let model = normalize_model(raw);
+        assert_eq!(model.pipeline_class.as_deref(), Some("FutureVideoPipeline"));
+        assert!(model.runtime_supported);
     }
 
     #[test]

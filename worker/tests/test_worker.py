@@ -174,6 +174,38 @@ def test_generation_endpoint_routes_capability_to_runtime(
     assert observed[-1]["capability"] == capability
 
 
+def test_video_api_uses_quality_and_aspect_ratio_as_semantic_targets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = create_app(settings(tmp_path))
+    observed: list[dict[str, Any]] = []
+
+    def fake_generate(payload: dict[str, Any]) -> dict[str, Any]:
+        observed.append(payload)
+        return {
+            "state": "COMPLETED",
+            "job_id": payload["job_id"],
+            "output_relative_path": payload["output_relative_path"],
+        }
+
+    monkeypatch.setattr(app.state.manager, "generate_image", fake_generate)
+    payload = _base_video_payload()
+    payload.pop("width")
+    payload.pop("height")
+    payload.update({"quality": "480p", "aspect_ratio": "9:16", "fps": 24})
+    response = TestClient(app).post(
+        "/v1/generate/text-to-video",
+        json=payload,
+        headers={"X-VidioAI-Worker-Token": "test-token"},
+    )
+    assert response.status_code == 200
+    assert observed[-1]["quality"] == "480p"
+    assert observed[-1]["aspect_ratio"] == "9:16"
+    assert observed[-1]["width"] is None
+    assert observed[-1]["height"] is None
+
+
 @pytest.mark.parametrize("capability,endpoint", sorted(CAPABILITY_ENDPOINTS.items()))
 def test_generation_endpoint_schema_validation_for_all_capabilities(
     tmp_path: Path,
@@ -248,8 +280,8 @@ def test_dynamic_metadata_detection_exposes_multiple_capabilities(tmp_path: Path
     )
 
     metadata = inspect_model_metadata(snapshot)
-    assert "TEXT_TO_IMAGE" in metadata["capabilities"]
     assert "IMAGE_TO_IMAGE" in metadata["capabilities"]
+    assert "TEXT_TO_IMAGE" not in metadata["capabilities"]
 
 
 def test_pipeline_registry_selects_an_adapter_from_metadata(tmp_path: Path) -> None:
@@ -689,7 +721,7 @@ def test_manifest_without_weights_is_rejected(tmp_path: Path) -> None:
     try:
         manager.validate_snapshot(snapshot)
     except WorkerError as error:
-        assert "safetensors" in str(error)
+        assert "poids Diffusers" in str(error)
     else:
         raise AssertionError("Un manifest sans poids ne doit jamais être accepté.")
 
@@ -794,7 +826,8 @@ def test_load_model_returns_structured_error_for_incompatible_pipeline(tmp_path:
     with pytest.raises(WorkerError) as error:
         manager.load_model("incompatible-model")
     assert error.value.status_code == 422
-    assert "pipeline non supporté" in str(error.value)
+    assert error.value.code == "DIFFUSERS_VERSION_TOO_OLD"
+    assert "CustomAudioPipeline" in str(error.value)
 
 
 def test_imports_contract_is_two_values(tmp_path: Path) -> None:
@@ -1266,7 +1299,7 @@ def test_install_pipeline_unsupported_never_sets_installed_or_ready(
 
     with pytest.raises(WorkerError) as error:
         manager.install_model("stable-image-core", "example/incompatible-model", "main", ["TEXT_TO_VIDEO"])
-    assert error.value.code == "PIPELINE_UNSUPPORTED"
+    assert error.value.code == "DIFFUSERS_VERSION_TOO_OLD"
 
     status = manager.model_status("stable-image-core")
     assert status["installed"] is False

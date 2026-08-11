@@ -531,6 +531,20 @@ pub struct Generation {
     #[serde(default)]
     pub resolution: Option<String>,
     #[serde(default)]
+    pub requested_quality: Option<String>,
+    #[serde(default)]
+    pub requested_aspect_ratio: Option<String>,
+    #[serde(default)]
+    pub requested_fps: Option<u32>,
+    #[serde(default)]
+    pub actual_width: Option<u32>,
+    #[serde(default)]
+    pub actual_height: Option<u32>,
+    #[serde(default)]
+    pub actual_fps: Option<f64>,
+    #[serde(default)]
+    pub actual_frames: Option<u32>,
+    #[serde(default)]
     pub audio: bool,
 }
 
@@ -568,7 +582,10 @@ pub struct GenerateVideoRequest {
     #[serde(default)]
     pub input_images: Vec<GenerationInputImage>,
     pub duration_seconds: Option<u32>,
-    pub resolution: Option<String>,
+    #[serde(alias = "resolution")]
+    pub quality: Option<String>,
+    pub aspect_ratio: Option<String>,
+    pub fps: Option<u32>,
     #[serde(default)]
     pub audio: bool,
 }
@@ -1130,12 +1147,13 @@ struct OptimizeInput {
     mode: GenerationMode,
     #[serde(default)]
     preset: String,
-    resolution: Option<String>,
+    #[serde(alias = "resolution")]
+    quality: Option<String>,
     duration_seconds: Option<u32>,
 }
 #[derive(Debug, Serialize)]
 struct OptimizeOutput {
-    resolution: String,
+    quality: String,
     duration_seconds: u32,
     device: String,
     warnings: Vec<String>,
@@ -1147,28 +1165,28 @@ async fn optimize_request(
 ) -> Json<OptimizeOutput> {
     let (hardware, _) = resolve_system(state.host_agent.as_ref()).await;
     let vram = hardware.total_vram_bytes().unwrap_or_default();
-    let mut resolution = input.resolution.unwrap_or_else(|| "720p".into());
+    let mut quality = input.quality.unwrap_or_else(|| "480p".into());
     let mut duration = input.duration_seconds.unwrap_or(6).clamp(2, 15);
     let mut warnings = Vec::new();
     if input.preset.eq_ignore_ascii_case("fast") {
-        resolution = "720p".into();
+        quality = "480p".into();
         duration = duration.min(6);
     }
     if input.preset.eq_ignore_ascii_case("minimum_cost") {
-        resolution = "720p".into();
+        quality = "480p".into();
         duration = duration.min(4);
     }
     if matches!(
         input.mode,
         GenerationMode::TextToVideo | GenerationMode::ImageToVideo | GenerationMode::VideoToVideo
     ) && vram < 8 * 1024 * 1024 * 1024
-        && resolution == "1080p"
+        && quality == "1080p"
     {
-        resolution = "720p".into();
+        quality = "720p".into();
         warnings.push("Résolution réduite à 720p : moins de 8 Go de VRAM détectés.".into());
     }
     Json(OptimizeOutput {
-        resolution,
+        quality,
         duration_seconds: duration,
         device: if vram > 0 { "GPU".into() } else { "CPU".into() },
         warnings,
@@ -2000,31 +2018,11 @@ async fn model_view(state: &AppState, entry: &CatalogEntry) -> ModelView {
     model_view_with_machine(state, entry, &machine).await
 }
 
-fn model_input_profile(entry: &CatalogEntry) -> ModelInputProfile {
-    let haystack = format!(
-        "{} {} {} {} {} {}",
-        entry.id,
-        entry.name,
-        entry.pipeline_tag.as_deref().unwrap_or_default(),
-        entry.architecture.as_deref().unwrap_or_default(),
-        entry.repository,
-        entry.tags.join(" ")
-    )
-    .to_ascii_lowercase();
-
-    let supports_start_end = entry
-        .runtime_capabilities
-        .contains(&ModelCapability::StartEndImageToVideo)
-        || haystack.contains("ltx")
-        || haystack.contains("ltx-video");
-    let supports_multi_reference = entry
-        .runtime_capabilities
+fn model_input_profile(runtime_capabilities: &[ModelCapability]) -> ModelInputProfile {
+    let supports_start_end = runtime_capabilities.contains(&ModelCapability::StartEndImageToVideo);
+    let supports_multi_reference = runtime_capabilities
         .contains(&ModelCapability::MultiImageToVideo)
-        || entry
-            .runtime_capabilities
-            .contains(&ModelCapability::KeyframesToVideo)
-        || haystack.contains("cogvideo")
-        || haystack.contains("cogvideox");
+        || runtime_capabilities.contains(&ModelCapability::KeyframesToVideo);
 
     if supports_start_end {
         ModelInputProfile {
@@ -2038,9 +2036,7 @@ fn model_input_profile(entry: &CatalogEntry) -> ModelInputProfile {
             ],
             supports_start_end_frames: true,
             supports_reference_images: supports_multi_reference,
-            supports_keyframes: entry
-                .runtime_capabilities
-                .contains(&ModelCapability::KeyframesToVideo),
+            supports_keyframes: runtime_capabilities.contains(&ModelCapability::KeyframesToVideo),
         }
     } else if supports_multi_reference {
         ModelInputProfile {
@@ -2076,6 +2072,60 @@ async fn model_view_with_machine(
     entry: &CatalogEntry,
     machine: &ModelMachineContext,
 ) -> ModelView {
+    let runtime_check = if entry.local || !machine.runtime_available {
+        None
+    } else if let Some(worker) = &state.worker {
+        worker
+            .compatibility(
+                entry.pipeline_class.as_deref(),
+                entry.library.as_deref(),
+                entry.pipeline_tag.as_deref(),
+                &entry.tags,
+            )
+            .await
+            .ok()
+    } else {
+        None
+    };
+    let runtime_supported = if entry.local {
+        true
+    } else {
+        runtime_check
+            .as_ref()
+            .is_some_and(|check| check.runtime_supported)
+    };
+    let runtime_capabilities = if entry.local {
+        entry.runtime_capabilities.clone()
+    } else {
+        runtime_check
+            .as_ref()
+            .map(|check| {
+                check
+                    .runtime_capabilities
+                    .iter()
+                    .filter_map(|value| {
+                        serde_json::from_value::<ModelCapability>(serde_json::Value::String(
+                            value.clone(),
+                        ))
+                        .ok()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let runtime_reason = if entry.local {
+        entry.runtime_reason.clone()
+    } else if let Some(check) = &runtime_check {
+        check.runtime_reason.clone()
+    } else if !machine.runtime_available {
+        "RUNTIME_UNAVAILABLE: le Worker Diffusers n'est pas disponible.".into()
+    } else {
+        "PIPELINE_CLASS_NOT_AVAILABLE: compatibility check Worker impossible.".into()
+    };
+    let pipeline_class = runtime_check
+        .as_ref()
+        .and_then(|check| check.pipeline_class.clone())
+        .or_else(|| entry.pipeline_class.clone());
     let installed_revision = installed_revision(state, entry).await;
     let downloaded = entry.local || installed_revision.is_some();
     let worker_status = if !entry.local && downloaded {
@@ -2145,7 +2195,7 @@ async fn model_view_with_machine(
     let compatibility_level = hardware_estimate.compatibility_level.clone();
     let installation_state = if entry.local {
         "READY".to_owned()
-    } else if !entry.runtime_supported {
+    } else if !runtime_supported {
         "RUNTIME_UNAVAILABLE".to_owned()
     } else if runtime_ready {
         "READY".to_owned()
@@ -2165,14 +2215,7 @@ async fn model_view_with_machine(
         "NOT_INSTALLED".into()
     };
 
-    let runtime_detail = if machine.runtime_available || entry.local {
-        entry.runtime_reason.clone()
-    } else {
-        format!(
-            "{} Runtime Worker indisponible sur cette instance.",
-            entry.runtime_reason
-        )
-    };
+    let runtime_detail = runtime_reason.clone();
     let access_ok = entry.access_authorized;
     let compatibility_checks = vec![
         CompatibilityCheck {
@@ -2217,7 +2260,7 @@ async fn model_view_with_machine(
         CompatibilityCheck {
             key: "runtime",
             label: "Pipeline VidioAI",
-            ok: entry.runtime_supported && (entry.local || machine.runtime_available),
+            ok: runtime_supported && (entry.local || machine.runtime_available),
             detail: runtime_detail,
         },
         CompatibilityCheck {
@@ -2232,7 +2275,7 @@ async fn model_view_with_machine(
         },
     ];
     let compatible = hardware_compatible
-        && entry.runtime_supported
+        && runtime_supported
         && entry.source_available
         && entry.quality_valid
         && (entry.local || machine.runtime_available);
@@ -2265,17 +2308,17 @@ async fn model_view_with_machine(
             .clone()
             .unwrap_or_else(|| "Non supporté".into()),
         engine_type: if entry.local { "procedural" } else { "ai" }.into(),
-        runtime_supported: entry.runtime_supported,
-        runtime_reason: entry.runtime_reason.clone(),
-        pipeline_class: entry.pipeline_class.clone(),
-        runtime_capabilities: entry.runtime_capabilities.clone(),
-        input_profile: model_input_profile(entry),
-        vidioai_supported: entry.runtime_supported,
+        runtime_supported,
+        runtime_reason,
+        pipeline_class,
+        runtime_capabilities: runtime_capabilities.clone(),
+        input_profile: model_input_profile(&runtime_capabilities),
+        vidioai_supported: runtime_supported,
         source_available: entry.source_available,
         hardware_compatible,
         available_ram_bytes: available_ram,
         available_vram_bytes: available_vram,
-        installable: entry.installable && compatible && access_ok,
+        installable: entry.installable && runtime_supported && compatible && access_ok,
         compatibility_checks,
         accessibility: entry.accessibility.clone(),
         access_authorized: entry.access_authorized,
@@ -2369,13 +2412,19 @@ async fn get_models(
         .map_err(ApiError::unavailable)?;
     let mut entries = local_runtime_models();
     entries.extend(result.models);
-    let mut views = Vec::with_capacity(entries.len());
     let machine = model_machine_context(&state).await;
-    for entry in entries {
-        if !entry_matches_query(&entry, &query) {
-            continue;
-        }
-        let view = model_view_with_machine(&state, &entry, &machine).await;
+    let matching = entries
+        .iter()
+        .filter(|entry| entry_matches_query(entry, &query))
+        .collect::<Vec<_>>();
+    let candidates = futures_util::future::join_all(
+        matching
+            .into_iter()
+            .map(|entry| model_view_with_machine(&state, entry, &machine)),
+    )
+    .await;
+    let mut views = Vec::with_capacity(candidates.len());
+    for view in candidates {
         if query
             .installed
             .is_some_and(|expected| view.installed != expected)
@@ -2496,6 +2545,8 @@ async fn start_model_install(
         entry.revision = revision;
     }
     let view = model_view(&state, &entry).await;
+    entry.runtime_capabilities = view.runtime_capabilities.clone();
+    entry.pipeline_class = view.pipeline_class.clone();
     // Une installation déjà à la révision courante est idempotemment refusée,
     // mais une révision distante plus récente suit le même job atomique : c'est
     // la voie de mise à jour, sans route spéciale ni perte de l'ID original.
@@ -3530,14 +3581,14 @@ async fn generate_image(
             "Capacité image invalide pour ce mode.",
         ));
     }
-    if !entry.capabilities.contains(&expected_capability)
-        || !entry.capabilities.contains(&requested_capability)
+    let view = model_view(&state, &entry).await;
+    if !view.runtime_capabilities.contains(&expected_capability)
+        || !view.runtime_capabilities.contains(&requested_capability)
     {
         return Err(ApiError::conflict(
             "Ce modèle ne supporte pas ce mode de génération.",
         ));
     }
-    let view = model_view(&state, &entry).await;
     if !view.installed {
         return Err(ApiError::conflict("Installez le modèle avant de générer."));
     }
@@ -3567,6 +3618,13 @@ async fn generate_image(
         updated_at: unix_now(),
         duration_seconds: None,
         resolution: None,
+        requested_quality: None,
+        requested_aspect_ratio: None,
+        requested_fps: None,
+        actual_width: None,
+        actual_height: None,
+        actual_fps: None,
+        actual_frames: None,
         audio: false,
     };
     state
@@ -3946,10 +4004,22 @@ async fn generate_video(
         ));
     }
     let duration = request.duration_seconds.unwrap_or(6).clamp(2, 15);
-    let resolution = request.resolution.unwrap_or_else(|| "720p".into());
-    if !matches!(resolution.as_str(), "720p" | "1080p") {
+    let quality = request.quality.unwrap_or_else(|| "480p".into());
+    if !matches!(quality.as_str(), "480p" | "720p" | "1080p") {
         return Err(ApiError::bad_request(
-            "La résolution doit être 720p ou 1080p.",
+            "La qualité doit être 480p, 720p ou 1080p.",
+        ));
+    }
+    let aspect_ratio = request.aspect_ratio.unwrap_or_else(|| "16:9".into());
+    if !matches!(aspect_ratio.as_str(), "16:9" | "9:16" | "1:1") {
+        return Err(ApiError::bad_request(
+            "Le ratio doit être 16:9, 9:16 ou 1:1.",
+        ));
+    }
+    let requested_fps = request.fps.unwrap_or(24);
+    if !(1..=60).contains(&requested_fps) {
+        return Err(ApiError::bad_request(
+            "Le FPS doit être compris entre 1 et 60.",
         ));
     }
 
@@ -3974,14 +4044,14 @@ async fn generate_video(
             "Capacité vidéo invalide pour ce mode.",
         ));
     }
-    if !entry.runtime_capabilities.contains(&expected)
-        || !entry.runtime_capabilities.contains(&requested_capability)
+    let view = model_view(&state, &entry).await;
+    if !view.runtime_capabilities.contains(&expected)
+        || !view.runtime_capabilities.contains(&requested_capability)
     {
         return Err(ApiError::conflict(
             "Ce modèle ne supporte pas le mode vidéo choisi.",
         ));
     }
-    let view = model_view(&state, &entry).await;
     if !view.installed {
         return Err(ApiError::conflict("Installez le modèle avant de générer."));
     }
@@ -4059,7 +4129,14 @@ async fn generate_video(
         created_at: unix_now(),
         updated_at: unix_now(),
         duration_seconds: Some(duration),
-        resolution: Some(resolution),
+        resolution: Some(quality.clone()),
+        requested_quality: Some(quality),
+        requested_aspect_ratio: Some(aspect_ratio),
+        requested_fps: Some(requested_fps),
+        actual_width: None,
+        actual_height: None,
+        actual_fps: None,
+        actual_frames: None,
         audio: request.audio,
     };
     update_generation(&state, generation.clone()).await;
@@ -4086,6 +4163,23 @@ async fn generate_video(
 /// Encode un MP4 H.264 lisible par les navigateurs. T2V construit d'abord une
 /// image déterministe depuis le prompt ; I2V anime l'image fournie ; V2V
 /// réencode et stylise la vidéo d'origine sans jamais l'écraser.
+fn procedural_video_dimensions(quality: &str, aspect_ratio: &str) -> (u32, u32) {
+    let short_side = match quality {
+        "1080p" => 1080,
+        "720p" => 720,
+        _ => 480,
+    };
+    let mut long_side = ((f64::from(short_side) * 16.0 / 9.0).round()) as u32;
+    if !long_side.is_multiple_of(2) {
+        long_side += 1;
+    }
+    match aspect_ratio {
+        "9:16" => (short_side, long_side),
+        "1:1" => (short_side, short_side),
+        _ => (long_side, short_side),
+    }
+}
+
 async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, job_id: Uuid) {
     generation.status = GenerationStatus::Running;
     generation.progress = 8;
@@ -4107,11 +4201,18 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
     let output_path = temporary_dir.join("result.mp4");
     let progress_path = temporary_dir.join("ffmpeg-progress.txt");
     let duration = generation.duration_seconds.unwrap_or(6);
-    let (width, height) = if generation.resolution.as_deref() == Some("1080p") {
-        (1920, 1080)
-    } else {
-        (1280, 720)
-    };
+    let quality = generation
+        .requested_quality
+        .as_deref()
+        .unwrap_or("480p")
+        .to_owned();
+    let aspect_ratio = generation
+        .requested_aspect_ratio
+        .as_deref()
+        .unwrap_or("16:9")
+        .to_owned();
+    let requested_fps = generation.requested_fps.unwrap_or(24);
+    let (width, height) = procedural_video_dimensions(&quality, &aspect_ratio);
 
     let result: Result<Asset, String> = async {
         let procedural = generation.model_id == "vidio-motion-local";
@@ -4223,10 +4324,10 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
                     },
                     None,
                     Some(capability.api_name()),
-                    width,
-                    height,
+                    &quality,
+                    &aspect_ratio,
                     duration,
-                    24,
+                    requested_fps,
                 )
                 .await?;
 
@@ -4240,6 +4341,14 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
             {
                 return Err("Le worker a renvoyé un résultat incohérent.".into());
             }
+            generation.actual_width = worker_result.actual_width.or(Some(worker_result.width));
+            generation.actual_height = worker_result.actual_height.or(Some(worker_result.height));
+            generation.actual_fps = worker_result.actual_fps;
+            generation.actual_frames = worker_result.actual_frames;
+            generation.requested_quality = worker_result.requested_quality
+                .or_else(|| generation.requested_quality.clone());
+            generation.requested_aspect_ratio = worker_result.requested_aspect_ratio
+                .or_else(|| generation.requested_aspect_ratio.clone());
 
             let shared_output = state.settings.get().await.work_dir.join(&relative);
             let bytes = fs::read(&shared_output).await.map_err(|error| {
@@ -4291,10 +4400,10 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
                     None,
                     None,
                     Some("TEXT_TO_VIDEO"),
-                    width,
-                    height,
+                    &quality,
+                    &aspect_ratio,
                     duration,
-                    24,
+                    requested_fps,
                 )
                 .await?;
             if worker_result.job_id != job_id.to_string()
@@ -4303,6 +4412,14 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
             {
                 return Err("Le worker a renvoyé un résultat incohérent.".into());
             }
+            generation.actual_width = worker_result.actual_width.or(Some(worker_result.width));
+            generation.actual_height = worker_result.actual_height.or(Some(worker_result.height));
+            generation.actual_fps = worker_result.actual_fps;
+            generation.actual_frames = worker_result.actual_frames;
+            generation.requested_quality = worker_result.requested_quality
+                .or_else(|| generation.requested_quality.clone());
+            generation.requested_aspect_ratio = worker_result.requested_aspect_ratio
+                .or_else(|| generation.requested_aspect_ratio.clone());
             let path = state.settings.get().await.work_dir.join(&relative);
             let bytes = fs::read(&path).await.map_err(|error| {
                 format!("Sortie worker introuvable sur le volume partagé: {error}")
@@ -4338,10 +4455,11 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
                 command.args(["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100", "-shortest"]);
             }
             command.arg("-t").arg(duration.to_string())
-                .arg("-vf").arg(format!("scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},zoompan=z='min(zoom+0.0007,1.08)':d=1:s={width}x{height}:fps=24,format=yuv420p"));
+                .arg("-vf").arg(format!("scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},zoompan=z='min(zoom+0.0007,1.08)':d=1:s={width}x{height}:fps={requested_fps},format=yuv420p"));
             if generation.audio { command.args(["-c:a", "aac"]); }
         }
-        command.args(["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart"])
+        command.arg("-r").arg(requested_fps.to_string())
+            .args(["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart"])
             // FFmpeg écrit ici le temps réellement encodé. La progression n'est
             // donc plus un compteur artificiel basé sur une temporisation.
             .arg("-progress").arg(&progress_path).arg("-nostats")
@@ -4408,6 +4526,15 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
     let _ = fs::remove_dir_all(&temporary_dir).await;
     match result {
         Ok(asset) => {
+            generation.actual_width = asset.width.or(generation.actual_width);
+            generation.actual_height = asset.height.or(generation.actual_height);
+            generation.actual_fps = asset.fps.or(generation.actual_fps);
+            if generation.actual_frames.is_none() {
+                generation.actual_frames = asset
+                    .duration_seconds
+                    .zip(asset.fps)
+                    .map(|(duration, fps)| (duration * fps).round() as u32);
+            }
             generation.output_asset_id = Some(asset.id);
             generation.status = GenerationStatus::Completed;
             generation.progress = 100;
@@ -4539,11 +4666,13 @@ async fn get_generation(
 #[cfg(test)]
 mod tests {
     use super::{
-        AppSettings, CanvasEngine, GenerationMode, ModelCapability, ModelIdQuery, image_endpoint,
-        is_valid_image_capability_for_mode, is_valid_video_capability_for_mode,
-        local_runtime_models, video_endpoint,
+        AppSettings, CanvasEngine, GenerateVideoRequest, GenerationMode, ModelCapability,
+        ModelIdQuery, image_endpoint, is_valid_image_capability_for_mode,
+        is_valid_video_capability_for_mode, local_runtime_models, procedural_video_dimensions,
+        video_endpoint,
     };
     use crate::worker::WorkerModelStatus;
+    use serde_json::json;
 
     #[test]
     fn query_model_ids_preserve_encoded_hugging_face_slashes() {
@@ -4586,6 +4715,36 @@ mod tests {
             serde_json::to_string(&GenerationMode::VideoToVideo).unwrap(),
             "\"VIDEO_TO_VIDEO\""
         );
+    }
+
+    #[test]
+    fn video_request_accepts_semantic_quality_and_legacy_resolution_alias() {
+        let current: GenerateVideoRequest = serde_json::from_value(json!({
+            "mode": "TEXT_TO_VIDEO",
+            "prompt": "Une ville futuriste en mouvement",
+            "quality": "480p",
+            "aspect_ratio": "9:16",
+            "fps": 24
+        }))
+        .unwrap();
+        assert_eq!(current.quality.as_deref(), Some("480p"));
+        assert_eq!(current.aspect_ratio.as_deref(), Some("9:16"));
+        assert_eq!(current.fps, Some(24));
+
+        let legacy: GenerateVideoRequest = serde_json::from_value(json!({
+            "mode": "TEXT_TO_VIDEO",
+            "prompt": "Une ville futuriste en mouvement",
+            "resolution": "720p"
+        }))
+        .unwrap();
+        assert_eq!(legacy.quality.as_deref(), Some("720p"));
+    }
+
+    #[test]
+    fn procedural_video_dimensions_cover_required_qualities_and_ratios() {
+        assert_eq!(procedural_video_dimensions("480p", "16:9"), (854, 480));
+        assert_eq!(procedural_video_dimensions("720p", "9:16"), (720, 1280));
+        assert_eq!(procedural_video_dimensions("480p", "1:1"), (480, 480));
     }
 
     #[test]

@@ -11,6 +11,7 @@ from .config import Settings
 from .runtime import RuntimeManager, WorkerError
 from .schemas import (
     CancelRequest,
+    CompatibilityRequest,
     GenerateImageRequest,
     GenerateVideoRequest,
     InstallModelRequest,
@@ -21,6 +22,7 @@ from .schemas import (
 def create_app(settings: Settings | None = None) -> FastAPI:
     worker_settings = settings or Settings.from_env()
     manager = RuntimeManager(worker_settings)
+    manager.log_runtime_versions()
     application = FastAPI(
         title="VidioAI GPU Worker",
         version="0.1.0",
@@ -95,6 +97,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "engine_type": "ai",
         }
 
+    @application.post("/v1/models/compatibility")
+    async def model_compatibility(
+        request: CompatibilityRequest, _auth: None = Depends(authorize)
+    ) -> dict[str, object]:
+        return manager.check_compatibility(request.model_dump())
+
     @application.post("/v1/models/install")
     async def install_model(
         request: InstallModelRequest, _auth: None = Depends(authorize)
@@ -139,7 +147,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload["capability"] = payload.get("capability") or "TEXT_TO_IMAGE"
         result = await asyncio.to_thread(manager.generate_image, payload)
         if result["state"] == "FAILED":
-            raise WorkerError(str(result["error"]), 500)
+            raise WorkerError(
+                str(result["error"]),
+                500,
+                code=str(result.get("error_code") or "GENERATION_FAILED"),
+            )
         if result["state"] == "CANCELLED":
             raise WorkerError("La génération a été annulée.", 409)
         return result
@@ -151,7 +163,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload["capability"] = payload.get("capability") or "IMAGE_TO_IMAGE"
         result = await asyncio.to_thread(manager.generate_image, payload)
         if result["state"] == "FAILED":
-            raise WorkerError(str(result["error"]), 500)
+            raise WorkerError(
+                str(result["error"]),
+                500,
+                code=str(result.get("error_code") or "GENERATION_FAILED"),
+            )
         if result["state"] == "CANCELLED":
             raise WorkerError("La génération a été annulée.", 409)
         return result
@@ -163,7 +179,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload["capability"] = payload.get("capability") or "TEXT_TO_VIDEO"
         result = await asyncio.to_thread(manager.generate_image, payload)
         if result["state"] == "FAILED":
-            raise WorkerError(str(result["error"]), 500)
+            raise WorkerError(
+                str(result["error"]),
+                500,
+                code=str(result.get("error_code") or "GENERATION_FAILED"),
+            )
         if result["state"] == "CANCELLED":
             raise WorkerError("La génération a été annulée.", 409)
         return result
@@ -175,7 +195,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload["capability"] = payload.get("capability") or "IMAGE_TO_VIDEO"
         result = await asyncio.to_thread(manager.generate_image, payload)
         if result["state"] == "FAILED":
-            raise WorkerError(str(result["error"]), 500)
+            raise WorkerError(
+                str(result["error"]),
+                500,
+                code=str(result.get("error_code") or "GENERATION_FAILED"),
+            )
         if result["state"] == "CANCELLED":
             raise WorkerError("La génération a été annulée.", 409)
         return result
@@ -187,7 +211,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload["capability"] = payload.get("capability") or "VIDEO_TO_VIDEO"
         result = await asyncio.to_thread(manager.generate_image, payload)
         if result["state"] == "FAILED":
-            raise WorkerError(str(result["error"]), 500)
+            raise WorkerError(
+                str(result["error"]),
+                500,
+                code=str(result.get("error_code") or "GENERATION_FAILED"),
+            )
         if result["state"] == "CANCELLED":
             raise WorkerError("La génération a été annulée.", 409)
         return result
@@ -199,7 +227,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload["capability"] = "INPAINTING"
         result = await asyncio.to_thread(manager.generate_image, payload)
         if result["state"] == "FAILED":
-            raise WorkerError(str(result["error"]), 500)
+            raise WorkerError(
+                str(result["error"]),
+                500,
+                code=str(result.get("error_code") or "GENERATION_FAILED"),
+            )
         if result["state"] == "CANCELLED":
             raise WorkerError("La génération a été annulée.", 409)
         return result
@@ -211,7 +243,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload["capability"] = "OUTPAINTING"
         result = await asyncio.to_thread(manager.generate_image, payload)
         if result["state"] == "FAILED":
-            raise WorkerError(str(result["error"]), 500)
+            raise WorkerError(
+                str(result["error"]),
+                500,
+                code=str(result.get("error_code") or "GENERATION_FAILED"),
+            )
         if result["state"] == "CANCELLED":
             raise WorkerError("La génération a été annulée.", 409)
         return result
@@ -223,7 +259,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload["capability"] = "IMAGE_VARIATION"
         result = await asyncio.to_thread(manager.generate_image, payload)
         if result["state"] == "FAILED":
-            raise WorkerError(str(result["error"]), 500)
+            raise WorkerError(
+                str(result["error"]),
+                500,
+                code=str(result.get("error_code") or "GENERATION_FAILED"),
+            )
         if result["state"] == "CANCELLED":
             raise WorkerError("La génération a été annulée.", 409)
         return result
@@ -235,7 +275,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload["capability"] = "IMAGE_UPSCALE"
         result = await asyncio.to_thread(manager.generate_image, payload)
         if result["state"] == "FAILED":
-            raise WorkerError(str(result["error"]), 500)
+            raise WorkerError(
+                str(result["error"]),
+                500,
+                code=str(result.get("error_code") or "GENERATION_FAILED"),
+            )
         if result["state"] == "CANCELLED":
             raise WorkerError("La génération a été annulée.", 409)
         return result
@@ -247,7 +291,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload["capability"] = "CONTROLLED_IMAGE_GENERATION"
         result = await asyncio.to_thread(manager.generate_image, payload)
         if result["state"] == "FAILED":
-            raise WorkerError(str(result["error"]), 500)
+            raise WorkerError(
+                str(result["error"]),
+                500,
+                code=str(result.get("error_code") or "GENERATION_FAILED"),
+            )
         if result["state"] == "CANCELLED":
             raise WorkerError("La génération a été annulée.", 409)
         return result
@@ -259,7 +307,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload["capability"] = "MULTI_IMAGE_TO_VIDEO"
         result = await asyncio.to_thread(manager.generate_image, payload)
         if result["state"] == "FAILED":
-            raise WorkerError(str(result["error"]), 500)
+            raise WorkerError(
+                str(result["error"]),
+                500,
+                code=str(result.get("error_code") or "GENERATION_FAILED"),
+            )
         if result["state"] == "CANCELLED":
             raise WorkerError("La génération a été annulée.", 409)
         return result
@@ -271,7 +323,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload["capability"] = "START_END_IMAGE_TO_VIDEO"
         result = await asyncio.to_thread(manager.generate_image, payload)
         if result["state"] == "FAILED":
-            raise WorkerError(str(result["error"]), 500)
+            raise WorkerError(
+                str(result["error"]),
+                500,
+                code=str(result.get("error_code") or "GENERATION_FAILED"),
+            )
         if result["state"] == "CANCELLED":
             raise WorkerError("La génération a été annulée.", 409)
         return result
@@ -283,7 +339,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload["capability"] = "KEYFRAMES_TO_VIDEO"
         result = await asyncio.to_thread(manager.generate_image, payload)
         if result["state"] == "FAILED":
-            raise WorkerError(str(result["error"]), 500)
+            raise WorkerError(
+                str(result["error"]),
+                500,
+                code=str(result.get("error_code") or "GENERATION_FAILED"),
+            )
         if result["state"] == "CANCELLED":
             raise WorkerError("La génération a été annulée.", 409)
         return result
@@ -295,7 +355,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload["capability"] = "VIDEO_INPAINTING"
         result = await asyncio.to_thread(manager.generate_image, payload)
         if result["state"] == "FAILED":
-            raise WorkerError(str(result["error"]), 500)
+            raise WorkerError(
+                str(result["error"]),
+                500,
+                code=str(result.get("error_code") or "GENERATION_FAILED"),
+            )
         if result["state"] == "CANCELLED":
             raise WorkerError("La génération a été annulée.", 409)
         return result
@@ -307,7 +371,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload["capability"] = "VIDEO_UPSCALE"
         result = await asyncio.to_thread(manager.generate_image, payload)
         if result["state"] == "FAILED":
-            raise WorkerError(str(result["error"]), 500)
+            raise WorkerError(
+                str(result["error"]),
+                500,
+                code=str(result.get("error_code") or "GENERATION_FAILED"),
+            )
         if result["state"] == "CANCELLED":
             raise WorkerError("La génération a été annulée.", 409)
         return result

@@ -3,6 +3,10 @@ from __future__ import annotations
 import inspect
 from typing import Any
 
+from ..capability_resolver import CapabilityResolver
+from ..model_profile import ModelRuntimeProfile
+from ..normalizers import assign_alias
+from ..pipeline_resolver import PipelineResolver
 from .base import RuntimeAdapter
 
 
@@ -34,31 +38,14 @@ class GenericDiffusersAdapter(RuntimeAdapter):
         ]
 
     def supported_capabilities(self, metadata: dict[str, Any]) -> list[str]:
-        capabilities = [
-            str(value).upper()
-            for value in (metadata.get("capabilities") or [])
-            if isinstance(value, str)
-        ]
-        if capabilities:
-            return capabilities
-
-        pipeline_tag = str(metadata.get("pipeline_tag") or "").lower()
-        class_name = str(metadata.get("class_name") or "").lower()
-        if "video" in pipeline_tag or "video" in class_name:
-            return ["TEXT_TO_VIDEO"]
-        return ["TEXT_TO_IMAGE"]
+        resolution = PipelineResolver().resolve_class(metadata)
+        return CapabilityResolver().resolve(metadata, resolution.pipeline_cls)
 
     def supports_model(self, metadata: dict[str, Any]) -> bool:
-        if str(metadata.get("library_name") or "").lower() != "diffusers":
-            return False
-        class_name = str(metadata.get("class_name") or "").strip()
-        if not class_name:
-            return False
         try:
-            import diffusers
+            return PipelineResolver().resolve_class(metadata).runtime_supported
         except Exception:
             return False
-        return getattr(diffusers, class_name, None) is not None
 
     def estimate_resources(self, metadata: dict[str, Any]) -> dict[str, Any]:
         class_name = str(metadata.get("class_name") or "").lower()
@@ -67,28 +54,14 @@ class GenericDiffusersAdapter(RuntimeAdapter):
         return {"vram_bytes": 10 * 1024 * 1024 * 1024, "ram_bytes": 10 * 1024 * 1024 * 1024}
 
     def load(self, snapshot: str, settings: dict[str, Any], runtime: Any) -> Any:
-        from diffusers import DiffusionPipeline
-        import diffusers
-
-        class_name = str(runtime.get("class_name") or "")
-        pipeline_cls = getattr(diffusers, class_name, None) if class_name else None
-        if pipeline_cls is not None:
-            try:
-                return pipeline_cls.from_pretrained(
-                    snapshot,
-                    local_files_only=True,
-                    use_safetensors=True,
-                    torch_dtype=settings.get("torch_dtype"),
-                )
-            except Exception:
-                pass
-
-        return DiffusionPipeline.from_pretrained(
+        pipeline, resolution = PipelineResolver().load(
             snapshot,
-            local_files_only=True,
-            use_safetensors=True,
-            torch_dtype=settings.get("torch_dtype"),
+            runtime.get("metadata") or {},
+            str(runtime.get("capability") or "TEXT_TO_IMAGE"),
+            settings,
         )
+        runtime["pipeline_resolution"] = resolution
+        return pipeline
 
     def unload(self, pipeline: Any, runtime: Any) -> None:
         del pipeline
@@ -120,23 +93,29 @@ class GenericDiffusersAdapter(RuntimeAdapter):
         capability = str(request.get("capability") or "TEXT_TO_IMAGE").upper()
         images, roles = self._prepare_pipeline_inputs(request)
 
+        accepted = set(inspect.signature(pipeline.__call__).parameters)
+        profile = ModelRuntimeProfile.from_metadata(runtime.get("metadata") or {}, pipeline)
+        values = profile.normalize(request, video="VIDEO" in capability)
         kwargs: dict[str, Any] = {
             "prompt": request.get("prompt"),
             "negative_prompt": request.get("negative_prompt"),
-            "width": request.get("width", 512),
-            "height": request.get("height", 512),
-            "num_inference_steps": request.get("steps", 4),
-            "guidance_scale": request.get("guidance_scale", 0.0),
+            "width": values["width"],
+            "height": values["height"],
+            "num_inference_steps": values["num_inference_steps"],
+            "guidance_scale": values["guidance_scale"],
             "generator": runtime.get("generator"),
-            "num_frames": request.get("frames"),
-            "fps": request.get("fps"),
-            "image": request.get("input_image"),
-            "video": request.get("input_video"),
-            "frames": request.get("input_frames"),
-            "mask_image": request.get("mask_image"),
-            "control_image": request.get("control_image"),
+            "fps": values["fps"],
             "strength": request.get("strength"),
         }
+
+        assign_alias(kwargs, accepted, values["num_frames"], "num_frames", "video_length")
+        assign_alias(kwargs, accepted, request.get("input_image"), "image")
+        input_video = request.get("input_video")
+        if input_video is None:
+            input_video = request.get("input_frames")
+        assign_alias(kwargs, accepted, input_video, "video", "frames")
+        assign_alias(kwargs, accepted, request.get("mask_image"), "mask_image", "mask")
+        assign_alias(kwargs, accepted, request.get("control_image"), "control_image")
 
         if capability in {
             "IMAGE_TO_VIDEO",
@@ -144,21 +123,20 @@ class GenericDiffusersAdapter(RuntimeAdapter):
             "START_END_IMAGE_TO_VIDEO",
             "KEYFRAMES_TO_VIDEO",
         } and images:
-            kwargs["image"] = images[0]
-            kwargs["images"] = images
-            kwargs["keyframes"] = images
-            kwargs["image_roles"] = roles
+            assign_alias(kwargs, accepted, images[0], "image")
+            assign_alias(kwargs, accepted, images, "images", "reference_images", "conditioning_images")
+            assign_alias(kwargs, accepted, images, "keyframes")
+            assign_alias(kwargs, accepted, roles, "image_roles")
             end_index = None
             for index, role in enumerate(roles):
                 if role in {"end", "end_frame"}:
                     end_index = index
                     break
             if end_index is not None:
-                kwargs["end_image"] = images[end_index]
+                assign_alias(kwargs, accepted, images[end_index], "last_image", "end_image")
             elif len(images) > 1:
-                kwargs["end_image"] = images[-1]
+                assign_alias(kwargs, accepted, images[-1], "last_image", "end_image")
 
-        accepted = set(inspect.signature(pipeline.__call__).parameters)
         filtered = {
             key: value
             for key, value in kwargs.items()
@@ -166,6 +144,6 @@ class GenericDiffusersAdapter(RuntimeAdapter):
         }
         output = pipeline(**filtered)
         frames = getattr(output, "frames", [])
-        if frames:
-            return {"frames": frames}
-        return {"images": getattr(output, "images", [])}
+        if frames is not None:
+            return {"frames": frames, **values}
+        return {"images": getattr(output, "images", []), **values}

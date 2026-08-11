@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import inspect
+import importlib.metadata
 import json
 import os
 import resource
@@ -28,6 +30,11 @@ from typing import Any
 
 from .adapters.inspectors import inspect_model_metadata
 from .adapters.registry import PipelineRegistry
+from .capability_resolver import CapabilityResolver
+from .normalizers import InputNormalizer, NormalizationError, OutputNormalizer, VIDEO_CAPABILITIES
+from .pipeline_resolver import PipelineResolutionError, PipelineResolver
+from .model_profile import ModelRuntimeProfile
+from .resolution_resolver import ResolutionResolver
 from .config import Settings
 from .schemas import JobState, ModelState
 
@@ -78,6 +85,10 @@ class RuntimeManager:
         self._runtime_modules: tuple[Any, Any] | None = None
         self._runtime_error: str | None = None
         self._registry = PipelineRegistry()
+        self._pipeline_resolver = PipelineResolver()
+        self._resolution_resolver = ResolutionResolver()
+        self._input_normalizer = InputNormalizer(self.settings.work_dir)
+        self._output_normalizer = OutputNormalizer(self.settings.work_dir)
 
     @staticmethod
     def _safe_segment(value: str) -> str:
@@ -126,92 +137,12 @@ class RuntimeManager:
         suffix = f" reason={reason}" if reason else ""
         print(f"MODEL_STATE {model_id} {from_state} -> {to_state}{suffix}")
 
-    @staticmethod
-    def _load_image(path: str | Path) -> Any:
-        from PIL import Image
-
-        image = Image.open(Path(path))
+    def _resolve_generation_inputs(self, request: dict[str, Any], pipeline: Any) -> dict[str, Any]:
+        accepted = set(inspect.signature(pipeline.__call__).parameters)
         try:
-            return image.convert("RGB")
-        finally:
-            image.close()
-
-    @staticmethod
-    def _load_first_video_frame(path: str | Path, workspace: Path) -> Any:
-        frame_path = workspace / f"frame-{uuid.uuid4()}.png"
-        command = [
-            "ffmpeg",
-            "-y",
-            "-loglevel",
-            "error",
-            "-i",
-            str(path),
-            "-frames:v",
-            "1",
-            str(frame_path),
-        ]
-        try:
-            subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=20,
-                check=True,
-            )
-        except subprocess.SubprocessError as error:
-            raise WorkerError(f"Décodage vidéo impossible: {error}", 422) from error
-        try:
-            return RuntimeManager._load_image(frame_path)
-        finally:
-            frame_path.unlink(missing_ok=True)
-
-    def _resolve_generation_inputs(self, request: dict[str, Any]) -> dict[str, Any]:
-        prepared = dict(request)
-        capability = str(prepared.get("capability") or "").upper()
-
-        input_path = prepared.get("input_path")
-        if isinstance(input_path, str) and input_path.strip():
-            candidate = Path(input_path)
-            if not candidate.is_file():
-                raise WorkerError("Le fichier d'entrée est introuvable.", 422)
-            if capability in {"VIDEO_TO_VIDEO", "VIDEO_INPAINTING", "VIDEO_UPSCALE"}:
-                prepared["input_video"] = str(candidate)
-                prepared["input_frames"] = [
-                    self._load_first_video_frame(candidate, self.settings.work_dir)
-                ]
-            else:
-                prepared["input_image"] = self._load_image(candidate)
-
-        mask_path = prepared.get("mask_path")
-        if isinstance(mask_path, str) and mask_path.strip():
-            candidate = Path(mask_path)
-            if not candidate.is_file():
-                raise WorkerError("Le masque fourni est introuvable.", 422)
-            prepared["mask_image"] = self._load_image(candidate)
-
-        control_path = prepared.get("control_path")
-        if isinstance(control_path, str) and control_path.strip():
-            candidate = Path(control_path)
-            if not candidate.is_file():
-                raise WorkerError("L'image de contrôle est introuvable.", 422)
-            prepared["control_image"] = self._load_image(candidate)
-
-        resolved_images = []
-        for item in prepared.get("input_images") or []:
-            if not isinstance(item, dict):
-                continue
-            source = item.get("source") or item.get("path") or item.get("input_path")
-            if not isinstance(source, str) or not source.strip():
-                continue
-            candidate = Path(source)
-            if not candidate.is_file():
-                raise WorkerError("Une image d'entrée référencée est introuvable.", 422)
-            resolved_images.append(self._load_image(candidate))
-
-        if resolved_images:
-            prepared["resolved_input_images"] = resolved_images
-
-        return prepared
+            return self._input_normalizer.normalize(request, accepted)
+        except NormalizationError as error:
+            raise WorkerError(str(error), 422, code=error.code) from error
 
     def _active_snapshot(self, model_id: str) -> tuple[Path, dict[str, Any]]:
         pointer = self._active_pointer(model_id)
@@ -223,6 +154,63 @@ class RuntimeManager:
         if not snapshot.is_dir():
             raise WorkerError("Le snapshot actif est absent du cache.", 409)
         return snapshot, metadata
+
+    def check_compatibility(self, request: dict[str, Any]) -> dict[str, Any]:
+        class_name = request.get("pipeline_class")
+        metadata = {
+            "class_name": class_name,
+            "library_name": request.get("library_name"),
+            "pipeline_tag": request.get("pipeline_tag"),
+            "raw_tags": request.get("tags") or [],
+            "architectures": request.get("architectures") or [],
+            "base_models": request.get("base_models") or [],
+            "trust_remote_code": request.get("trust_remote_code") is True,
+            "model_index": {"_class_name": class_name} if class_name else {},
+            "config": {},
+        }
+        if self._pipeline_resolver.requires_remote_code(metadata):
+            return {
+                "runtime_supported": False,
+                "runtime_capabilities": [],
+                "pipeline_class": class_name,
+                "runtime_reason": "REMOTE_CODE_REQUIRED",
+                "error_code": "REMOTE_CODE_REQUIRED",
+            }
+        library = str(metadata.get("library_name") or "").lower()
+        if library not in {"", "diffusers"}:
+            return {
+                "runtime_supported": False,
+                "runtime_capabilities": [],
+                "pipeline_class": class_name,
+                "runtime_reason": f"Bibliotheque non prise en charge: {library}",
+                "error_code": "UNSUPPORTED_LIBRARY",
+            }
+        try:
+            resolution = self._pipeline_resolver.resolve_class(metadata)
+        except PipelineResolutionError as error:
+            return {
+                "runtime_supported": False,
+                "runtime_capabilities": [],
+                "pipeline_class": class_name,
+                "runtime_reason": str(error),
+                "error_code": error.code,
+                "dependency": error.dependency,
+            }
+        capabilities = CapabilityResolver().resolve(metadata, resolution.pipeline_cls)
+        error_code = None
+        if not resolution.runtime_supported:
+            error_code = (
+                "DIFFUSERS_VERSION_TOO_OLD"
+                if resolution.class_name
+                else "PIPELINE_CLASS_NOT_AVAILABLE"
+            )
+        return {
+            "runtime_supported": resolution.runtime_supported,
+            "runtime_capabilities": capabilities,
+            "pipeline_class": resolution.class_name,
+            "runtime_reason": resolution.runtime_reason,
+            "error_code": error_code,
+        }
 
     @staticmethod
     def _metadata_with_capabilities(
@@ -284,6 +272,47 @@ class RuntimeManager:
             if adapter is not None:
                 return candidate
         return None
+
+    def _unsupported_pipeline_error(
+        self,
+        metadata: dict[str, Any],
+        capability: str | None = None,
+    ) -> WorkerError:
+        if self._pipeline_resolver.requires_remote_code(metadata):
+            return WorkerError(
+                "Le snapshot exige trust_remote_code.",
+                422,
+                code="REMOTE_CODE_REQUIRED",
+            )
+        library = str(metadata.get("library_name") or "diffusers").lower()
+        if library not in {"", "diffusers"}:
+            return WorkerError(
+                f"Bibliotheque runtime non prise en charge: {library}",
+                422,
+                code="UNSUPPORTED_LIBRARY",
+            )
+        try:
+            resolution = self._pipeline_resolver.resolve_class(metadata)
+        except PipelineResolutionError as error:
+            return WorkerError(str(error), 422, code=error.code)
+        if not resolution.runtime_supported:
+            code = (
+                "DIFFUSERS_VERSION_TOO_OLD"
+                if resolution.class_name
+                else "PIPELINE_CLASS_NOT_AVAILABLE"
+            )
+            return WorkerError(resolution.runtime_reason, 422, code=code)
+        if capability:
+            return WorkerError(
+                f"La pipeline {resolution.class_name} ne declare pas {capability}.",
+                422,
+                code="PIPELINE_CAPABILITY_NOT_AVAILABLE",
+            )
+        return WorkerError(
+            "La classe Diffusers existe, mais aucun loader generique ou specialise n'a fonctionne.",
+            422,
+            code="PIPELINE_UNSUPPORTED",
+        )
 
     @staticmethod
     def _read_manifest(snapshot: Path) -> dict[str, Any]:
@@ -537,6 +566,66 @@ class RuntimeManager:
             else:
                 os.environ["HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY"] = previous_seq
 
+    def _preflight_remote_metadata(
+        self,
+        repository: str,
+        revision: str,
+        local_dir: Path,
+        token: str | None,
+    ) -> dict[str, Any] | None:
+        """Ne recupere que les JSON legers avant les poids du snapshot."""
+        try:
+            from huggingface_hub import hf_hub_download
+        except (ImportError, ModuleNotFoundError):
+            return None
+
+        downloaded = False
+        for filename in ("model_index.json", "config.json"):
+            try:
+                hf_hub_download(
+                    repo_id=repository,
+                    filename=filename,
+                    revision=revision,
+                    local_dir=local_dir,
+                    token=token,
+                )
+                downloaded = True
+            except Exception as error:
+                # Un JSON peut legitimement manquer; les erreurs d'acces et de
+                # repository sont classees par le chemin d'installation global.
+                if self._looks_like_hf_auth_error(error) or self._looks_like_hf_not_found(error):
+                    raise
+        if not downloaded:
+            return None
+
+        metadata = inspect_model_metadata(local_dir)
+        if self._pipeline_resolver.requires_remote_code(metadata):
+            raise WorkerError(
+                "Le modele exige trust_remote_code; execution distante refusee.",
+                422,
+                code="REMOTE_CODE_REQUIRED",
+            )
+        library = str(metadata.get("library_name") or "diffusers").lower()
+        if library not in {"", "diffusers"}:
+            raise WorkerError(
+                f"Bibliotheque runtime non prise en charge: {library}",
+                422,
+                code="UNSUPPORTED_LIBRARY",
+            )
+        resolution = self._pipeline_resolver.resolve_class(metadata)
+        if not resolution.runtime_supported:
+            code = (
+                "DIFFUSERS_VERSION_TOO_OLD"
+                if resolution.class_name
+                else "PIPELINE_CLASS_NOT_AVAILABLE"
+            )
+            raise WorkerError(resolution.runtime_reason, 422, code=code)
+        metadata["capabilities"] = CapabilityResolver().resolve(
+            metadata,
+            resolution.pipeline_cls,
+        )
+        return metadata
+
     def runtime_status(self) -> dict[str, Any]:
         configuration_errors = self.settings.configuration_errors()
         try:
@@ -566,8 +655,25 @@ class RuntimeManager:
             "cuda_available": cuda_available,
             "cuda_version": cuda_version,
             "torch_version": torch_version,
+            "versions": self.runtime_versions(),
             "errors": configuration_errors,
         }
+
+    @staticmethod
+    def runtime_versions() -> dict[str, str | None]:
+        versions: dict[str, str | None] = {}
+        for package in ("torch", "diffusers", "transformers", "huggingface_hub", "accelerate"):
+            distribution = "huggingface-hub" if package == "huggingface_hub" else package
+            try:
+                versions[package] = importlib.metadata.version(distribution)
+            except importlib.metadata.PackageNotFoundError:
+                versions[package] = None
+        return versions
+
+    def log_runtime_versions(self) -> None:
+        versions = self.runtime_versions()
+        values = " ".join(f"{name}={value or 'missing'}" for name, value in versions.items())
+        print(f"RUNTIME_VERSIONS {values}")
 
     @staticmethod
     def _nvidia_metrics() -> dict[str, Any] | None:
@@ -651,10 +757,12 @@ class RuntimeManager:
             raise WorkerError("Le manifest Diffusers ne déclare pas _class_name.", 422)
 
         weights = sorted(snapshot.rglob("*.safetensors"))
+        if not weights:
+            weights = sorted(snapshot.rglob("*.bin"))
         total_weights = sum(path.stat().st_size for path in weights)
         if not weights or total_weights < self.settings.minimum_weights_bytes:
             raise WorkerError(
-                "Le snapshot ne contient pas de poids safetensors cohérents.",
+                "Le snapshot ne contient pas de poids Diffusers cohérents.",
                 422,
             )
 
@@ -715,12 +823,7 @@ class RuntimeManager:
             manifest.get("capabilities") or capabilities,
         )
         if resolved_capability is None:
-            raise WorkerError(
-                "pipeline non supporté: aucun adapter Diffusers compatible n'a été trouvé pour ce modèle.",
-                422,
-                code="PIPELINE_UNSUPPORTED",
-                retryable=False,
-            )
+            raise self._unsupported_pipeline_error(metadata)
 
         runtime_capabilities = metadata.get("capabilities") or [resolved_capability]
         cached = {
@@ -753,7 +856,7 @@ class RuntimeManager:
         capabilities: list[str],
     ) -> dict[str, Any]:
         model_id = self._safe_segment(model_id)
-        self._log_model_state(model_id, "DISCOVERED", "DOWNLOADING")
+        self._log_model_state(model_id, "DISCOVERED", "COMPATIBILITY_CHECK")
 
         # Réutilisation du snapshot actif seulement s'il correspond exactement à
         # la révision demandée ET repasse la validation runtime actuelle.
@@ -775,7 +878,13 @@ class RuntimeManager:
                 # Un ancien snapshot valide mais incompatible ne doit pas être
                 # présenté comme installé. On ne retélécharge pas la même révision
                 # uniquement pour masquer une erreur de pipeline.
-                if error.code == "PIPELINE_UNSUPPORTED":
+                if error.code in {
+                    "PIPELINE_UNSUPPORTED",
+                    "DIFFUSERS_VERSION_TOO_OLD",
+                    "PIPELINE_CLASS_NOT_AVAILABLE",
+                    "REMOTE_CODE_REQUIRED",
+                    "UNSUPPORTED_LIBRARY",
+                }:
                     self._mark_failed(
                         model_id,
                         error=error,
@@ -787,7 +896,7 @@ class RuntimeManager:
         with self._lock:
             self._model_states[model_id] = {
                 "model_id": model_id,
-                "state": ModelState.DOWNLOADING,
+                "state": ModelState.COMPATIBILITY_CHECK,
                 "downloaded": False,
                 "validated": False,
                 "installed": False,
@@ -802,6 +911,7 @@ class RuntimeManager:
             / f"download-{model_id}-{uuid.uuid4()}"
         )
         temporary.mkdir(parents=True, exist_ok=True)
+        weights_download_started = False
 
         try:
             _, hub = self._imports()
@@ -810,8 +920,29 @@ class RuntimeManager:
             info = HfApi(token=hf_token).model_info(repository, revision=revision)
             resolved_revision = self._safe_segment(info.sha)
 
+            preflight_metadata = self._preflight_remote_metadata(
+                repository,
+                resolved_revision,
+                temporary,
+                hf_token,
+            )
+            if preflight_metadata is not None:
+                preflight_capabilities = preflight_metadata.get("capabilities") or []
+                requested = {
+                    str(value).upper() for value in capabilities if isinstance(value, str)
+                }
+                if requested and preflight_capabilities and not requested.intersection(preflight_capabilities):
+                    raise WorkerError(
+                        "La pipeline disponible ne declare aucune des capabilities demandees.",
+                        422,
+                        code="PIPELINE_CAPABILITY_NOT_AVAILABLE",
+                    )
+
             required_bytes = self._estimate_required_download_bytes(info)
             self._precheck_download_environment(required_bytes)
+            self._log_model_state(model_id, "COMPATIBILITY_CHECK", "DOWNLOADING")
+            with self._lock:
+                self._model_states[model_id]["state"] = ModelState.DOWNLOADING
 
             xet_retries = max(1, int(os.getenv("VIDIOAI_HF_XET_RETRIES", "2")))
             allow_no_xet_fallback = os.getenv(
@@ -822,6 +953,7 @@ class RuntimeManager:
             last_xet_error: Exception | None = None
             for attempt in range(1, xet_retries + 1):
                 try:
+                    weights_download_started = True
                     self._snapshot_download_with_env(
                         snapshot_download,
                         repo_id=repository,
@@ -868,8 +1000,16 @@ class RuntimeManager:
                         retryable=True,
                     ) from fallback_error
 
+            self._log_model_state(model_id, "DOWNLOADING", "DOWNLOADED")
+            with self._lock:
+                self._model_states[model_id].update(
+                    state=ModelState.DOWNLOADED,
+                    downloaded=True,
+                )
+            self._log_model_state(model_id, "DOWNLOADED", "VALIDATING")
+            with self._lock:
+                self._model_states[model_id]["state"] = ModelState.VALIDATING
             validation = self.validate_snapshot(temporary)
-            self._log_model_state(model_id, "DOWNLOADING", "VALIDATING")
 
             metadata = inspect_model_metadata(temporary)
             metadata = self._metadata_with_capabilities(metadata)
@@ -878,12 +1018,7 @@ class RuntimeManager:
                 capabilities,
             )
             if resolved_capability is None:
-                raise WorkerError(
-                    "pipeline non supporté: aucun adapter Diffusers compatible n'a été trouvé pour ce modèle.",
-                    422,
-                    code="PIPELINE_UNSUPPORTED",
-                    retryable=False,
-                )
+                raise self._unsupported_pipeline_error(metadata)
 
             runtime_capabilities = metadata.get("capabilities") or [resolved_capability]
             destination = self._model_root(model_id) / resolved_revision
@@ -938,7 +1073,7 @@ class RuntimeManager:
             self._mark_failed(
                 model_id,
                 error=error,
-                downloaded=self._directory_has_files(temporary),
+                downloaded=weights_download_started and self._directory_has_files(temporary),
             )
             raise
 
@@ -990,7 +1125,7 @@ class RuntimeManager:
             self._mark_failed(
                 model_id,
                 error=worker_error,
-                downloaded=self._directory_has_files(temporary),
+                downloaded=weights_download_started and self._directory_has_files(temporary),
             )
             raise worker_error from error
 
@@ -1028,6 +1163,7 @@ class RuntimeManager:
                 manifest.get("capabilities"),
             )
             if resolved_capability is None:
+                runtime_error = self._unsupported_pipeline_error(metadata)
                 return {
                     "model_id": model_id,
                     "state": ModelState.FAILED,
@@ -1040,8 +1176,8 @@ class RuntimeManager:
                     "validation_test": False,
                     "loaded": False,
                     "ready": False,
-                    "error_code": "PIPELINE_UNSUPPORTED",
-                    "error": "pipeline non supporté: aucun adapter Diffusers compatible n'a été trouvé pour ce modèle.",
+                    "error_code": runtime_error.code,
+                    "error": str(runtime_error),
                 }
 
             with self._lock:
@@ -1114,6 +1250,27 @@ class RuntimeManager:
         )
         if device == "cuda" and hasattr(pipeline, "to"):
             pipeline = pipeline.to(device)
+        resolved_capabilities = CapabilityResolver().resolve(metadata, pipeline)
+        if resolved_capabilities:
+            metadata["capabilities"] = resolved_capabilities
+            if capability not in resolved_capabilities:
+                raise PipelineResolutionError(
+                    f"La signature chargee ne supporte pas {capability}.",
+                    code="PIPELINE_CAPABILITY_NOT_AVAILABLE",
+                )
+
+        optional_optimizations = []
+        if os.getenv("VIDIOAI_ENABLE_VAE_TILING", "false").lower() in {"1", "true", "yes"}:
+            optional_optimizations.append("enable_vae_tiling")
+        if os.getenv("VIDIOAI_ENABLE_VAE_SLICING", "false").lower() in {"1", "true", "yes"}:
+            optional_optimizations.append("enable_vae_slicing")
+        for method_name in optional_optimizations:
+            method = getattr(pipeline, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                except (NotImplementedError, RuntimeError, ValueError):
+                    pass
         return pipeline
 
     def _validate_loaded_pipeline(
@@ -1140,17 +1297,35 @@ class RuntimeManager:
             return
 
         generator = torch.Generator(device=device if device == "cuda" else "cpu")
+        profile = ModelRuntimeProfile.from_metadata(metadata, pipeline)
         request: dict[str, Any] = {
             "prompt": "VidioAI runtime validation",
             "negative_prompt": None,
-            "width": 128 if "VIDEO" in capability else 64,
-            "height": 128 if "VIDEO" in capability else 64,
+            "width": 64,
+            "height": 64,
             "steps": 1,
-            "guidance_scale": 0.0,
+            "guidance_scale": profile.guidance_scale,
             "frames": 5 if "VIDEO" in capability else None,
-            "fps": 8 if "VIDEO" in capability else None,
+            "fps": profile.fps if "VIDEO" in capability else None,
             "duration_seconds": 1 if "VIDEO" in capability else None,
         }
+        if "VIDEO" in capability:
+            resolution = self._resolution_resolver.resolve(
+                quality="480p",
+                aspect_ratio="16:9",
+                pipeline=pipeline,
+                metadata=metadata,
+                default_width=profile.width,
+                default_height=profile.height,
+            )
+            request.update(
+                {
+                    "quality": resolution.requested_quality,
+                    "aspect_ratio": resolution.requested_aspect_ratio,
+                    "width": resolution.width,
+                    "height": resolution.height,
+                }
+            )
 
         if capability in {
             "IMAGE_TO_IMAGE",
@@ -1181,7 +1356,11 @@ class RuntimeManager:
             },
             request,
         )
-        if not output.get("images") and not output.get("frames"):
+        validation_images, validation_frames = self._output_normalizer.extract(
+            output,
+            video=capability in VIDEO_CAPABILITIES,
+        )
+        if not validation_images and not validation_frames:
             raise RuntimeError("Le pipeline n'a produit aucune sortie de validation.")
 
     def load_model(self, model_id: str) -> dict[str, Any]:
@@ -1189,6 +1368,16 @@ class RuntimeManager:
         self._log_model_state(model_id, "INSTALLED", "LOADING")
         snapshot, pointer = self._active_snapshot(model_id)
         validation = self.validate_snapshot(snapshot)
+        with self._lock:
+            self._model_states[model_id] = {
+                "model_id": model_id,
+                "state": ModelState.LOADING,
+                "downloaded": True,
+                "validated": True,
+                "installed": True,
+                "loaded": False,
+                "ready": False,
+            }
         torch, _ = self._imports()
         cuda_available = bool(torch.cuda.is_available())
 
@@ -1215,33 +1404,25 @@ class RuntimeManager:
             manifest.get("capabilities"),
         )
         if capability is None:
+            runtime_error = self._unsupported_pipeline_error(metadata)
             self._log_model_state(
                 model_id,
                 "LOADING",
                 "FAILED",
-                reason="PIPELINE_UNSUPPORTED",
-            )
-            error = WorkerError(
-                "pipeline non supporté: aucun adapter Diffusers compatible n'a été trouvé pour ce modèle.",
-                422,
-                code="PIPELINE_UNSUPPORTED",
+                reason=runtime_error.code,
             )
             self._mark_failed(
                 model_id,
-                error=error,
+                error=runtime_error,
                 downloaded=True,
                 validated=True,
                 installed=False,
             )
-            raise error
+            raise runtime_error
 
         adapter = self._registry.select_for_capability(metadata, capability)
         if adapter is None:
-            raise WorkerError(
-                "Adapter runtime introuvable.",
-                422,
-                code="PIPELINE_UNSUPPORTED",
-            )
+            raise self._unsupported_pipeline_error(metadata, capability)
 
         device = "cuda" if cuda_available else "cpu"
         dtype, precision = self._torch_dtype(torch, cuda_available)
@@ -1268,7 +1449,8 @@ class RuntimeManager:
                 torch=torch,
             )
         except Exception as error:
-            self._log_model_state(model_id, "LOADING", "FAILED", reason="LOAD_FAILED")
+            code = error.code if isinstance(error, PipelineResolutionError) else "LOAD_FAILED"
+            self._log_model_state(model_id, "LOADING", "FAILED", reason=code)
             status = {
                 "model_id": model_id,
                 "state": ModelState.FAILED,
@@ -1282,13 +1464,16 @@ class RuntimeManager:
                 "loaded": False,
                 "ready": False,
                 "error": f"Chargement Diffusers impossible: {type(error).__name__}: {error}",
+                "error_code": code,
             }
+            if isinstance(error, PipelineResolutionError) and error.dependency:
+                status["dependency"] = error.dependency
             with self._lock:
                 self._model_states[model_id] = status
             raise WorkerError(
                 status["error"],
-                503,
-                code="LOAD_FAILED",
+                422 if code in {"DIFFUSERS_VERSION_TOO_OLD", "REMOTE_CODE_REQUIRED", "MISSING_DEPENDENCY", "PIPELINE_CLASS_NOT_AVAILABLE", "INVALID_MODEL_SNAPSHOT"} else 503,
+                code=code,
                 retryable=False,
             ) from error
 
@@ -1351,6 +1536,8 @@ class RuntimeManager:
             "ready": True,
             "device": device,
             "capability": capability,
+            "capabilities": list(metadata.get("capabilities") or []),
+            "pipeline_class": metadata.get("class_name"),
             "repository": pointer["repository"],
             "revision": pointer["revision"],
             "benchmark": load_benchmark,
@@ -1409,11 +1596,7 @@ class RuntimeManager:
         metadata = loaded.metadata or {}
         adapter = self._registry.select_for_capability(metadata, requested_capability)
         if adapter is None:
-            raise WorkerError(
-                "Aucun adapter compatible ne peut générer cette capacité.",
-                422,
-                code="PIPELINE_UNSUPPORTED",
-            )
+            raise self._unsupported_pipeline_error(metadata, requested_capability)
 
         if loaded.capability == requested_capability and loaded.pipeline is not None:
             return adapter
@@ -1477,104 +1660,6 @@ class RuntimeManager:
         candidate.parent.mkdir(parents=True, exist_ok=True)
         return candidate
 
-    @staticmethod
-    def _normalize_video_frames(frames: Any) -> list[Any]:
-        if frames is None:
-            return []
-
-        # Tensor/ndarray batché : [B, F, H, W, C] ou [F, H, W, C].
-        ndim = getattr(frames, "ndim", None)
-        if isinstance(ndim, int):
-            if ndim >= 5:
-                frames = frames[0]
-            return [frame for frame in frames]
-
-        if isinstance(frames, (list, tuple)):
-            if len(frames) == 1:
-                first = frames[0]
-                first_ndim = getattr(first, "ndim", None)
-                if isinstance(first, (list, tuple)):
-                    return list(first)
-                if isinstance(first_ndim, int) and first_ndim >= 4:
-                    return [frame for frame in first]
-            return list(frames)
-
-        return [frames]
-
-    def _export_frames_to_mp4(
-        self,
-        frames: Any,
-        output_path: Path,
-        fps: int,
-    ) -> None:
-        from PIL import Image
-
-        normalized = self._normalize_video_frames(frames)
-        if not normalized:
-            raise RuntimeError("Aucune frame vidéo à encoder.")
-
-        frame_dir = self.settings.work_dir / f"video-frames-{uuid.uuid4()}"
-        frame_dir.mkdir(parents=True, exist_ok=True)
-        temporary = output_path.with_name(f"{output_path.stem}.tmp.mp4")
-
-        try:
-            for index, frame in enumerate(normalized):
-                if hasattr(frame, "detach"):
-                    frame = frame.detach().cpu().numpy()
-
-                if hasattr(frame, "save"):
-                    image = frame.convert("RGB") if hasattr(frame, "convert") else frame
-                else:
-                    import numpy as np
-
-                    array = np.asarray(frame)
-                    if array.dtype.kind == "f":
-                        array = np.clip(array, 0.0, 1.0)
-                        array = (array * 255.0).round().astype("uint8")
-                    elif array.dtype != np.uint8:
-                        array = np.clip(array, 0, 255).astype("uint8")
-
-                    # Certains pipelines renvoient CHW au lieu de HWC.
-                    if array.ndim == 3 and array.shape[0] in {1, 3, 4} and array.shape[-1] not in {1, 3, 4}:
-                        array = np.moveaxis(array, 0, -1)
-                    if array.ndim == 3 and array.shape[-1] == 1:
-                        array = array[..., 0]
-                    image = Image.fromarray(array).convert("RGB")
-
-                image.save(frame_dir / f"frame-{index:06d}.png", format="PNG")
-
-            command = [
-                "ffmpeg",
-                "-y",
-                "-loglevel",
-                "error",
-                "-framerate",
-                str(max(1, fps)),
-                "-i",
-                str(frame_dir / "frame-%06d.png"),
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
-                "-movflags",
-                "+faststart",
-                str(temporary),
-            ]
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=60 * 10,
-                check=False,
-            )
-            if result.returncode != 0 or not temporary.is_file():
-                message = result.stderr.strip() or "ffmpeg n'a produit aucun fichier"
-                raise RuntimeError(f"Encodage MP4 impossible: {message}")
-            os.replace(temporary, output_path)
-        finally:
-            shutil.rmtree(frame_dir, ignore_errors=True)
-            temporary.unlink(missing_ok=True)
-
     def _generate_with_adapter(
         self,
         loaded: LoadedModel,
@@ -1589,7 +1674,47 @@ class RuntimeManager:
             loaded,
             requested_capability,
         )
-        prepared_request = self._resolve_generation_inputs(request)
+        prepared_request = self._resolve_generation_inputs(request, loaded.pipeline)
+        is_video_request = requested_capability in VIDEO_CAPABILITIES
+        if is_video_request:
+            profile = ModelRuntimeProfile.from_metadata(loaded.metadata or {}, loaded.pipeline)
+            try:
+                resolution = self._resolution_resolver.resolve(
+                    quality=prepared_request.get("quality") or "480p",
+                    aspect_ratio=prepared_request.get("aspect_ratio") or "16:9",
+                    pipeline=loaded.pipeline,
+                    metadata=loaded.metadata or {},
+                    requested_width=prepared_request.get("width"),
+                    requested_height=prepared_request.get("height"),
+                    default_width=profile.width,
+                    default_height=profile.height,
+                )
+            except ValueError as error:
+                raise WorkerError(
+                    str(error),
+                    422,
+                    code="RESOLUTION_UNSUPPORTED",
+                    retryable=False,
+                ) from error
+            prepared_request.update(
+                {
+                    "quality": resolution.requested_quality,
+                    "aspect_ratio": resolution.requested_aspect_ratio,
+                    "width": resolution.width,
+                    "height": resolution.height,
+                    "dimension_multiple": resolution.dimension_multiple,
+                }
+            )
+            normalized = profile.normalize(prepared_request, video=True)
+            prepared_request.update(
+                {
+                    "fps": normalized["fps"],
+                    "duration_seconds": normalized["duration_seconds"],
+                    "frames": normalized["num_frames"],
+                    "steps": normalized["num_inference_steps"],
+                    "guidance_scale": normalized["guidance_scale"],
+                }
+            )
 
         with self._lock:
             cancel_event = self._cancel_events.get(job_id)
@@ -1632,39 +1757,21 @@ class RuntimeManager:
         if cancel_event.is_set():
             raise InterruptedError("Job annulé.")
 
-        images = output.get("images") or []
-        frames = output.get("frames")
-        normalized_frames = self._normalize_video_frames(frames)
+        images, normalized_frames = self._output_normalizer.extract(output, video=is_video_request)
         if not images and not normalized_frames:
             raise RuntimeError("Le runtime n'a produit aucune sortie.")
 
         output_path = self._output_path(request["output_relative_path"])
-        is_video_request = requested_capability in {
-            "TEXT_TO_VIDEO",
-            "IMAGE_TO_VIDEO",
-            "MULTI_IMAGE_TO_VIDEO",
-            "START_END_IMAGE_TO_VIDEO",
-            "KEYFRAMES_TO_VIDEO",
-            "VIDEO_TO_VIDEO",
-            "VIDEO_INPAINTING",
-            "VIDEO_UPSCALE",
-        }
-
+        media_probe: dict[str, Any]
         if is_video_request:
             if not normalized_frames:
                 raise RuntimeError(
                     "Le pipeline vidéo n'a renvoyé aucune séquence de frames exploitable."
                 )
             fps = int(output.get("fps") or prepared_request.get("fps") or 24)
-            self._export_frames_to_mp4(normalized_frames, output_path, fps)
+            media_probe = self._output_normalizer.write_video(normalized_frames, output_path, fps)
         else:
-            if not images:
-                raise RuntimeError("Le pipeline image n'a renvoyé aucune image.")
-            temporary = output_path.with_name(
-                f"{output_path.stem}.tmp{output_path.suffix or '.png'}"
-            )
-            images[0].save(temporary, format="PNG")
-            os.replace(temporary, output_path)
+            media_probe = self._output_normalizer.write_image(images, output_path)
 
         gpu_after = self._nvidia_metrics()
         process_peak = (
@@ -1679,8 +1786,8 @@ class RuntimeManager:
         if total_vram:
             observed_peak = min(observed_peak, total_vram)
 
-        width = int(output.get("width") or prepared_request.get("width") or 512)
-        height = int(output.get("height") or prepared_request.get("height") or 512)
+        width = int(media_probe.get("width") or output.get("width") or prepared_request.get("width") or 512)
+        height = int(media_probe.get("height") or output.get("height") or prepared_request.get("height") or 512)
 
         return {
             "job_id": job_id,
@@ -1689,6 +1796,12 @@ class RuntimeManager:
             "output_relative_path": request["output_relative_path"],
             "width": width,
             "height": height,
+            "requested_quality": prepared_request.get("quality") if is_video_request else None,
+            "requested_aspect_ratio": prepared_request.get("aspect_ratio") if is_video_request else None,
+            "actual_width": width,
+            "actual_height": height,
+            "actual_fps": media_probe.get("fps") if is_video_request else None,
+            "actual_frames": media_probe.get("frames") if is_video_request else None,
             "sha256": self._sha256(output_path),
             "benchmark": {
                 **loaded.load_benchmark,
@@ -1700,6 +1813,9 @@ class RuntimeManager:
                 "precision": loaded.precision,
                 "resolution_width": width,
                 "resolution_height": height,
+                "frames": media_probe.get("frames"),
+                "duration_seconds": media_probe.get("duration"),
+                "fps": media_probe.get("fps"),
                 "batch": 1,
                 "inference_seconds": time.perf_counter() - generation_started,
             },
@@ -1741,6 +1857,7 @@ class RuntimeManager:
                 "state": JobState.FAILED,
                 "progress": self._jobs[job_id]["progress"],
                 "error": f"{type(error).__name__}: {error}",
+                "error_code": getattr(error, "code", "GENERATION_FAILED"),
             }
         finally:
             with self._lock:

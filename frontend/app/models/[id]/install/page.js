@@ -28,6 +28,7 @@ function InstallContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const modelId = searchParams.get("model_id") || decodeURIComponent(id || "");
+  const fallbackModelName = decodeURIComponent(modelId || "").split("/").filter(Boolean).pop() || "Modèle inconnu";
   const jobId = searchParams.get("job");
   const [model, setModel] = useState(null);
   const [job, setJob] = useState(null);
@@ -91,7 +92,7 @@ function InstallContent() {
       <header className={styles.pageHeading}><div className={styles.headingWithBack}><Link href="/models"><BsArrowLeft /></Link><div><h1>Installation automatique</h1><p>Téléchargement et installation simplifiés et automatisés.</p></div></div></header>
       {error && <div className={styles.errorBanner}>{error}</div>}
       <section className={styles.installShell}>
-        <div className={styles.installIntro}><h2>Installation de {model?.name || "votre modèle"}</h2><p>Vous pouvez suivre la progression réelle sans actualiser la page.</p></div>
+        <div className={styles.installIntro}><h2>Installation de {model?.name || fallbackModelName}</h2><p>{model?.repository || modelId} · Vous pouvez suivre la progression réelle sans actualiser la page.</p></div>
         <div className={styles.installGrid}>
           <div className={styles.timeline}>
             {STEPS.map(([stage, label, help], index) => {
