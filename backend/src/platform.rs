@@ -5236,6 +5236,10 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
             )
             .await;
 
+        // Les moteurs proceduraux restent 1024x1024 par defaut.
+        // Pour les pipelines IA, les dimensions reelles du Worker sont
+        // authoritative et sont propagees jusqu'a l'Asset.
+        let mut output_dimensions = (1024_u32, 1024_u32);
         let bytes = match generation.mode {
             GenerationMode::TextToImage if !procedural => {
                 let worker = state.worker.as_ref().ok_or("Worker GPU absent")?;
@@ -5261,15 +5265,29 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
                     ),
                 )
                 .await?;
+                let worker_width = worker_result
+                    .actual_width
+                    .unwrap_or(worker_result.width);
+                let worker_height = worker_result
+                    .actual_height
+                    .unwrap_or(worker_result.height);
                 if worker_result.job_id != job_id.to_string()
                     || worker_result.state != "COMPLETED"
                     || worker_result.output_relative_path != relative.to_string_lossy()
-                    || worker_result.width != 1024
-                    || worker_result.height != 1024
+                    || worker_width == 0
+                    || worker_height == 0
                     || worker_result.sha256.len() != 64
                 {
-                    return Err("Le worker a renvoyé un résultat incohérent.".into());
+                    return Err(format!(
+                        "WORKER_RESULT_INVALID: state={} path={} width={} height={} sha256_len={}",
+                        worker_result.state,
+                        worker_result.output_relative_path,
+                        worker_width,
+                        worker_height,
+                        worker_result.sha256.len(),
+                    ));
                 }
+                output_dimensions = (worker_width, worker_height);
                 if let Some(observation) = &worker_result.benchmark
                     && let Ok(entry) = resolve_model(&state, &generation.model_id).await
                 {
@@ -5378,15 +5396,29 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
                     ),
                 )
                 .await?;
+                let worker_width = worker_result
+                    .actual_width
+                    .unwrap_or(worker_result.width);
+                let worker_height = worker_result
+                    .actual_height
+                    .unwrap_or(worker_result.height);
                 if worker_result.job_id != job_id.to_string()
                     || worker_result.state != "COMPLETED"
                     || worker_result.output_relative_path != relative.to_string_lossy()
-                    || worker_result.width != 1024
-                    || worker_result.height != 1024
+                    || worker_width == 0
+                    || worker_height == 0
                     || worker_result.sha256.len() != 64
                 {
-                    return Err("Le worker a renvoyé un résultat incohérent.".into());
+                    return Err(format!(
+                        "WORKER_RESULT_INVALID: state={} path={} width={} height={} sha256_len={}",
+                        worker_result.state,
+                        worker_result.output_relative_path,
+                        worker_width,
+                        worker_height,
+                        worker_result.sha256.len(),
+                    ));
                 }
+                output_dimensions = (worker_width, worker_height);
                 let path = state.settings.get().await.work_dir.join(&relative);
                 let content = fs::read(&path).await.map_err(|error| {
                     format!("Sortie worker introuvable sur le volume partagé: {error}")
@@ -5433,7 +5465,7 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
             format!("generation-{}.png", generation.id),
             "image/png".into(),
             AssetKind::Image,
-            Some((1024, 1024)),
+            Some(output_dimensions),
             "png",
         )
         .await
@@ -5449,6 +5481,8 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
     match result {
         Ok(asset) => {
             generation.output_asset_id = Some(asset.id);
+            generation.actual_width = asset.width;
+            generation.actual_height = asset.height;
             generation.status = GenerationStatus::Completed;
             generation.progress = 100;
             generation.updated_at = unix_now();

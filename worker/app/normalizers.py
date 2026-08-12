@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -10,11 +11,18 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .temporal_output_planner import TemporalOutputPlanner
+
 
 VIDEO_CAPABILITIES = {
-    "TEXT_TO_VIDEO", "IMAGE_TO_VIDEO", "MULTI_IMAGE_TO_VIDEO",
-    "START_END_IMAGE_TO_VIDEO", "KEYFRAMES_TO_VIDEO", "VIDEO_TO_VIDEO",
-    "VIDEO_INPAINTING", "VIDEO_UPSCALE",
+    "TEXT_TO_VIDEO",
+    "IMAGE_TO_VIDEO",
+    "MULTI_IMAGE_TO_VIDEO",
+    "START_END_IMAGE_TO_VIDEO",
+    "KEYFRAMES_TO_VIDEO",
+    "VIDEO_TO_VIDEO",
+    "VIDEO_INPAINTING",
+    "VIDEO_UPSCALE",
 }
 
 
@@ -34,19 +42,28 @@ class InputNormalizer:
 
         candidate = Path(path)
         if not candidate.is_file():
-            raise NormalizationError(f"Asset introuvable: {candidate}", code="INVALID_INPUT_ASSET")
+            raise NormalizationError(
+                f"Asset introuvable: {candidate}",
+                code="INVALID_INPUT_ASSET",
+            )
         with Image.open(candidate) as image:
             return image.convert(mode).copy()
 
     def load_video_frames(self, path: str | Path) -> list[Any]:
         candidate = Path(path)
         if not candidate.is_file():
-            raise NormalizationError(f"Video introuvable: {candidate}", code="INVALID_INPUT_ASSET")
+            raise NormalizationError(
+                f"Video introuvable: {candidate}",
+                code="INVALID_INPUT_ASSET",
+            )
         frame_dir = self.work_dir / f"input-video-{uuid.uuid4()}"
         frame_dir.mkdir(parents=True, exist_ok=True)
         try:
             result = subprocess.run(
-                ["ffmpeg", "-y", "-loglevel", "error", "-i", str(candidate), str(frame_dir / "frame-%08d.png")],
+                [
+                    "ffmpeg", "-y", "-loglevel", "error", "-i", str(candidate),
+                    str(frame_dir / "frame-%08d.png"),
+                ],
                 capture_output=True,
                 text=True,
                 timeout=10 * 60,
@@ -66,6 +83,7 @@ class InputNormalizer:
         prepared = dict(request)
         input_path = prepared.get("input_path")
         capability = str(prepared.get("capability") or "").upper()
+
         if isinstance(input_path, str) and input_path.strip():
             if capability in {"VIDEO_TO_VIDEO", "VIDEO_INPAINTING", "VIDEO_UPSCALE"}:
                 frames = self.load_video_frames(input_path)
@@ -90,16 +108,21 @@ class InputNormalizer:
             if source:
                 resolved.append(self.load_image(source))
                 roles.append(str(item.get("role") or "reference").lower())
-        if raw_images and not resolved and capability in {
-            "IMAGE_TO_VIDEO",
-            "MULTI_IMAGE_TO_VIDEO",
-            "START_END_IMAGE_TO_VIDEO",
-            "KEYFRAMES_TO_VIDEO",
-        } and not prepared.get("input_image"):
+
+        if (
+            raw_images
+            and not resolved
+            and capability in {
+                "IMAGE_TO_VIDEO", "MULTI_IMAGE_TO_VIDEO",
+                "START_END_IMAGE_TO_VIDEO", "KEYFRAMES_TO_VIDEO",
+            }
+            and not prepared.get("input_image")
+        ):
             raise NormalizationError(
-                "Les asset IDs doivent être résolus vers des images avant l'appel pipeline.",
+                "Les asset IDs doivent etre resolus vers des images avant l'appel pipeline.",
                 code="INVALID_INPUT_ASSET",
             )
+
         if resolved:
             prepared["resolved_input_images"] = resolved
             prepared["resolved_image_roles"] = roles
@@ -109,6 +132,7 @@ class InputNormalizer:
 class OutputNormalizer:
     def __init__(self, work_dir: Path) -> None:
         self.work_dir = Path(work_dir)
+        self._temporal_planner = TemporalOutputPlanner()
 
     @staticmethod
     def normalize_frames(frames: Any) -> list[Any]:
@@ -124,7 +148,6 @@ class OutputNormalizer:
                 shape = getattr(frames, "shape", ())
                 if shape and shape[0] in {1, 3, 4} and shape[-1] not in {1, 3, 4}:
                     import numpy as np
-
                     frames = np.moveaxis(frames, 0, -1)
             return list(frames)
         if isinstance(frames, (list, tuple)):
@@ -153,6 +176,7 @@ class OutputNormalizer:
             if frames is None and isinstance(output, (list, tuple)):
                 frames = output if video else None
                 images = [] if video else output
+
         normalized_frames = OutputNormalizer.normalize_frames(frames)
         if video and not normalized_frames and images:
             normalized_frames = OutputNormalizer.normalize_frames(images)
@@ -186,7 +210,8 @@ class OutputNormalizer:
         result = subprocess.run(
             [
                 "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
-                "-show_entries", "stream=codec_name,width,height,nb_frames,nb_read_frames,avg_frame_rate:format=duration",
+                "-show_entries",
+                "stream=codec_name,width,height,nb_frames,nb_read_frames,avg_frame_rate:format=duration",
                 "-of", "json", str(path),
             ],
             capture_output=True,
@@ -203,6 +228,7 @@ class OutputNormalizer:
             fps = float(rate[0]) / max(1.0, float(rate[1]))
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise NormalizationError("ffprobe n'a pas reconnu une video valide.") from error
+
         probe = {
             "codec": stream.get("codec_name"),
             "width": int(stream.get("width") or 0),
@@ -212,49 +238,236 @@ class OutputNormalizer:
             "fps": fps,
         }
         if (
-            result.returncode != 0 or probe["codec"] != "h264" or probe["width"] <= 0
-            or probe["height"] <= 0 or probe["duration"] <= 0 or probe["frames"] <= 1
+            result.returncode != 0
+            or probe["codec"] != "h264"
+            or probe["width"] <= 0
+            or probe["height"] <= 0
+            or probe["duration"] <= 0
+            or probe["frames"] <= 1
         ):
             raise NormalizationError(f"Video MP4 invalide apres encodage: {probe}")
         return probe
 
-    def write_video(self, frames: Any, output_path: Path, fps: int) -> dict[str, Any]:
+    @staticmethod
+    def _encode_sequence(
+        *,
+        frame_dir: Path,
+        output_path: Path,
+        input_fps: float,
+        output_fps: int,
+        frames_limit: int | None = None,
+        filter_graph: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        command = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-framerate", f"{max(0.001, input_fps):.10f}",
+            "-i", str(frame_dir / "frame-%08d.png"),
+        ]
+        if filter_graph:
+            command.extend(["-vf", filter_graph])
+        if frames_limit is not None:
+            command.extend(["-frames:v", str(frames_limit)])
+        command.extend([
+            "-r", str(max(1, output_fps)),
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            str(output_path),
+        ])
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=10 * 60,
+            check=False,
+        )
+
+    def _write_native_frames(self, normalized: list[Any], frame_dir: Path) -> None:
+        for index, frame in enumerate(normalized):
+            self._to_image(frame).save(
+                frame_dir / f"frame-{index:08d}.png",
+                format="PNG",
+            )
+
+    def _write_linear_resample(
+        self,
+        normalized: list[Any],
+        frame_dir: Path,
+        target_count: int,
+    ) -> None:
+        from PIL import Image
+
+        source = [self._to_image(frame) for frame in normalized]
+        if target_count <= 1:
+            raise NormalizationError("Le reechantillonnage video exige au moins deux frames.")
+        if len(source) == 1:
+            source = [source[0], source[0]]
+
+        for index in range(target_count):
+            position = index * (len(source) - 1) / (target_count - 1)
+            low = int(math.floor(position))
+            high = min(len(source) - 1, low + 1)
+            alpha = position - low
+            image = (
+                source[low].copy()
+                if high == low or alpha <= 1e-9
+                else Image.blend(source[low], source[high], alpha)
+            )
+            image.save(frame_dir / f"frame-{index:08d}.png", format="PNG")
+
+    @staticmethod
+    def _probe_matches_plan(
+        probe: dict[str, Any],
+        *,
+        delivery_frames: int,
+        delivery_fps: int,
+        target_duration: float,
+        tolerance: float,
+    ) -> bool:
+        return (
+            int(probe.get("frames") or 0) == delivery_frames
+            and abs(float(probe.get("fps") or 0) - delivery_fps) <= 0.05
+            and abs(float(probe.get("duration") or 0) - target_duration) <= tolerance
+        )
+
+    def write_video(
+        self,
+        frames: Any,
+        output_path: Path,
+        fps: int,
+        *,
+        duration_seconds: float | int | None = None,
+    ) -> dict[str, Any]:
         normalized = self.normalize_frames(frames)
         if len(normalized) <= 1:
             raise NormalizationError("Une generation video doit contenir plus d'une frame.")
         if output_path.suffix.lower() != ".mp4":
-            raise NormalizationError("Une sortie video doit utiliser l'extension .mp4.", code="INVALID_OUTPUT_PATH")
-        frame_dir = self.work_dir / f"output-video-{uuid.uuid4()}"
-        frame_dir.mkdir(parents=True, exist_ok=True)
-        temporary = output_path.with_name(f"{output_path.stem}.tmp.mp4")
-        try:
-            for index, frame in enumerate(normalized):
-                self._to_image(frame).save(frame_dir / f"frame-{index:08d}.png", format="PNG")
-            result = subprocess.run(
-                [
-                    "ffmpeg", "-y", "-loglevel", "error", "-framerate", str(max(1, fps)),
-                    "-i", str(frame_dir / "frame-%08d.png"), "-c:v", "libx264",
-                    "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(temporary),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=10 * 60,
-                check=False,
+            raise NormalizationError(
+                "Une sortie video doit utiliser l'extension .mp4.",
+                code="INVALID_OUTPUT_PATH",
             )
-            if result.returncode != 0 or not temporary.is_file():
-                raise NormalizationError(f"Encodage H.264 impossible: {result.stderr.strip()}")
-            probe = self.probe_video(temporary)
+
+        plan = self._temporal_planner.plan(
+            native_frames=len(normalized),
+            requested_duration_seconds=duration_seconds,
+            requested_fps=fps,
+        )
+
+        native_dir = self.work_dir / f"output-video-native-{uuid.uuid4()}"
+        native_dir.mkdir(parents=True, exist_ok=True)
+        temporary = output_path.with_name(f"{output_path.stem}.tmp.mp4")
+        strategy_used = plan.strategy
+
+        try:
+            self._write_native_frames(normalized, native_dir)
+
+            if plan.strategy == "DIRECT":
+                result = self._encode_sequence(
+                    frame_dir=native_dir,
+                    output_path=temporary,
+                    input_fps=plan.delivery_fps,
+                    output_fps=plan.delivery_fps,
+                    frames_limit=plan.delivery_frames,
+                )
+            elif plan.strategy == "MOTION_INTERPOLATION":
+                result = self._encode_sequence(
+                    frame_dir=native_dir,
+                    output_path=temporary,
+                    input_fps=plan.source_fps_for_motion_interpolation or plan.delivery_fps,
+                    output_fps=plan.delivery_fps,
+                    frames_limit=plan.delivery_frames,
+                    filter_graph=(
+                        "minterpolate="
+                        f"fps={plan.delivery_fps}:"
+                        "mi_mode=mci:"
+                        "mc_mode=aobmc:"
+                        "me_mode=bidir:"
+                        "vsbmc=1"
+                    ),
+                )
+            else:
+                result = subprocess.CompletedProcess([], 1, "", "")
+
+            probe = None
+            if result.returncode == 0 and temporary.is_file():
+                try:
+                    probe = self.probe_video(temporary)
+                except NormalizationError:
+                    probe = None
+
+            if (
+                probe is None
+                or not self._probe_matches_plan(
+                    probe,
+                    delivery_frames=plan.delivery_frames,
+                    delivery_fps=plan.delivery_fps,
+                    target_duration=plan.target_duration_seconds,
+                    tolerance=plan.tolerance_seconds,
+                )
+            ):
+                strategy_used = "LINEAR_RESAMPLE"
+                temporary.unlink(missing_ok=True)
+                resampled_dir = self.work_dir / f"output-video-resampled-{uuid.uuid4()}"
+                resampled_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    self._write_linear_resample(
+                        normalized,
+                        resampled_dir,
+                        plan.delivery_frames,
+                    )
+                    result = self._encode_sequence(
+                        frame_dir=resampled_dir,
+                        output_path=temporary,
+                        input_fps=plan.delivery_fps,
+                        output_fps=plan.delivery_fps,
+                        frames_limit=plan.delivery_frames,
+                    )
+                finally:
+                    shutil.rmtree(resampled_dir, ignore_errors=True)
+
+                if result.returncode != 0 or not temporary.is_file():
+                    raise NormalizationError(
+                        f"Encodage H.264 impossible: {result.stderr.strip()}",
+                        code="OUTPUT_ENCODING_FAILED",
+                    )
+                probe = self.probe_video(temporary)
+
+            if not self._probe_matches_plan(
+                probe,
+                delivery_frames=plan.delivery_frames,
+                delivery_fps=plan.delivery_fps,
+                target_duration=plan.target_duration_seconds,
+                tolerance=plan.tolerance_seconds,
+            ):
+                raise NormalizationError(
+                    "VIDEO_DURATION_MISMATCH: "
+                    f"attendu {plan.target_duration_seconds:.3f}s / "
+                    f"{plan.delivery_frames} frames / {plan.delivery_fps}fps, "
+                    f"obtenu {probe.get('duration')}s / "
+                    f"{probe.get('frames')} frames / {probe.get('fps')}fps.",
+                    code="OUTPUT_DURATION_MISMATCH",
+                )
+
             os.replace(temporary, output_path)
-            return probe
+            return {
+                **probe,
+                "native_frames": len(normalized),
+                "delivery_frames": plan.delivery_frames,
+                "temporal_strategy": strategy_used,
+                "requested_duration": plan.requested_duration_seconds,
+            }
         finally:
-            shutil.rmtree(frame_dir, ignore_errors=True)
+            shutil.rmtree(native_dir, ignore_errors=True)
             temporary.unlink(missing_ok=True)
 
     def write_image(self, images: list[Any], output_path: Path) -> dict[str, Any]:
         if not images:
             raise NormalizationError("Le pipeline image n'a renvoye aucune image.")
         if output_path.suffix.lower() != ".png":
-            raise NormalizationError("Une sortie image doit utiliser l'extension .png.", code="INVALID_OUTPUT_PATH")
+            raise NormalizationError(
+                "Une sortie image doit utiliser l'extension .png.",
+                code="INVALID_OUTPUT_PATH",
+            )
         temporary = output_path.with_name(f"{output_path.stem}.tmp.png")
         image = self._to_image(images[0])
         image.save(temporary, format="PNG")
@@ -266,7 +479,12 @@ def first_supported(accepted: set[str], *aliases: str) -> str | None:
     return next((name for name in aliases if name in accepted), None)
 
 
-def assign_alias(kwargs: dict[str, Any], accepted: set[str], value: Any, *aliases: str) -> None:
+def assign_alias(
+    kwargs: dict[str, Any],
+    accepted: set[str],
+    value: Any,
+    *aliases: str,
+) -> None:
     name = first_supported(accepted, *aliases)
     if name is not None and value is not None:
         kwargs[name] = value

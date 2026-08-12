@@ -9,12 +9,8 @@ from .base import RuntimeAdapter, log_diffusers_call
 class ImageToImageAdapter(RuntimeAdapter):
     def capabilities(self) -> list[str]:
         return [
-            "IMAGE_TO_IMAGE",
-            "INPAINTING",
-            "OUTPAINTING",
-            "IMAGE_VARIATION",
-            "IMAGE_UPSCALE",
-            "CONTROLLED_IMAGE_GENERATION",
+            "IMAGE_TO_IMAGE", "INPAINTING", "OUTPAINTING",
+            "IMAGE_VARIATION", "IMAGE_UPSCALE", "CONTROLLED_IMAGE_GENERATION",
         ]
 
     def supports_model(self, metadata: dict[str, Any]) -> bool:
@@ -26,7 +22,10 @@ class ImageToImageAdapter(RuntimeAdapter):
         )
 
     def estimate_resources(self, metadata: dict[str, Any]) -> dict[str, Any]:
-        return {"vram_bytes": 10 * 1024 * 1024 * 1024, "ram_bytes": 10 * 1024 * 1024 * 1024}
+        return {
+            "vram_bytes": 10 * 1024 * 1024 * 1024,
+            "ram_bytes": 10 * 1024 * 1024 * 1024,
+        }
 
     def load(self, snapshot: str, settings: dict[str, Any], runtime: Any) -> Any:
         from diffusers import AutoPipelineForImage2Image, DiffusionPipeline
@@ -50,26 +49,29 @@ class ImageToImageAdapter(RuntimeAdapter):
         del pipeline
 
     def generate(self, pipeline: Any, runtime: Any, request: dict[str, Any]) -> dict[str, Any]:
-        image = request.get("input_image")
         capability = str(request.get("capability") or "IMAGE_TO_IMAGE").upper()
         kwargs: dict[str, Any] = {
             "prompt": request.get("prompt"),
             "negative_prompt": request.get("negative_prompt"),
-            "image": image,
-            "strength": request.get("strength", 0.8),
-            "num_inference_steps": request.get("steps", 4),
-            "guidance_scale": request.get("guidance_scale", 0.0),
+            "image": request.get("input_image"),
             "generator": runtime.get("generator"),
-            "width": request.get("width"),
-            "height": request.get("height"),
             "mask_image": request.get("mask_image"),
             "control_image": request.get("control_image"),
         }
+
+        if request.get("strength") is not None:
+            kwargs["strength"] = request.get("strength")
+        if request.get("steps") is not None:
+            kwargs["num_inference_steps"] = request.get("steps")
+        if request.get("guidance_scale") is not None:
+            kwargs["guidance_scale"] = request.get("guidance_scale")
+        if request.get("width") is not None:
+            kwargs["width"] = request.get("width")
+        if request.get("height") is not None:
+            kwargs["height"] = request.get("height")
+
         if capability == "IMAGE_VARIATION":
             kwargs.pop("strength", None)
-        if capability in {"IMAGE_UPSCALE", "OUTPAINTING"}:
-            kwargs["width"] = request.get("width", 1024)
-            kwargs["height"] = request.get("height", 1024)
 
         accepted = set(inspect.signature(pipeline.__call__).parameters)
         filtered = {

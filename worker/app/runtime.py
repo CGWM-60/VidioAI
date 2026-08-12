@@ -2864,8 +2864,38 @@ class RuntimeManager:
                 raise RuntimeError(
                     "Le pipeline vidéo n'a renvoyé aucune séquence de frames exploitable."
                 )
-            fps = int(output.get("fps") or prepared_request.get("fps") or 24)
-            media_probe = self._output_normalizer.write_video(normalized_frames, output_path, fps)
+            delivery_fps = int(
+                prepared_request.get("requested_fps")
+                or prepared_request.get("fps")
+                or 24
+            )
+            requested_duration = (
+                prepared_request.get("requested_duration_seconds")
+                or prepared_request.get("duration_seconds")
+            )
+            media_probe = self._output_normalizer.write_video(
+                normalized_frames,
+                output_path,
+                delivery_fps,
+                duration_seconds=requested_duration,
+            )
+            logger.info(
+                "TEMPORAL_OUTPUT_PLAN %s",
+                json.dumps(
+                    {
+                        "model_id": loaded.model_id,
+                        "capability": requested_capability,
+                        "native_frames": media_probe.get("native_frames"),
+                        "delivery_frames": media_probe.get("delivery_frames"),
+                        "delivery_fps": media_probe.get("fps"),
+                        "actual_duration": media_probe.get("duration"),
+                        "requested_duration": requested_duration,
+                        "temporal_strategy": media_probe.get("temporal_strategy"),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
         else:
             media_probe = self._output_normalizer.write_image(images, output_path)
 
@@ -2908,6 +2938,9 @@ class RuntimeManager:
             "frames": media_probe.get("frames"),
             "duration_seconds": media_probe.get("duration"),
             "fps": media_probe.get("fps"),
+            "native_frames": media_probe.get("native_frames"),
+            "delivery_frames": media_probe.get("delivery_frames"),
+            "temporal_strategy": media_probe.get("temporal_strategy"),
             "batch": 1,
             "inference_seconds": time.perf_counter() - generation_started,
         }
@@ -2996,7 +3029,7 @@ class RuntimeManager:
                     status_code = 500
                 message = (
                     str(error)
-                    if status_code < 500
+                    if status_code < 500 or isinstance(error, NormalizationError)
                     else "La génération a échoué dans le runtime Diffusers."
                 )
                 retryable = False

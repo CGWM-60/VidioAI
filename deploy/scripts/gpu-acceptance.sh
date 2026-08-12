@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 PROJECT_DIR=${VIDIOAI_PROJECT_DIR:-/opt/vidioai}
 BASE_URL=${1:-http://127.0.0.1:8080}
-TARGET_VERSION=${VIDIOAI_GPU_ACCEPTANCE_VERSION:-2026.08.11-10}
+TARGET_VERSION=${VIDIOAI_GPU_ACCEPTANCE_VERSION:-2026.08.11-11}
 COMPOSE_FILE=${VIDIOAI_COMPOSE_FILE:-${PROJECT_DIR}/compose.production.yml}
 ENV_FILE=${VIDIOAI_ENV_FILE:-${PROJECT_DIR}/.env.production}
 source "${PROJECT_DIR}/deploy/scripts/lib/scratch-storage.sh"
@@ -255,7 +255,10 @@ run_video() {
     (.requested_duration_seconds > 0) and (.requested_fps > 0) and
     (.requested_frames > 0) and (.inference_frames > 0) and
     (.actual_width > 0) and (.actual_height > 0) and
-    (.actual_fps > 0) and (.actual_frames > 1) and (.actual_duration > 0)
+    (.actual_fps > 0) and (.actual_frames > 1) and (.actual_duration > 0) and
+    ((.actual_duration - .requested_duration_seconds) < 0.15) and
+    ((.actual_duration - .requested_duration_seconds) > -0.15) and
+    (.actual_frames == ((.requested_duration_seconds * .requested_fps) | round))
   ' <<<"${generation}" >/dev/null
   printf '%s\n' "${generation}" > "${RESULT_ROOT}/${label}.generation.json"
   asset_id=$(jq -er '.output_asset_id' <<<"${generation}")

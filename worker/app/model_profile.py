@@ -1,7 +1,14 @@
-"""Parametres d'inference derives du snapshot puis normalises pour la pipeline."""
+"""Parametres d'inference derives du snapshot puis normalises pour la pipeline.
+
+2026.08.11-11:
+- pas de fallback arbitraire pour steps/guidance;
+- metadata puis defaults reels de pipeline.__call__;
+- FPS de livraison separe du FPS de conditionnement modele.
+"""
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,11 +33,23 @@ def _number(*values: Any) -> float | None:
     return None
 
 
+def _signature_default(pipeline: Any, name: str) -> Any:
+    if pipeline is None:
+        return None
+    try:
+        parameter = inspect.signature(pipeline.__call__).parameters.get(name)
+    except (TypeError, ValueError):
+        return None
+    if parameter is None or parameter.default is inspect.Parameter.empty:
+        return None
+    return parameter.default
+
+
 @dataclass(slots=True)
 class ModelRuntimeProfile:
     fps: int
-    steps: int
-    guidance_scale: float
+    steps: int | None
+    guidance_scale: float | None
     width: int
     height: int
     num_frames: int | None
@@ -58,38 +77,68 @@ class ModelRuntimeProfile:
             return getattr(source, name, None)
 
         fps = _positive_int(
-            profile.get("fps"), model_index.get("fps"), config.get("fps"),
-            runtime_value(pipeline_config, "fps"),
+            profile.get("fps"),
+            model_index.get("fps"),
+            config.get("fps"),
         ) or 24
+
         steps = _positive_int(
-            profile.get("num_inference_steps"), model_index.get("num_inference_steps"),
-            config.get("num_inference_steps"), config.get("default_num_inference_steps"),
-        ) or 28
-        guidance = _number(
-            profile.get("guidance_scale"), model_index.get("guidance_scale"),
-            config.get("guidance_scale"), config.get("default_guidance_scale"),
+            profile.get("num_inference_steps"),
+            model_index.get("num_inference_steps"),
+            config.get("num_inference_steps"),
+            config.get("default_num_inference_steps"),
+            _signature_default(pipeline, "num_inference_steps"),
         )
-        width = _positive_int(profile.get("width"), model_index.get("width"), config.get("width"), config.get("sample_size")) or 512
-        height = _positive_int(profile.get("height"), model_index.get("height"), config.get("height"), config.get("sample_size")) or 512
+        guidance = _number(
+            profile.get("guidance_scale"),
+            model_index.get("guidance_scale"),
+            config.get("guidance_scale"),
+            config.get("default_guidance_scale"),
+            _signature_default(pipeline, "guidance_scale"),
+        )
+        width = _positive_int(
+            profile.get("width"),
+            model_index.get("width"),
+            config.get("width"),
+            config.get("sample_size"),
+        ) or 512
+        height = _positive_int(
+            profile.get("height"),
+            model_index.get("height"),
+            config.get("height"),
+            config.get("sample_size"),
+        ) or 512
+
         return cls(
             fps=fps,
             steps=steps,
-            guidance_scale=5.0 if guidance is None else guidance,
+            guidance_scale=guidance,
             width=width,
             height=height,
-            num_frames=_positive_int(profile.get("num_frames"), model_index.get("num_frames"), config.get("num_frames")),
-            dimension_multiple=_positive_int(profile.get("dimension_multiple"), config.get("dimension_multiple"), config.get("vae_scale_factor")) or 8,
+            num_frames=_positive_int(
+                profile.get("num_frames"),
+                model_index.get("num_frames"),
+                config.get("num_frames"),
+            ),
+            dimension_multiple=_positive_int(
+                profile.get("dimension_multiple"),
+                config.get("dimension_multiple"),
+                config.get("vae_scale_factor"),
+            ) or 8,
             temporal_multiple=_positive_int(
-                profile.get("temporal_multiple"), config.get("temporal_compression_ratio"),
+                profile.get("temporal_multiple"),
+                config.get("temporal_compression_ratio"),
                 runtime_value(vae_config, "temporal_compression_ratio"),
                 runtime_value(transformer_config, "temporal_compression_ratio"),
             ) or 1,
             min_frames=_positive_int(
-                profile.get("min_frames"), config.get("min_frames"),
+                profile.get("min_frames"),
+                config.get("min_frames"),
                 runtime_value(pipeline_config, "min_frames"),
             ),
             max_frames=_positive_int(
-                profile.get("max_frames"), config.get("max_frames"),
+                profile.get("max_frames"),
+                config.get("max_frames"),
                 runtime_value(pipeline_config, "max_frames"),
             ),
         )
@@ -106,6 +155,12 @@ class ModelRuntimeProfile:
         frames = _positive_int(request.get("frames"), self.num_frames)
         if video and frames is not None:
             frames = self._normalize_frames(frames)
+
+        explicit_guidance = (
+            _number(request.get("guidance_scale"))
+            if request.get("guidance_scale") is not None
+            else None
+        )
         return {
             "width": self._align(width, self.dimension_multiple),
             "height": self._align(height, self.dimension_multiple),
@@ -113,7 +168,11 @@ class ModelRuntimeProfile:
             "duration_seconds": duration,
             "num_frames": frames if video else None,
             "num_inference_steps": _positive_int(request.get("steps")) or self.steps,
-            "guidance_scale": _number(request.get("guidance_scale")) if request.get("guidance_scale") is not None else self.guidance_scale,
+            "guidance_scale": (
+                explicit_guidance
+                if request.get("guidance_scale") is not None
+                else self.guidance_scale
+            ),
         }
 
     def _normalize_frames(self, requested: int) -> int:
@@ -121,7 +180,9 @@ class ModelRuntimeProfile:
         if self.temporal_multiple > 1:
             frames = max(
                 1,
-                round((frames - 1) / self.temporal_multiple) * self.temporal_multiple + 1,
+                round((frames - 1) / self.temporal_multiple)
+                * self.temporal_multiple
+                + 1,
             )
         if self.min_frames is not None and frames < self.min_frames:
             frames = self.min_frames
