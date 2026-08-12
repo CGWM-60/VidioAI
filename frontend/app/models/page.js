@@ -189,9 +189,10 @@ export default function ModelsPage() {
                 <p>{model.description}</p>
                 <small className={styles.hardwareSummary} title={hardwareTooltip(model.hardware)}><BsCpu /> {hardwareSummary(model.hardware)} · {model.compatibility_level.toLowerCase().replaceAll("_", " ")}</small>
                 <div className={styles.compactCompatibility}>
-                  <span className={model.hardware_compatible ? styles.checkGood : styles.checkBad}>{model.hardware_compatible ? "✓" : "✕"} Matériel</span>
-                  <span className={runtimeStatus(model) === "SUPPORTED" ? styles.checkGood : runtimeStatus(model) === "UNKNOWN" ? styles.warningBanner : styles.checkBad}>{runtimeStatus(model) === "SUPPORTED" ? "✓ Pipeline runtime" : runtimeStatus(model) === "UNKNOWN" ? "? Validation après téléchargement" : "✕ Pipeline runtime"}</span>
-                  <span className={model.source_available ? styles.checkGood : styles.checkBad}>{model.source_available ? "✓" : "✕"} Source</span>
+                  <span className={model.discovered ? styles.checkGood : styles.checkBad}>{model.discovered ? "✓ Découvert" : "✕ Non découvert"}</span>
+                  <span className={model.downloadable ? styles.checkGood : styles.checkBad}>{model.downloadable ? "✓ Téléchargeable" : "✕ Non téléchargeable"}</span>
+                  <span className={runtimeStatus(model) === "SUPPORTED" ? styles.checkGood : runtimeStatus(model) === "UNKNOWN" ? styles.warningBanner : styles.checkBad}>{runtimeStatus(model) === "SUPPORTED" ? "✓ Runtime" : runtimeStatus(model) === "UNKNOWN" ? "? Runtime à valider" : "✕ Runtime"}</span>
+                  <span className={model.hardware_compatibility === "COMPATIBLE" ? styles.checkGood : model.hardware_compatibility === "UNKNOWN" ? styles.warningBanner : styles.checkBad}>{model.hardware_compatibility === "COMPATIBLE" ? "✓ Matériel" : model.hardware_compatibility === "UNKNOWN" ? "? Matériel à mesurer" : "✕ Matériel"}</span>
                   <span className={accessStatus(model) === "AUTHORIZED" ? styles.checkGood : accessStatus(model) === "UNVERIFIED" ? styles.warningBanner : styles.checkBad}>{accessStatus(model) === "AUTHORIZED" ? "✓ Accès HF" : accessStatus(model) === "UNVERIFIED" ? "? Accès vérifié à l’installation" : "✕ Accès HF"}</span>
                 </div>
                 {runtimeStatus(model) !== "SUPPORTED" && <small className={styles.runtimeReason}>{model.runtime_reason}</small>}

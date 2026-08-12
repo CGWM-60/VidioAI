@@ -30,7 +30,7 @@ const GIB: u64 = 1024 * 1024 * 1024;
 // Toute modification d'un champ calculé (comme `runtime_reason`) doit invalider
 // les anciennes entrées, sinon l'interface continuerait à afficher un diagnostic
 // obsolète après la mise à jour du binaire.
-const CACHE_SCHEMA_VERSION: u32 = 7;
+const CACHE_SCHEMA_VERSION: u32 = 8;
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -608,6 +608,7 @@ impl HuggingFaceCatalogService {
             .filter(|path| {
                 *path == "config.json"
                     || *path == "model_index.json"
+                    || *path == "modular_model_index.json"
                     || ([
                         "transformer/",
                         "unet/",
@@ -660,6 +661,9 @@ impl HuggingFaceCatalogService {
                 }
                 "model_index.json" => {
                     merged.insert("_model_index".into(), result.1);
+                }
+                "modular_model_index.json" => {
+                    merged.insert("_modular_model_index".into(), result.1);
                 }
                 _ => {
                     components.insert(result.0, result.1);
@@ -834,13 +838,19 @@ fn normalize_model(raw: HfRawModel) -> CatalogModel {
     let capabilities = normalize_capabilities(pipeline, &raw.tags);
     let kind = primary_kind(&capabilities);
     let has_weights = files.iter().any(|file| is_weight_file(&file.path));
+    let has_modular_index = files
+        .iter()
+        .any(|file| file.path.rsplit('/').next() == Some("modular_model_index.json"));
     let has_config = files.iter().any(|file| {
         matches!(
             file.path.rsplit('/').next(),
-            Some("config.json" | "model_index.json")
+            Some("config.json" | "model_index.json" | "modular_model_index.json")
         )
     });
-    let quality_valid = !raw.disabled && !files.is_empty() && has_weights && has_config;
+    // Un repository ModularPipeline peut être un pur manifeste : les poids
+    // référencés sont matérialisés par le Worker pendant l'installation.
+    let quality_valid =
+        !raw.disabled && !files.is_empty() && has_config && (has_weights || has_modular_index);
     let architecture = architecture_from_config(&raw.config);
     let license = license_from(&raw.card_data, &raw.tags);
     let estimated_size_bytes = raw.used_storage.or_else(|| {
@@ -1117,9 +1127,15 @@ fn primary_kind(capabilities: &[ModelCapability]) -> ModelKind {
 
 fn architecture_from_config(config: &Value) -> Option<String> {
     config
-        .get("_model_index")
+        .get("_modular_model_index")
         .and_then(|value| value.get("_class_name"))
         .and_then(Value::as_str)
+        .or_else(|| {
+            config
+                .get("_model_index")
+                .and_then(|value| value.get("_class_name"))
+                .and_then(Value::as_str)
+        })
         .or_else(|| config.get("_class_name").and_then(Value::as_str))
         .or_else(|| {
             config
@@ -1182,6 +1198,26 @@ fn runtime_match(
     let has_diffusers_index = files
         .iter()
         .any(|file| file.path.rsplit('/').next() == Some("model_index.json"));
+    let has_modular_index = files
+        .iter()
+        .any(|file| file.path.rsplit('/').next() == Some("modular_model_index.json"));
+
+    if library == "diffusers"
+        && has_modular_index
+        && architecture.is_some_and(|value| value.ends_with("Pipeline"))
+    {
+        let runtime_capabilities = infer_runtime_capabilities(capabilities, architecture, files);
+        let detected = architecture.expect("architecture vérifiée ci-dessus");
+        return (
+            Some("Diffusers ModularPipeline".into()),
+            true,
+            format!(
+                "Manifest modular_model_index.json détecté ({detected}); le Worker validera ModularPipeline, ses blocks et ses composants au chargement."
+            ),
+            runtime_capabilities,
+        );
+    }
+
     if library == "diffusers"
         && has_safetensors
         && has_diffusers_index

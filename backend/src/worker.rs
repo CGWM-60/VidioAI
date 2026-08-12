@@ -181,6 +181,7 @@ struct CompatibilityRequest<'a> {
     tags: &'a [String],
     architectures: Vec<&'a str>,
     base_models: Vec<&'a str>,
+    is_modular: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,6 +222,14 @@ pub struct GenerateResponse {
     pub actual_frames: Option<u32>,
     #[serde(default)]
     pub actual_duration: Option<f64>,
+    #[serde(default)]
+    pub actual_audio: bool,
+    #[serde(default)]
+    pub audio_codec: Option<String>,
+    #[serde(default)]
+    pub audio_channels: Option<u32>,
+    #[serde(default)]
+    pub audio_sample_rate: Option<u32>,
     pub sha256: String,
     #[serde(default)]
     pub benchmark: Option<WorkerBenchmarkObservation>,
@@ -352,6 +361,7 @@ impl WorkerClient {
         library_name: Option<&str>,
         pipeline_tag: Option<&str>,
         tags: &[String],
+        is_modular: bool,
     ) -> Result<WorkerCompatibility, String> {
         self.json(
             self.request(reqwest::Method::POST, "/v1/models/compatibility")
@@ -363,6 +373,7 @@ impl WorkerClient {
                     tags,
                     architectures: pipeline_class.into_iter().collect(),
                     base_models: Vec::new(),
+                    is_modular,
                 }),
         )
         .await
@@ -454,6 +465,7 @@ impl WorkerClient {
         aspect_ratio: &str,
         duration_seconds: u32,
         fps: u32,
+        audio: bool,
     ) -> Result<GenerateResponse, String> {
         let relative = output_path
             .to_str()
@@ -468,6 +480,7 @@ impl WorkerClient {
             "aspect_ratio": aspect_ratio,
             "duration_seconds": duration_seconds,
             "fps": fps,
+            "audio": audio,
             "seed": null,
             "output_relative_path": relative,
         });

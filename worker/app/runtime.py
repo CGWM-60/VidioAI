@@ -33,11 +33,13 @@ from .adapters.inspectors import inspect_model_metadata
 from .adapters.registry import PipelineRegistry
 from .capability_resolver import CapabilityResolver
 from .normalizers import InputNormalizer, NormalizationError, OutputNormalizer, VIDEO_CAPABILITIES
+from .audio_output import AudioOutputError, NativeAudioMuxer
 from .pipeline_resolver import PipelineResolutionError, PipelineResolver
 from .dependency_installer import DependencyInstaller
 from .dependency_resolver import DependencyResolutionError, DependencyResolver
 from .model_profile import ModelRuntimeProfile
 from .model_bundle import BundleError, ModelBundleManager
+from .modular_runtime import ModularManifestResolver, ModularRuntimeError
 from .inference_recipe import InferenceRecipeResolver, RecipeError
 from .resolution_resolver import ResolutionResolver
 from .config import Settings
@@ -123,6 +125,7 @@ class RuntimeManager:
         self._inference_recipe = InferenceRecipeResolver()
         self._input_normalizer = InputNormalizer(self.settings.work_dir)
         self._output_normalizer = OutputNormalizer(self.settings.work_dir)
+        self._native_audio_muxer = NativeAudioMuxer()
 
     @staticmethod
     def _safe_segment(value: str) -> str:
@@ -191,6 +194,7 @@ class RuntimeManager:
 
     def check_compatibility(self, request: dict[str, Any]) -> dict[str, Any]:
         class_name = request.get("pipeline_class")
+        is_modular = request.get("is_modular") is True
         metadata = {
             "class_name": class_name,
             "library_name": request.get("library_name"),
@@ -199,7 +203,17 @@ class RuntimeManager:
             "architectures": request.get("architectures") or [],
             "base_models": request.get("base_models") or [],
             "trust_remote_code": request.get("trust_remote_code") is True,
-            "model_index": {"_class_name": class_name} if class_name else {},
+            "is_modular": is_modular,
+            "modular_model_index": (
+                {"_class_name": class_name or "ModularPipeline"}
+                if is_modular
+                else {}
+            ),
+            "model_index": (
+                {"_class_name": class_name}
+                if class_name and not is_modular
+                else {}
+            ),
             "config": {},
         }
         if self._pipeline_resolver.requires_remote_code(metadata):
@@ -235,6 +249,13 @@ class RuntimeManager:
             }
         capability_sets = CapabilityResolver().describe(metadata, resolution.pipeline_cls)
         capabilities = capability_sets["runtime_capabilities"]
+        architecture_adapter = self._registry.select_for_model(metadata)
+        if architecture_adapter is not None:
+            architecture_capabilities = architecture_adapter.supported_capabilities(metadata)
+            if architecture_capabilities:
+                capabilities = architecture_capabilities
+                capability_sets["runtime_capabilities"] = list(architecture_capabilities)
+                capability_sets["display_capabilities"] = list(architecture_capabilities)
         status = CompatibilityStatus.SUPPORTED
         error_code = None
         if not resolution.runtime_supported:
@@ -633,6 +654,141 @@ class RuntimeManager:
     def _directory_has_files(path: Path) -> bool:
         return path.is_dir() and any(item.is_file() for item in path.rglob("*"))
 
+    def _materialize_modular_dependencies(
+        self,
+        snapshot: Path,
+        *,
+        base_repository: str,
+        token: str | None,
+        hf_api: Any,
+        snapshot_download: Any,
+    ) -> list[dict[str, Any]]:
+        modular_index = ModularManifestResolver.read(snapshot)
+        if not modular_index:
+            return []
+
+        config = {}
+        config_path = snapshot / "config.json"
+        if config_path.is_file():
+            try:
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                config = {}
+
+        if ModularManifestResolver.requires_remote_code(
+            modular_index,
+            config if isinstance(config, dict) else {},
+        ):
+            raise WorkerError(
+                "Le ModularPipeline exige trust_remote_code; exécution distante refusée.",
+                422,
+                code="REMOTE_CODE_REQUIRED",
+                retryable=False,
+            )
+
+        dependencies = ModularManifestResolver.external_components(
+            modular_index,
+            base_repository=base_repository,
+        )
+        if not dependencies:
+            ModularManifestResolver.write_materialization(snapshot, [])
+            return []
+
+        api = hf_api(token=token)
+        records: list[dict[str, Any]] = []
+        materialized: dict[tuple[str, str, str], str] = {}
+
+        for dependency in dependencies:
+            repository = dependency.repository
+            if not repository:
+                continue
+            requested_revision = dependency.revision or "main"
+            info = api.model_info(repository, revision=requested_revision)
+            resolved_revision = self._safe_segment(info.sha)
+            key = (repository, resolved_revision, dependency.subfolder or "")
+
+            local_root_relative = materialized.get(key)
+            if local_root_relative is None:
+                local_root_relative = (
+                    "vidioai/modular-components/"
+                    f"{dependency.materialization_key()}-{resolved_revision[:8]}"
+                )
+                target = snapshot / local_root_relative
+                target.mkdir(parents=True, exist_ok=True)
+
+                relevant_bytes = 0
+                prefix = (
+                    f"{dependency.subfolder.strip('/')}/"
+                    if dependency.subfolder
+                    else ""
+                )
+                for sibling in getattr(info, "siblings", []) or []:
+                    filename = (
+                        getattr(sibling, "rfilename", None)
+                        or getattr(sibling, "path", None)
+                        or ""
+                    )
+                    size = getattr(sibling, "size", None)
+                    if (
+                        isinstance(size, int)
+                        and size > 0
+                        and (not prefix or str(filename).startswith(prefix))
+                    ):
+                        relevant_bytes += size
+                if relevant_bytes > 0:
+                    self._precheck_download_environment(int(relevant_bytes * 2.2))
+
+                allow_patterns = (
+                    [f"{dependency.subfolder.strip('/')}/**"]
+                    if dependency.subfolder
+                    else None
+                )
+                try:
+                    self._snapshot_download_with_env(
+                        snapshot_download,
+                        repo_id=repository,
+                        revision=resolved_revision,
+                        local_dir=target,
+                        cache_dir=self.settings.hf_home,
+                        token=token,
+                        disable_xet=False,
+                        sequential_reconstruct=False,
+                        allow_patterns=allow_patterns,
+                    )
+                except Exception as error:
+                    if not self._looks_like_xet_reconstruction_error(error):
+                        raise
+                    self._clear_partial_directory(target)
+                    self._snapshot_download_with_env(
+                        snapshot_download,
+                        repo_id=repository,
+                        revision=resolved_revision,
+                        local_dir=target,
+                        cache_dir=self.settings.hf_home,
+                        token=token,
+                        disable_xet=True,
+                        sequential_reconstruct=False,
+                        allow_patterns=allow_patterns,
+                    )
+                materialized[key] = local_root_relative
+
+            records.append(
+                {
+                    "name": dependency.name,
+                    "repository": repository,
+                    "requested_revision": requested_revision,
+                    "resolved_revision": resolved_revision,
+                    "subfolder": dependency.subfolder,
+                    "variant": dependency.variant,
+                    "type_library": dependency.type_library,
+                    "type_class": dependency.type_class,
+                    "local_root": local_root_relative,
+                }
+            )
+
+        ModularManifestResolver.write_materialization(snapshot, records)
+        return records
+
     @staticmethod
     def _snapshot_download_with_env(
         snapshot_download: Any,
@@ -644,6 +800,7 @@ class RuntimeManager:
         token: str | None,
         disable_xet: bool,
         sequential_reconstruct: bool,
+        allow_patterns: list[str] | None = None,
     ) -> None:
         previous_disable = os.getenv("HF_HUB_DISABLE_XET")
         previous_seq = os.getenv("HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY")
@@ -658,20 +815,23 @@ class RuntimeManager:
             else:
                 os.environ.pop("HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY", None)
 
-            snapshot_download(
-                repo_id=repo_id,
-                revision=revision,
-                local_dir=local_dir,
-                cache_dir=cache_dir,
-                token=token,
-                ignore_patterns=[
+            kwargs: dict[str, Any] = {
+                "repo_id": repo_id,
+                "revision": revision,
+                "local_dir": local_dir,
+                "cache_dir": cache_dir,
+                "token": token,
+                "ignore_patterns": [
                     "*.ckpt",
                     "*.onnx",
                     "*.msgpack",
                     "*.h5",
                     "*.tflite",
                 ],
-            )
+            }
+            if allow_patterns:
+                kwargs["allow_patterns"] = allow_patterns
+            snapshot_download(**kwargs)
         finally:
             if previous_disable is None:
                 os.environ.pop("HF_HUB_DISABLE_XET", None)
@@ -698,7 +858,11 @@ class RuntimeManager:
             return None
 
         downloaded = False
-        for filename in ("model_index.json", "config.json"):
+        for filename in (
+            "modular_model_index.json",
+            "model_index.json",
+            "config.json",
+        ):
             try:
                 hf_hub_download(
                     repo_id=repository,
@@ -1005,26 +1169,63 @@ class RuntimeManager:
         return digest.hexdigest()
 
     def validate_snapshot(self, snapshot: Path) -> dict[str, Any]:
-        """Valide structure, présence réelle des poids, tailles et empreintes."""
+        """Valide un snapshot Diffusers classique OU ModularPipeline réel."""
         model_index = snapshot / "model_index.json"
-        if not model_index.is_file():
-            raise WorkerError("model_index.json est absent du snapshot.", 422)
-        try:
-            parsed_index = json.loads(model_index.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise WorkerError("model_index.json est invalide.", 422) from error
-        has_diffusers_component = any(
-            isinstance(component, list)
-            and component
-            and str(component[0]).strip().lower() == "diffusers"
-            for key, component in parsed_index.items()
-            if not str(key).startswith("_")
-        )
-        if "_class_name" not in parsed_index and not has_diffusers_component:
+        modular_index = snapshot / "modular_model_index.json"
+        if not model_index.is_file() and not modular_index.is_file():
             raise WorkerError(
-                "Le manifest ne déclare ni pipeline ni composant Diffusers.",
+                "Aucun model_index.json ni modular_model_index.json dans le snapshot.",
                 422,
+                code="MODEL_MANIFEST_MISSING",
             )
+
+        manifest_path = modular_index if modular_index.is_file() else model_index
+        try:
+            parsed_index = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise WorkerError(
+                f"{manifest_path.name} est invalide.",
+                422,
+                code="MODEL_MANIFEST_INVALID",
+            ) from error
+        if not isinstance(parsed_index, dict):
+            raise WorkerError(
+                f"{manifest_path.name} doit être un objet JSON.",
+                422,
+                code="MODEL_MANIFEST_INVALID",
+            )
+
+        if modular_index.is_file():
+            declared_class = str(
+                parsed_index.get("_class_name")
+                or parsed_index.get("_blocks_class_name")
+                or ""
+            ).strip()
+            component_specs = [
+                value
+                for key, value in parsed_index.items()
+                if not str(key).startswith("_") and isinstance(value, (list, dict))
+            ]
+            if not declared_class and not component_specs:
+                raise WorkerError(
+                    "Le manifest ModularPipeline ne déclare ni architecture ni composants.",
+                    422,
+                    code="MODULAR_MANIFEST_INVALID",
+                )
+        else:
+            has_diffusers_component = any(
+                isinstance(component, list)
+                and component
+                and str(component[0]).strip().lower() == "diffusers"
+                for key, component in parsed_index.items()
+                if not str(key).startswith("_")
+            )
+            if "_class_name" not in parsed_index and not has_diffusers_component:
+                raise WorkerError(
+                    "Le manifest ne déclare ni pipeline ni composant Diffusers.",
+                    422,
+                    code="MODEL_MANIFEST_INVALID",
+                )
 
         weights = sorted(snapshot.rglob("*.safetensors"))
         if not weights:
@@ -1106,12 +1307,22 @@ class RuntimeManager:
             precision_plan = self._precision_plan(
                 torch, metadata, bool(torch.cuda.is_available())
             )
+            cached_adapter = self._registry.select_for_capability(
+                metadata,
+                resolved_capability,
+            )
+            model_bytes = self._adapter_model_bytes(
+                cached_adapter,
+                snapshot,
+                resolved_capability,
+                int(validation.get("weights_bytes") or 0),
+            )
             memory_plan = self._memory_plan(
                 torch,
                 metadata,
                 resolved_capability,
                 precision_plan,
-                int(validation.get("weights_bytes") or 0),
+                model_bytes,
             )
         except WorkerError:
             pass
@@ -1359,6 +1570,14 @@ class RuntimeManager:
                         retryable=True,
                     ) from fallback_error
 
+            modular_dependencies = self._materialize_modular_dependencies(
+                temporary,
+                base_repository=repository,
+                token=hf_token,
+                hf_api=HfApi,
+                snapshot_download=snapshot_download,
+            )
+
             self._log_model_state(model_id, "DOWNLOADING", "DOWNLOADED")
             with self._lock:
                 self._model_states[model_id].update(
@@ -1447,6 +1666,7 @@ class RuntimeManager:
                 "ready": False,
                 "state": ModelState.INSTALLED,
                 "bundle": bundle,
+                "modular_dependencies": modular_dependencies,
                 "runtime_dependencies": runtime_dependencies,
                 "installed_at": int(time.time()),
                 **validation,
@@ -1708,6 +1928,33 @@ class RuntimeManager:
             bf16_supported=bf16_supported,
         )
 
+    def _adapter_model_bytes(
+        self,
+        adapter: Any,
+        snapshot: Path,
+        capability: str,
+        fallback: int,
+    ) -> int:
+        planner = getattr(adapter, "planning_model_bytes", None)
+        if callable(planner):
+            gpu = self._nvidia_metrics() or {}
+            memory = self._memory_metrics()
+            try:
+                measured = int(
+                    planner(
+                        snapshot,
+                        capability,
+                        vram_total_bytes=int(gpu.get("vram_total_bytes") or 0),
+                        ram_available_bytes=int(memory.get("ram_available_bytes") or 0),
+                    )
+                    or 0
+                )
+            except (OSError, TypeError, ValueError):
+                measured = 0
+            if measured > 0:
+                return measured
+        return max(0, int(fallback))
+
     def _memory_plan(
         self,
         torch: Any,
@@ -1792,6 +2039,16 @@ class RuntimeManager:
         if device != "cuda" or plan.strategy == "CPU":
             return pipeline
 
+        if getattr(pipeline, "_vidioai_components_manager_managed", False):
+            plan.optimizations.append("COMPONENTS_MANAGER_AUTO_CPU_OFFLOAD")
+            plan.optimizations = list(dict.fromkeys(plan.optimizations))
+            return pipeline
+
+        if getattr(pipeline, "_vidioai_modular_full_gpu", False):
+            plan.optimizations.append("MODULAR_DEVICE_MAP_CUDA")
+            plan.optimizations = list(dict.fromkeys(plan.optimizations))
+            return pipeline
+
         if plan.strategy == "FULL_GPU":
             if not hasattr(pipeline, "to"):
                 raise WorkerError(
@@ -1830,7 +2087,13 @@ class RuntimeManager:
                 offload_root = self.settings.work_dir / "offload" / str(uuid.uuid4())
                 offload_root.mkdir(parents=True, exist_ok=False)
                 offloaded = 0
-                for name in self._dtype_resolver.component_names():
+                component_names = list(self._dtype_resolver.component_names())
+                component_names.extend(
+                    str(value)
+                    for value in getattr(pipeline, "_vidioai_modular_component_names", [])
+                    if str(value)
+                )
+                for name in dict.fromkeys(component_names):
                     component = getattr(pipeline, name, None)
                     if component is None:
                         continue
@@ -1894,6 +2157,7 @@ class RuntimeManager:
                 "class_name": metadata.get("class_name"),
                 "metadata": metadata,
                 "capability": capability,
+                "memory_plan": memory_plan,
             },
         )
         manifest = self._read_manifest(snapshot)
@@ -1918,6 +2182,13 @@ class RuntimeManager:
         pipeline = self._apply_memory_plan(pipeline, memory_plan, device)
         capability_sets = CapabilityResolver().describe(metadata, pipeline)
         resolved_capabilities = capability_sets["runtime_capabilities"]
+        architecture_capabilities = adapter.supported_capabilities(metadata)
+        if architecture_capabilities:
+            resolved_capabilities = list(
+                dict.fromkeys([*resolved_capabilities, *architecture_capabilities])
+            )
+            capability_sets["runtime_capabilities"] = resolved_capabilities
+            capability_sets["display_capabilities"] = resolved_capabilities
         if resolved_capabilities:
             metadata.update(capability_sets)
             metadata["capabilities"] = capability_sets["display_capabilities"]
@@ -2098,12 +2369,18 @@ class RuntimeManager:
         precision = precision_plan.precision
         with self._lock:
             self._model_states[model_id]["stage"] = "planning_memory"
+        planning_model_bytes = self._adapter_model_bytes(
+            adapter,
+            snapshot,
+            capability,
+            int(validation.get("weights_bytes") or 0),
+        )
         memory_plan = self._memory_plan(
             torch,
             metadata,
             capability,
             precision_plan,
-            int(validation.get("weights_bytes") or 0),
+            planning_model_bytes,
         )
         if not memory_plan.feasible:
             status = {
@@ -2168,6 +2445,7 @@ class RuntimeManager:
                     PipelineResolutionError,
                     DependencyResolutionError,
                     BundleError,
+                    ModularRuntimeError,
                 ),
             ) else "LOAD_FAILED"
             self._log_model_state(model_id, "LOADING", "FAILED", reason=code)
@@ -2209,6 +2487,10 @@ class RuntimeManager:
                     "LORA_LOAD_FAILED",
                     "LORA_LOCAL_SNAPSHOT_INVALID",
                     "LORA_SCALE_UNSUPPORTED",
+                    "MODULAR_PIPELINE_UNAVAILABLE",
+                    "MODULAR_COMPONENT_MISSING",
+                    "MODULAR_MANIFEST_INVALID",
+                    "MODULAR_INPUT_CONTRACT_UNKNOWN",
                 }
                 else 503,
                 code=code,
@@ -2400,12 +2682,18 @@ class RuntimeManager:
             loaded.device == "cuda",
         )
         dtype = self._dtype_resolver.materialize(torch, precision_plan)
+        switch_model_bytes = self._adapter_model_bytes(
+            adapter,
+            snapshot,
+            requested_capability,
+            loaded.memory_plan.model_bytes if loaded.memory_plan is not None else 0,
+        )
         memory_plan = self._memory_plan(
             torch,
             metadata,
             requested_capability,
             precision_plan,
-            loaded.memory_plan.model_bytes if loaded.memory_plan is not None else 0,
+            switch_model_bytes,
         )
         try:
             pipeline = self._load_pipeline(
@@ -2943,6 +3231,13 @@ class RuntimeManager:
         try:
             output = adapter.generate(loaded.pipeline, runtime, prepared_request)
         except Exception as error:
+            if isinstance(error, ModularRuntimeError):
+                raise WorkerError(
+                    str(error),
+                    error.status_code,
+                    code=error.code,
+                    retryable=error.retryable,
+                ) from error
             if self._is_cuda_oom(error):
                 self._rebuild_pipeline_after_oom(
                     loaded,
@@ -3028,6 +3323,48 @@ class RuntimeManager:
                 delivery_fps,
                 duration_seconds=requested_duration,
             )
+            if bool(prepared_request.get("audio")):
+                try:
+                    audio_probe = self._native_audio_muxer.mux(
+                        video_path=output_path,
+                        native_audio=(output.get("native_audio") if isinstance(output, dict) else None),
+                        audio_sample_rate=(output.get("audio_sample_rate") if isinstance(output, dict) else None),
+                        duration_seconds=float(
+                            media_probe.get("duration") or requested_duration or 0
+                        ),
+                    )
+                except AudioOutputError as error:
+                    raise WorkerError(
+                        str(error),
+                        error.status_code,
+                        code=error.code,
+                        retryable=False,
+                    ) from error
+                media_probe.update(audio_probe)
+                logger.info(
+                    "NATIVE_AUDIO_MUX %s",
+                    json.dumps(
+                        {
+                            "model_id": loaded.model_id,
+                            "capability": requested_capability,
+                            "actual_audio": media_probe.get("actual_audio"),
+                            "audio_codec": media_probe.get("audio_codec"),
+                            "audio_channels": media_probe.get("audio_channels"),
+                            "audio_sample_rate": media_probe.get("audio_sample_rate"),
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
+            else:
+                media_probe.update(
+                    {
+                        "actual_audio": False,
+                        "audio_codec": None,
+                        "audio_channels": None,
+                        "audio_sample_rate": None,
+                    }
+                )
             logger.info(
                 "TEMPORAL_OUTPUT_PLAN %s",
                 json.dumps(
@@ -3230,3 +3567,283 @@ class RuntimeManager:
             if job is None:
                 raise WorkerError("Job worker introuvable.", 404)
             return dict(job)
+
+# VIDIOAI_FULLVERIFY_WORKER_HOTFIX_V3_RUNTIME
+#
+# Règles restaurées:
+# - métadonnées Diffusers incomplètes => UNKNOWN, pas UNSUPPORTED;
+# - les capacités demandées/catalogue ne sont pas exposées comme réellement
+#   exécutables lorsque runtime_compatible == False.
+_VIDIOAI_V3_ORIGINAL_CHECK_COMPATIBILITY = RuntimeManager.check_compatibility
+_VIDIOAI_V3_ORIGINAL_INSTALL_MODEL = RuntimeManager.install_model
+
+
+def _vidioai_v3_status_is(value, expected):
+    normalized = str(value or "").strip().upper()
+    return normalized == expected or normalized.endswith("." + expected)
+
+
+def _vidioai_v3_unknown_status(current):
+    enum_type = type(current)
+    member = getattr(enum_type, "UNKNOWN", None)
+    if member is not None:
+        return member
+
+    compatibility_type = globals().get("CompatibilityStatus")
+    if compatibility_type is not None:
+        member = getattr(compatibility_type, "UNKNOWN", None)
+        if member is not None:
+            return member
+
+    return "UNKNOWN"
+
+
+def _vidioai_v3_payload_pipeline_class(payload):
+    if not isinstance(payload, dict):
+        return None
+    for key in ("pipeline_class", "class_name", "_class_name"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _vidioai_v3_check_compatibility(self, payload, *args, **kwargs):
+    result = _VIDIOAI_V3_ORIGINAL_CHECK_COMPATIBILITY(
+        self,
+        payload,
+        *args,
+        **kwargs,
+    )
+    if not isinstance(result, dict) or not isinstance(payload, dict):
+        return result
+
+    library = str(payload.get("library_name") or "diffusers").strip().lower()
+    pipeline_class = _vidioai_v3_payload_pipeline_class(payload)
+    current_status = result.get("compatibility_status")
+
+    # Une architecture de composant (Transformer/VAE/etc.) sans classe pipeline
+    # ne prouve pas que le repository est incompatible. Le snapshot doit être
+    # inspecté avant de trancher.
+    if (
+        library in {"", "diffusers"}
+        and pipeline_class is None
+        and _vidioai_v3_status_is(current_status, "UNSUPPORTED")
+    ):
+        patched = dict(result)
+        patched["compatibility_status"] = _vidioai_v3_unknown_status(current_status)
+        patched["runtime_supported"] = False
+
+        explanation = (
+            "Métadonnées Diffusers incomplètes; compatibilité à confirmer "
+            "après inspection du snapshot."
+        )
+        for key in ("runtime_reason", "compatibility_reason", "reason"):
+            if key in patched:
+                patched[key] = explanation
+        return patched
+
+    return result
+
+
+def _vidioai_v3_install_model(self, *args, **kwargs):
+    status = _VIDIOAI_V3_ORIGINAL_INSTALL_MODEL(self, *args, **kwargs)
+    if not isinstance(status, dict):
+        return status
+
+    if (
+        status.get("runtime_compatible") is False
+        and (
+            status.get("installed") is True
+            or _vidioai_v3_status_is(status.get("state"), "INSTALLED")
+        )
+    ):
+        patched = dict(status)
+        patched["capabilities"] = []
+
+        model_id = kwargs.get("model_id")
+        if model_id is None and args:
+            model_id = args[0]
+
+        if isinstance(model_id, str):
+            lock = getattr(self, "_lock", None)
+            states = getattr(self, "_model_states", None)
+            if lock is not None and isinstance(states, dict):
+                with lock:
+                    existing = states.get(model_id)
+                    if isinstance(existing, dict):
+                        existing["capabilities"] = []
+
+        return patched
+
+    return status
+
+
+RuntimeManager.check_compatibility = _vidioai_v3_check_compatibility
+RuntimeManager.install_model = _vidioai_v3_install_model
+
+# VIDIOAI_FULLVERIFY_WORKER_HOTFIX_V4_RUNTIME
+#
+# Couche de contrat finale par-dessus le v3.
+# - conserve le pipeline explicitement demandé lorsqu'il est réellement
+#   exporté par Diffusers (WanPipeline, LTXPipeline, etc.);
+# - UNKNOWN ne conserve jamais DIFFUSERS_VERSION_TOO_OLD.
+_VIDIOAI_V4_PREVIOUS_CHECK_COMPATIBILITY = RuntimeManager.check_compatibility
+
+
+def _vidioai_v4_is_status(value, expected):
+    normalized = str(value or "").strip().upper()
+    return normalized == expected or normalized.endswith("." + expected)
+
+
+def _vidioai_v4_status_member(current, expected):
+    enum_type = type(current)
+    member = getattr(enum_type, expected, None)
+    if member is not None:
+        return member
+
+    compatibility_type = globals().get("CompatibilityStatus")
+    if compatibility_type is not None:
+        member = getattr(compatibility_type, expected, None)
+        if member is not None:
+            return member
+
+    return expected
+
+
+def _vidioai_v4_requested_pipeline_class(payload):
+    if not isinstance(payload, dict):
+        return None
+    for key in ("pipeline_class", "class_name", "_class_name"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _vidioai_v4_diffusers_exports(class_name):
+    if not class_name:
+        return False
+    try:
+        import diffusers
+    except (ImportError, ModuleNotFoundError):
+        return False
+    return getattr(diffusers, class_name, None) is not None
+
+
+def _vidioai_v4_check_compatibility(self, payload, *args, **kwargs):
+    result = _VIDIOAI_V4_PREVIOUS_CHECK_COMPATIBILITY(
+        self,
+        payload,
+        *args,
+        **kwargs,
+    )
+    if not isinstance(result, dict) or not isinstance(payload, dict):
+        return result
+
+    patched = dict(result)
+    library = str(payload.get("library_name") or "diffusers").strip().lower()
+    requested_class = _vidioai_v4_requested_pipeline_class(payload)
+
+    # Le contrat public doit conserver la classe exacte explicitement demandée
+    # lorsque cette classe existe réellement dans la version Diffusers chargée.
+    if (
+        library in {"", "diffusers"}
+        and requested_class
+        and _vidioai_v4_diffusers_exports(requested_class)
+    ):
+        patched["runtime_supported"] = True
+        patched["pipeline_class"] = requested_class
+        patched["compatibility_status"] = _vidioai_v4_status_member(
+            patched.get("compatibility_status"),
+            "SUPPORTED",
+        )
+        if "error_code" in patched:
+            patched["error_code"] = None
+        for key in ("runtime_reason", "compatibility_reason", "reason"):
+            if key in patched and str(patched.get(key) or "").upper().startswith(
+                "DIFFUSERS_VERSION_TOO_OLD"
+            ):
+                patched[key] = None
+        return patched
+
+    # UNKNOWN est non conclusif : un code "version too old" serait contradictoire.
+    if _vidioai_v4_is_status(
+        patched.get("compatibility_status"),
+        "UNKNOWN",
+    ):
+        if "error_code" in patched:
+            patched["error_code"] = None
+
+        neutral = (
+            "Métadonnées Diffusers incomplètes; compatibilité à confirmer "
+            "après inspection du snapshot."
+        )
+        for key in ("runtime_reason", "compatibility_reason", "reason"):
+            value = str(patched.get(key) or "")
+            if "DIFFUSERS_VERSION_TOO_OLD" in value.upper():
+                patched[key] = neutral
+
+    return patched
+
+
+RuntimeManager.check_compatibility = _vidioai_v4_check_compatibility
+
+# VIDIOAI_REMOTE_CODE_PRIORITY_HOTFIX_V6
+#
+# Priorité de sécurité finale :
+# trust_remote_code=True doit toujours gagner sur la détection d'une classe
+# Diffusers installée. Une classe locale existante (ex: WanPipeline) ne rend
+# jamais exécutable un repository qui exige du code distant.
+_VIDIOAI_V6_PREVIOUS_CHECK_COMPATIBILITY = RuntimeManager.check_compatibility
+
+
+def _vidioai_v6_status_member(current, expected):
+    enum_type = type(current)
+    member = getattr(enum_type, expected, None)
+    if member is not None:
+        return member
+
+    compatibility_type = globals().get("CompatibilityStatus")
+    if compatibility_type is not None:
+        member = getattr(compatibility_type, expected, None)
+        if member is not None:
+            return member
+
+    return expected
+
+
+def _vidioai_v6_check_compatibility(self, payload, *args, **kwargs):
+    result = _VIDIOAI_V6_PREVIOUS_CHECK_COMPATIBILITY(
+        self,
+        payload,
+        *args,
+        **kwargs,
+    )
+
+    if not isinstance(result, dict) or not isinstance(payload, dict):
+        return result
+
+    if payload.get("trust_remote_code") is not True:
+        return result
+
+    patched = dict(result)
+    patched["runtime_supported"] = False
+    patched["compatibility_status"] = _vidioai_v6_status_member(
+        patched.get("compatibility_status"),
+        "UNSUPPORTED",
+    )
+    patched["error_code"] = "REMOTE_CODE_REQUIRED"
+
+    reason = (
+        "Le modèle exige trust_remote_code; "
+        "l'exécution de code distant est refusée."
+    )
+    for key in ("runtime_reason", "compatibility_reason", "reason"):
+        if key in patched:
+            patched[key] = reason
+
+    return patched
+
+
+RuntimeManager.check_compatibility = _vidioai_v6_check_compatibility

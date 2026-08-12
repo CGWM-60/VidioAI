@@ -178,6 +178,26 @@ impl HardwareEstimator {
             .unwrap_or_default();
         let (selected_file_bytes, components, _file_quality) =
             select_weight_files(metadata, &precision);
+
+        // Un repository ModularPipeline peut ne contenir que le manifeste et
+        // déléguer ses poids à d'autres repos. Avant matérialisation, ne jamais
+        // présenter la petite taille du repo racine comme une estimation VRAM.
+        if is_modular(metadata)
+            && !metadata.files.iter().any(|file| is_weight(&file.path))
+            && has_modular_external_components(&metadata.config)
+        {
+            return HardwareEstimate {
+                source: HardwareSource::Partial,
+                confidence: EstimateConfidence::Low,
+                recommended_backend: Some("CUDA".into()),
+                supports_cpu_offload: true,
+                notes: vec![
+                    "Repository ModularPipeline détecté.".into(),
+                    "Les composants externes doivent être matérialisés avant de pouvoir estimer précisément VRAM et RAM.".into(),
+                ],
+                ..Default::default()
+            };
+        }
         let parameter_bytes = parameter_count.map(|count| {
             // Comme Accelerate, on estime ici le stockage des tenseurs selon le
             // dtype. Les surcoûts runtime sont ajoutés séparément ci-dessous.
@@ -220,7 +240,7 @@ impl HardwareEstimator {
         };
         let kind = pipeline_kind(metadata);
         let quantization_overhead = match precision.as_str() {
-            "INT4" => 1.18,
+            "INT4" | "FP4" => 1.18,
             "INT8" => 1.10,
             _ => 1.03,
         };
@@ -388,7 +408,17 @@ enum PipelineKind {
 
 fn pipeline_kind(metadata: &HardwareMetadata) -> PipelineKind {
     let pipeline = metadata.pipeline_tag.as_deref().unwrap_or_default();
-    if pipeline.contains("video") {
+    let architecture = metadata
+        .architecture
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let modular = metadata
+        .config
+        .get("_modular_model_index")
+        .map(|value| value.to_string().to_ascii_lowercase())
+        .unwrap_or_default();
+    if pipeline.contains("video") || architecture.contains("video") || modular.contains("video") {
         PipelineKind::Video
     } else if pipeline.contains("image") || is_diffusers(metadata) {
         PipelineKind::Image
@@ -407,12 +437,39 @@ fn pipeline_kind(metadata: &HardwareMetadata) -> PipelineKind {
     }
 }
 
+fn is_modular(metadata: &HardwareMetadata) -> bool {
+    metadata.config.get("_modular_model_index").is_some()
+        || metadata
+            .files
+            .iter()
+            .any(|file| file.path == "modular_model_index.json")
+}
+
+fn has_modular_external_components(config: &Value) -> bool {
+    let Some(index) = config
+        .get("_modular_model_index")
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    index.values().any(|component| {
+        component
+            .as_array()
+            .and_then(|items| items.get(2))
+            .and_then(Value::as_object)
+            .and_then(|loading| loading.get("pretrained_model_name_or_path"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.contains('/'))
+    })
+}
+
 fn is_diffusers(metadata: &HardwareMetadata) -> bool {
     metadata
         .library_name
         .as_deref()
         .is_some_and(|name| name.eq_ignore_ascii_case("diffusers"))
         || metadata.config.get("diffusers").is_some()
+        || is_modular(metadata)
         || metadata
             .files
             .iter()
@@ -467,6 +524,12 @@ fn detect_precision(metadata: &HardwareMetadata) -> String {
     {
         return "INT8".into();
     }
+    if ["nvfp4", "mxfp4", "fp4", "float4"]
+        .iter()
+        .any(|needle| searchable.contains(needle))
+    {
+        return "FP4".into();
+    }
     if searchable.contains("fp8") || searchable.contains("float8") {
         return "FP8".into();
     }
@@ -500,7 +563,7 @@ fn config_dtype(config: &Value) -> Option<String> {
 
 fn bytes_for_parameters(parameters: u64, precision: &str) -> u64 {
     match precision {
-        "INT4" => parameters.div_ceil(2),
+        "INT4" | "FP4" => parameters.div_ceil(2),
         "INT8" | "FP8" => parameters,
         "FP16" | "BF16" => parameters.saturating_mul(2),
         _ => parameters.saturating_mul(4),

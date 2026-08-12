@@ -370,8 +370,11 @@ pub struct ModelView {
     pub input_profile: ModelInputProfile,
     /// Alias métier explicite demandé par le contrat catalogue.
     pub vidioai_supported: bool,
+    pub discovered: bool,
+    pub downloadable: bool,
     pub source_available: bool,
     pub hardware_compatible: bool,
+    pub hardware_compatibility: String,
     /// Capacités libres observées au moment de la réponse. Elles expliquent la
     /// décision et ne doivent pas être confondues avec la capacité physique.
     pub available_ram_bytes: u64,
@@ -600,6 +603,14 @@ pub struct Generation {
     pub actual_duration: Option<f64>,
     #[serde(default)]
     pub audio: bool,
+    #[serde(default)]
+    pub actual_audio: bool,
+    #[serde(default)]
+    pub audio_codec: Option<String>,
+    #[serde(default)]
+    pub audio_channels: Option<u32>,
+    #[serde(default)]
+    pub audio_sample_rate: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2301,43 +2312,50 @@ async fn model_view(state: &AppState, entry: &CatalogEntry) -> ModelView {
 }
 
 fn model_input_profile(runtime_capabilities: &[ModelCapability]) -> ModelInputProfile {
+    let supports_text_to_video = runtime_capabilities.contains(&ModelCapability::TextToVideo);
+    let supports_image_to_video = runtime_capabilities.contains(&ModelCapability::ImageToVideo);
     let supports_start_end = runtime_capabilities.contains(&ModelCapability::StartEndImageToVideo);
     let supports_multi_reference = runtime_capabilities
         .contains(&ModelCapability::MultiImageToVideo)
         || runtime_capabilities.contains(&ModelCapability::KeyframesToVideo);
+    let supports_keyframes = runtime_capabilities.contains(&ModelCapability::KeyframesToVideo);
+    let accepts_images = supports_image_to_video || supports_start_end || supports_multi_reference;
 
+    let mut roles = Vec::new();
+    if supports_image_to_video || supports_start_end {
+        roles.extend(["start".into(), "start_frame".into()]);
+    }
     if supports_start_end {
-        ModelInputProfile {
-            min_input_images: 1,
-            max_input_images: 2,
-            supported_image_roles: vec![
-                "start".into(),
-                "end".into(),
-                "start_frame".into(),
-                "end_frame".into(),
-            ],
-            supports_start_end_frames: true,
-            supports_reference_images: supports_multi_reference,
-            supports_keyframes: runtime_capabilities.contains(&ModelCapability::KeyframesToVideo),
-        }
-    } else if supports_multi_reference {
-        ModelInputProfile {
-            min_input_images: 1,
-            max_input_images: 8,
-            supported_image_roles: vec!["reference".into(), "keyframe".into()],
-            supports_start_end_frames: false,
-            supports_reference_images: true,
-            supports_keyframes: true,
-        }
-    } else {
-        ModelInputProfile {
-            min_input_images: 1,
-            max_input_images: 1,
-            supported_image_roles: Vec::new(),
-            supports_start_end_frames: false,
-            supports_reference_images: false,
-            supports_keyframes: false,
-        }
+        roles.extend(["end".into(), "end_frame".into()]);
+    }
+    if supports_multi_reference {
+        roles.push("reference".into());
+    }
+    if supports_keyframes {
+        roles.push("keyframe".into());
+    }
+
+    ModelInputProfile {
+        min_input_images: if supports_text_to_video {
+            0
+        } else if accepts_images {
+            1
+        } else {
+            0
+        },
+        max_input_images: if supports_multi_reference {
+            8
+        } else if supports_start_end {
+            2
+        } else if supports_image_to_video {
+            1
+        } else {
+            0
+        },
+        supported_image_roles: roles,
+        supports_start_end_frames: supports_start_end,
+        supports_reference_images: supports_multi_reference,
+        supports_keyframes,
     }
 }
 
@@ -2373,6 +2391,9 @@ async fn model_view_with_machine(
                     entry.library.as_deref(),
                     entry.pipeline_tag.as_deref(),
                     &entry.tags,
+                    entry.files.iter().any(|file| {
+                        file.path.rsplit('/').next() == Some("modular_model_index.json")
+                    }),
                 )
                 .await
                 .ok();
@@ -2401,7 +2422,7 @@ async fn model_view_with_machine(
     };
     let runtime_supported = runtime_compatibility == "SUPPORTED";
     let runtime_allowed = runtime_compatibility != "UNSUPPORTED";
-    let runtime_capabilities = if entry.local {
+    let mut runtime_capabilities = if entry.local {
         entry.runtime_capabilities.clone()
     } else {
         runtime_check
@@ -2451,6 +2472,21 @@ async fn model_view_with_machine(
             .as_ref()
             .is_some_and(|status| downloaded && status.installed && status.weights_valid)
     };
+    if let Some(status) = &worker_status
+        && !status.capabilities.is_empty()
+    {
+        let actual_capabilities: Vec<ModelCapability> = status
+            .capabilities
+            .iter()
+            .filter_map(|value| {
+                serde_json::from_value::<ModelCapability>(serde_json::Value::String(value.clone()))
+                    .ok()
+            })
+            .collect();
+        if !actual_capabilities.is_empty() {
+            runtime_capabilities = actual_capabilities;
+        }
+    }
     let runtime_dependencies = worker_status
         .as_ref()
         .map(|status| status.runtime_dependencies.clone())
@@ -2535,15 +2571,44 @@ async fn model_view_with_machine(
     let mut hardware_compatible = hardware_estimate
         .compatible_with_current_machine
         .unwrap_or(false);
+    let mut hardware_compatibility = match hardware_estimate.compatible_with_current_machine {
+        Some(true) => "COMPATIBLE".to_owned(),
+        Some(false) => "UNSUPPORTED".to_owned(),
+        None => "UNKNOWN".to_owned(),
+    };
+    // Après installation, le MemoryPlanner Worker est plus fiable que
+    // l'estimation pré-téléchargement: il connaît tous les composants modular
+    // matérialisés, leurs poids réels, la RAM, la VRAM et le Scratch courant.
+    if let Some(plan) = worker_status
+        .as_ref()
+        .and_then(|status| status.memory_plan.as_ref())
+        && let Some(feasible) = plan.get("feasible").and_then(serde_json::Value::as_bool)
+    {
+        hardware_compatible = feasible;
+        hardware_compatibility = if feasible {
+            "COMPATIBLE".to_owned()
+        } else {
+            "UNSUPPORTED".to_owned()
+        };
+        hardware_estimate.compatible_with_current_machine = Some(feasible);
+        if let Some(strategy) = plan.get("strategy").and_then(serde_json::Value::as_str) {
+            hardware_estimate
+                .notes
+                .push(format!("Plan mémoire Worker réel: {strategy}."));
+        }
+    }
     if !storage_compatible {
         hardware_compatible = false;
         hardware_estimate.compatible_with_current_machine = Some(false);
         hardware_estimate.compatibility_level = "UNSUPPORTED".into();
+        hardware_compatibility = "UNSUPPORTED".into();
         hardware_estimate
             .notes
             .push("Espace disque insuffisant pour le snapshot et sa validation atomique.".into());
     }
     let compatibility_level = hardware_estimate.compatibility_level.clone();
+    let hardware_blocks_install =
+        hardware_estimate.compatible_with_current_machine == Some(false) || !storage_compatible;
     let installation_state = if entry.local {
         "READY".to_owned()
     } else if runtime_compatibility == "UNSUPPORTED" {
@@ -2626,9 +2691,9 @@ async fn model_view_with_machine(
             label: "Fichiers requis",
             ok: entry.quality_valid,
             detail: if entry.quality_valid {
-                "Manifest et poids détectés dans le repository.".into()
+                "Manifest standard/modular et composants ou références de poids détectés.".into()
             } else {
-                "Manifest Diffusers ou poids Safetensors incomplets.".into()
+                "Manifest Diffusers/ModularPipeline incomplet ou non téléchargeable.".into()
             },
         },
     ];
@@ -2637,6 +2702,8 @@ async fn model_view_with_machine(
         && entry.source_available
         && entry.quality_valid
         && (entry.local || machine.runtime_available);
+    let discovered = entry.source_available;
+    let downloadable = entry.source_available && entry.quality_valid && access_ok;
 
     let display_capabilities = if runtime_capabilities.is_empty() {
         entry.capabilities.clone()
@@ -2685,15 +2752,17 @@ async fn model_view_with_machine(
         runtime_capabilities: runtime_capabilities.clone(),
         input_profile: model_input_profile(&runtime_capabilities),
         vidioai_supported: runtime_supported,
+        discovered,
+        downloadable,
         source_available: entry.source_available,
         hardware_compatible,
+        hardware_compatibility,
         available_ram_bytes: available_ram,
         available_vram_bytes: available_vram,
-        installable: entry.source_available
-            && entry.quality_valid
+        installable: downloadable
             && runtime_allowed
-            && compatible
-            && access_ok,
+            && !hardware_blocks_install
+            && (entry.local || machine.runtime_available),
         compatibility_checks,
         accessibility: entry.accessibility.clone(),
         access_authorized: entry.access_authorized,
@@ -5141,6 +5210,10 @@ async fn generate_image(
         actual_frames: None,
         actual_duration: None,
         audio: false,
+        actual_audio: false,
+        audio_codec: None,
+        audio_channels: None,
+        audio_sample_rate: None,
     };
     state
         .generations
@@ -5778,6 +5851,10 @@ async fn generate_video(
         actual_frames: None,
         actual_duration: None,
         audio: request.audio,
+        actual_audio: false,
+        audio_codec: None,
+        audio_channels: None,
+        audio_sample_rate: None,
     };
     update_generation(&state, generation.clone()).await;
     let job = Job {
@@ -5983,6 +6060,7 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
                     &aspect_ratio,
                     duration,
                     requested_fps,
+                    generation.audio,
                 ),
             )
             .await?;
@@ -6002,6 +6080,16 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
             generation.actual_fps = worker_result.actual_fps;
             generation.actual_frames = worker_result.actual_frames;
             generation.actual_duration = worker_result.actual_duration;
+            generation.actual_audio = worker_result.actual_audio;
+            generation.audio_codec = worker_result.audio_codec.clone();
+            generation.audio_channels = worker_result.audio_channels;
+            generation.audio_sample_rate = worker_result.audio_sample_rate;
+            if generation.audio && !generation.actual_audio {
+                return Err(
+                    "NATIVE_AUDIO_NOT_VERIFIED: audio demandé mais le MP4 Worker ne contient pas une piste AAC validée."
+                        .into(),
+                );
+            }
             generation.requested_duration_seconds = worker_result.requested_duration_seconds
                 .or(generation.requested_duration_seconds);
             generation.requested_fps = worker_result.requested_fps
@@ -6079,6 +6167,7 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
                     &aspect_ratio,
                     duration,
                     requested_fps,
+                    generation.audio,
                 ),
             )
             .await?;
@@ -6093,6 +6182,16 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
             generation.actual_fps = worker_result.actual_fps;
             generation.actual_frames = worker_result.actual_frames;
             generation.actual_duration = worker_result.actual_duration;
+            generation.actual_audio = worker_result.actual_audio;
+            generation.audio_codec = worker_result.audio_codec.clone();
+            generation.audio_channels = worker_result.audio_channels;
+            generation.audio_sample_rate = worker_result.audio_sample_rate;
+            if generation.audio && !generation.actual_audio {
+                return Err(
+                    "NATIVE_AUDIO_NOT_VERIFIED: audio demandé mais le MP4 Worker ne contient pas une piste AAC validée."
+                        .into(),
+                );
+            }
             generation.requested_duration_seconds = worker_result.requested_duration_seconds
                 .or(generation.requested_duration_seconds);
             generation.requested_fps = worker_result.requested_fps

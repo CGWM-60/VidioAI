@@ -1257,7 +1257,7 @@ def test_preflight_keeps_model_index_when_optional_root_config_is_absent(
     def fake_hf_hub_download(**kwargs) -> str:
         filename = str(kwargs["filename"])
         attempted.append(filename)
-        if filename == "config.json":
+        if filename in {"modular_model_index.json", "config.json"}:
             raise RemoteEntryNotFoundError("optional root config is absent")
         destination = Path(kwargs["local_dir"]) / filename
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1291,7 +1291,7 @@ def test_preflight_keeps_model_index_when_optional_root_config_is_absent(
         None,
     )
 
-    assert attempted == ["model_index.json", "config.json"]
+    assert attempted == ["modular_model_index.json", "model_index.json", "config.json"]
     assert metadata is not None
     assert metadata["class_name"] == "LTXPipeline"
     assert metadata["compatibility_status"] == "SUPPORTED"
@@ -1400,7 +1400,7 @@ def test_preflight_with_no_optional_metadata_stays_unknown(
         None,
     )
 
-    assert attempted == ["model_index.json", "config.json"]
+    assert attempted == ["modular_model_index.json", "model_index.json", "config.json"]
     assert metadata is not None
     assert metadata["compatibility_status"] == "UNKNOWN"
     assert metadata["runtime_supported"] is False

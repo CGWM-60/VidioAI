@@ -189,7 +189,10 @@ function ModelDetailsContent() {
       </section>
       <section className={`${styles.largePanel} ${styles.detailsGrid}`}>
         <div><span className={styles.eyebrow}>Révision</span><h2>{model.revision.slice(0, 12)}</h2></div>
-        <div><span className={styles.eyebrow}>Compatibilité</span><h2>{model.compatibility_level.replaceAll("_", " ")}</h2></div>
+        <div><span className={styles.eyebrow}>Découvert</span><h2>{model.discovered ? "Oui" : "Non"}</h2></div>
+        <div><span className={styles.eyebrow}>Téléchargeable</span><h2>{model.downloadable ? "Oui" : "Non"}</h2></div>
+        <div><span className={styles.eyebrow}>Runtime</span><h2>{runtimeStatus(model)}</h2></div>
+        <div><span className={styles.eyebrow}>Matériel</span><h2>{model.hardware_compatibility || "UNKNOWN"}</h2></div>
         <div><span className={styles.eyebrow}>Accès</span><h2>{model.accessibility.replaceAll("_", " ")}</h2></div>
       </section>
       {model.repository_url && <section className={styles.largePanel}><h2>Source officielle</h2><a className={styles.repositoryLink} href={model.repository_url} target="_blank" rel="noreferrer">{model.repository}</a></section>}

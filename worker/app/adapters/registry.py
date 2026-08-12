@@ -7,43 +7,101 @@ from .image_to_image import ImageToImageAdapter
 from .text_to_video import TextToVideoAdapter
 from .image_to_video import ImageToVideoAdapter
 from .video_to_video import VideoToVideoAdapter
+from .minimax_h3 import MiniMaxH3Adapter
+from .modular_diffusers import ModularDiffusersAdapter
 from .generic_diffusers import GenericDiffusersAdapter
 
 
 class PipelineRegistry:
     def __init__(self) -> None:
-        self._adapters = [
+        # Les runtimes d'architecture passent avant le runtime Modular générique.
+        # Le choix est fait sur les métadonnées/classes, jamais sur repo_id.
+        self._architecture_adapters = [
+            MiniMaxH3Adapter(),
+        ]
+        self._modular = ModularDiffusersAdapter()
+        self._generic = GenericDiffusersAdapter()
+        self._specialized = [
             TextToImageAdapter(),
             ImageToImageAdapter(),
             TextToVideoAdapter(),
             ImageToVideoAdapter(),
             VideoToVideoAdapter(),
-            # Fallback en dernier: les adapters spécialisés restent prioritaires.
-            GenericDiffusersAdapter(),
+        ]
+        self._adapters = [
+            *self._architecture_adapters,
+            self._modular,
+            *self._specialized,
+            self._generic,
         ]
 
     def capabilities(self) -> list[str]:
-        return [capability for adapter in self._adapters for capability in adapter.capabilities()]
+        return [
+            capability
+            for adapter in self._adapters
+            for capability in adapter.capabilities()
+        ]
 
-    def select_for_capability(self, metadata: dict[str, Any], capability: str):
-        # La pipeline Diffusers reelle est le chemin principal. Les adapters
-        # specialises ne sont que des fallbacks pour les pipelines qui ne sont
-        # pas exposées par la version installee de Diffusers.
-        generic = self._adapters[-1]
-        if generic.supports_model(metadata):
-            discovered = generic.supported_capabilities(metadata)
-            # Une signature opaque est chargee de facon provisoire afin de
-            # pouvoir introspecter l'instance. Cela n'ajoute pas la capability
-            # aux metadonnees et ne la publie pas dans le catalogue.
-            if not discovered or capability in discovered:
-                return generic
-        for adapter in self._adapters[:-1]:
-            if capability in adapter.supported_capabilities(metadata) and adapter.supports_model(metadata):
+    def _architecture_adapter(
+        self,
+        metadata: dict[str, Any],
+    ):
+        for adapter in self._architecture_adapters:
+            if adapter.supports_model(metadata):
                 return adapter
         return None
 
-    def select_for_model(self, metadata: dict[str, Any]):
-        for adapter in self._adapters:
+    def select_for_capability(
+        self,
+        metadata: dict[str, Any],
+        capability: str,
+    ):
+        architecture = self._architecture_adapter(metadata)
+        if architecture is not None:
+            return (
+                architecture
+                if capability
+                in architecture.supported_capabilities(metadata)
+                else None
+            )
+
+        if self._modular.supports_model(metadata):
+            discovered = self._modular.supported_capabilities(
+                metadata
+            )
+            if not discovered or capability in discovered:
+                return self._modular
+            return None
+
+        if self._generic.supports_model(metadata):
+            discovered = self._generic.supported_capabilities(
+                metadata
+            )
+            if not discovered or capability in discovered:
+                return self._generic
+
+        for adapter in self._specialized:
+            if (
+                capability
+                in adapter.supported_capabilities(metadata)
+                and adapter.supports_model(metadata)
+            ):
+                return adapter
+        return None
+
+    def select_for_model(
+        self,
+        metadata: dict[str, Any],
+    ):
+        architecture = self._architecture_adapter(metadata)
+        if architecture is not None:
+            return architecture
+        if self._modular.supports_model(metadata):
+            return self._modular
+        for adapter in [
+            self._generic,
+            *self._specialized,
+        ]:
             if adapter.supports_model(metadata):
                 return adapter
         return None

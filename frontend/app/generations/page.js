@@ -329,12 +329,12 @@ function GenerationsContent() {
           {selectedModel?.installed && !selectedModel.runtime_ready && <div className={styles.warningBanner}>Ce modèle est installé mais pas chargé. Ouvrez sa fiche et lancez « Charger le modèle » avant la génération.</div>}
 
           <div className={styles.videoSettingsRow}>
-            <label className={styles.formGroup}><span>Durée</span><select value={duration} onChange={(event) => setDuration(event.target.value)}><option value="4">4 secondes</option><option value="6">6 secondes</option><option value="10">10 secondes</option><option value="15">15 secondes</option></select></label>
+            <label className={styles.formGroup}><span>Durée</span><select value={duration} onChange={(event) => setDuration(event.target.value)}><option value="4">4 secondes</option><option value="5">5 secondes</option><option value="6">6 secondes</option><option value="10">10 secondes</option><option value="15">15 secondes</option></select></label>
             <label className={styles.formGroup}><span>Qualité</span><select value={quality} onChange={(event) => setQuality(event.target.value)}><option value="480p">Rapide 480p</option><option value="720p">HD 720p</option><option value="1080p">Full HD 1080p</option></select></label>
             <label className={styles.formGroup}><span>Ratio</span><select value={aspectRatio} onChange={(event) => setAspectRatio(event.target.value)}><option value="16:9">16:9 paysage</option><option value="9:16">9:16 portrait</option><option value="1:1">1:1 carré</option></select></label>
             <label className={styles.formGroup}><span>Cadence</span><select value={fps} onChange={(event) => setFps(event.target.value)}><option value="12">12 fps</option><option value="24">24 fps</option><option value="30">30 fps</option></select></label>
           </div>
-          <div className={styles.audioSetting}><span><strong>Ajouter une piste audio silencieuse</strong><small>Crée une piste AAC vide prête pour un mixage ultérieur.</small></span><button type="button" role="switch" aria-checked={audio} onClick={() => setAudio((value) => !value)} className={`${styles.toggle} ${audio ? styles.toggleOn : ""}`}><span /></button></div>
+          <div className={styles.audioSetting}><span><strong>Audio natif du modèle</strong><small>Pour un modèle IA, aucune piste silencieuse n’est substituée : la génération échoue si le runtime ne livre pas une vraie piste audio muxée en AAC.</small></span><button type="button" role="switch" aria-checked={audio} onClick={() => setAudio((value) => !value)} className={`${styles.toggle} ${audio ? styles.toggleOn : ""}`}><span /></button></div>
           <button type="button" className={styles.generateButton} disabled={isRunning || !modelId || !selectedModel?.runtime_ready || prompt.trim().length < 3} onClick={submitGeneration}><BsStars /> {isRunning ? "Génération en cours…" : "Générer la vidéo"}</button>
         </div>
 
@@ -351,6 +351,7 @@ function GenerationsContent() {
             <div><span>Frames générées</span><strong>{generation.actual_frames ?? "—"}</strong></div>
             <div><span>FPS réel</span><strong>{generation.actual_fps ? Number(generation.actual_fps).toFixed(2) : "—"}</strong></div>
             <div><span>Durée réelle</span><strong>{secondsLabel(generation.actual_duration)}</strong></div>
+            <div><span>Audio natif</span><strong>{generation.actual_audio ? `READY · ${generation.audio_codec || "aac"} · ${generation.audio_channels || "?"} ch · ${generation.audio_sample_rate || "?"} Hz` : generation.audio ? "Non livré" : "Non demandé"}</strong></div>
           </div>}
           {generation?.status === "failed" && <div className={styles.errorBanner}>{generationErrorMessage(generation)}</div>}
           <div className={styles.videoResultActions}>

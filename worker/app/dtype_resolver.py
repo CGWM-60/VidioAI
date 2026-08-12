@@ -99,7 +99,11 @@ class DTypeResolver:
     def _quantization(metadata: dict[str, Any]) -> str | None:
         config = metadata.get("quantization_config")
         if not isinstance(config, dict):
-            for container in (metadata.get("config"), metadata.get("model_index")):
+            for container in (
+                metadata.get("config"),
+                metadata.get("model_index"),
+                metadata.get("modular_model_index"),
+            ):
                 if isinstance(container, dict) and isinstance(container.get("quantization_config"), dict):
                     config = container["quantization_config"]
                     break
@@ -133,7 +137,7 @@ class DTypeResolver:
 
         # Dtype global du modele avant toute declaration de composant.
         model_explicit: list[tuple[str, str]] = []
-        for name in ("config", "model_index"):
+        for name in ("config", "model_index", "modular_model_index"):
             container = metadata.get(name)
             if isinstance(container, dict):
                 for key in self._DTYPE_KEYS:
@@ -214,7 +218,13 @@ class DTypeResolver:
     @classmethod
     def inspect_components(cls, pipeline: Any) -> list[ComponentPrecisionPlan]:
         result: list[ComponentPrecisionPlan] = []
-        for name in cls._COMPONENTS:
+        names = list(cls._COMPONENTS)
+        names.extend(
+            str(value)
+            for value in getattr(pipeline, "_vidioai_modular_component_names", [])
+            if str(value)
+        )
+        for name in dict.fromkeys(names):
             component = getattr(pipeline, name, None)
             if component is None:
                 continue

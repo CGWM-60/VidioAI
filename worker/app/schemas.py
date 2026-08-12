@@ -85,6 +85,7 @@ class CompatibilityRequest(BaseModel):
     architectures: list[str] = Field(default_factory=list)
     base_models: list[str] = Field(default_factory=list)
     trust_remote_code: bool = False
+    is_modular: bool = False
 
 
 class GenerateImageRequest(BaseModel):
@@ -131,6 +132,7 @@ class GenerateVideoRequest(BaseModel):
     input_path: str | None = Field(default=None, max_length=2048)
     mask_path: str | None = Field(default=None, max_length=2048)
     input_images: list[dict[str, Any]] = Field(default_factory=list)
+    audio: bool = False
 
 
 class UnsupportedGenerationRequest(BaseModel):

@@ -33,6 +33,7 @@ class DependencyRegistry:
 
     _SPECS = {
         "bitsandbytes": DependencySpec("bitsandbytes", "bitsandbytes", "0.49.2"),
+        "torchao": DependencySpec("torchao", "torchao", "0.17.0"),
         "sentencepiece": DependencySpec("sentencepiece", "sentencepiece", "0.2.2"),
         "einops": DependencySpec("einops", "einops", "0.8.2"),
         "peft": DependencySpec("peft", "peft", "0.20.0"),
@@ -105,7 +106,12 @@ class DependencyResolver:
         # requirements.txt, modules Python et custom pipelines sont ignorés.
         payloads: list[Any] = [metadata or {}]
         for path in sorted(snapshot.rglob("*.json")):
-            if path.name not in {"config.json", "model_index.json", "quantization_config.json"}:
+            if path.name not in {
+                "config.json",
+                "model_index.json",
+                "modular_model_index.json",
+                "quantization_config.json",
+            }:
                 continue
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
