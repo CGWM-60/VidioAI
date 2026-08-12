@@ -336,6 +336,8 @@ pub struct ModelView {
     pub cache_error: Option<String>,
     pub runtime_dependencies: Vec<serde_json::Value>,
     pub runtime_precision: Option<serde_json::Value>,
+    /// Composition effective: modèle de base + LoRA(s) + recette.
+    pub bundle: serde_json::Value,
     /// `true` uniquement lorsqu'un runtime exploitable a été validé. Un simple
     /// manifeste Hugging Face ne doit jamais être présenté comme un modèle prêt.
     pub runtime_ready: bool,
@@ -617,6 +619,8 @@ pub struct GenerateImageRequest {
     pub prompt: String,
     pub negative_prompt: Option<String>,
     pub model_id: Option<String>,
+    #[serde(default)]
+    pub quality: Option<String>,
     pub input_asset_id: Option<Uuid>,
     pub mask_asset_id: Option<Uuid>,
     pub control_asset_id: Option<Uuid>,
@@ -2466,13 +2470,31 @@ async fn model_view_with_machine(
         .as_ref()
         .and_then(|job| job.cache_status.clone())
         .unwrap_or_else(|| {
-            if state.object_storage.enabled() && installed {
+            if state.object_storage.enabled() && installed && auto_cache_models_enabled() {
                 "CACHE_UNKNOWN".into()
+            } else if state.object_storage.enabled() && installed {
+                "CACHE_MANUAL".into()
             } else {
                 "CACHE_DISABLED".into()
             }
         });
     let cache_error = cache_job.and_then(|job| job.cache_error);
+    let bundle = worker_status
+        .as_ref()
+        .and_then(|status| status.bundle.clone())
+        .unwrap_or_else(|| {
+            json!({
+                "schema_version": 1,
+                "base_model": {
+                    "repository": entry.repository.clone(),
+                    "revision": entry.revision.clone(),
+                },
+                "loras": [],
+                "recipe": {
+                    "quality_mode": "native",
+                },
+            })
+        });
     let runtime_ready = entry.local || worker_status.as_ref().is_some_and(worker_reports_ready);
     let available_ram = machine.available_ram_bytes;
     let available_vram = machine.available_vram_bytes;
@@ -2635,6 +2657,7 @@ async fn model_view_with_machine(
         cache_error,
         runtime_dependencies,
         runtime_precision,
+        bundle,
         runtime_ready,
         installation_state,
         compatible,
@@ -2885,13 +2908,17 @@ async fn install_model(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<Job>), ApiError> {
-    start_model_install(state, id, None).await
+    start_model_install(state, id, None, None, None).await
 }
 
 #[derive(Debug, Deserialize)]
 struct InstallModelInput {
     model_id: String,
     revision: Option<String>,
+    #[serde(default)]
+    loras: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    recipe: Option<serde_json::Value>,
 }
 
 /// Route recommandée : le repository reste dans le JSON et ne dépend donc pas
@@ -2900,20 +2927,47 @@ async fn install_model_from_body(
     State(state): State<Arc<AppState>>,
     Json(input): Json<InstallModelInput>,
 ) -> Result<(StatusCode, Json<Job>), ApiError> {
-    start_model_install(state, input.model_id, input.revision).await
+    start_model_install(
+        state,
+        input.model_id,
+        input.revision,
+        input.loras,
+        input.recipe,
+    )
+    .await
+}
+
+fn auto_cache_models_enabled() -> bool {
+    std::env::var("VIDIOAI_AUTO_CACHE_MODELS").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 async fn start_model_install(
     state: Arc<AppState>,
     id: String,
     requested_revision: Option<String>,
+    loras: Option<Vec<serde_json::Value>>,
+    recipe: Option<serde_json::Value>,
 ) -> Result<(StatusCode, Json<Job>), ApiError> {
     state.ensure_accepting_jobs().await?;
     let mut entry = resolve_model(&state, &id).await?;
+    let bundle_configuration_requested = loras.is_some() || recipe.is_some();
     if let Some(revision) = requested_revision {
-        if revision != entry.revision {
+        let matches_installed = if bundle_configuration_requested {
+            installed_revision(&state, &entry)
+                .await
+                .as_deref()
+                .is_some_and(|installed| installed == revision)
+        } else {
+            false
+        };
+        if revision != entry.revision && !matches_installed {
             return Err(ApiError::conflict(
-                "La révision demandée n'est plus la révision publiée par Hugging Face.",
+                "La révision demandée n'est ni la révision publiée ni la révision locale installée.",
             ));
         }
         entry.revision = revision;
@@ -2924,8 +2978,17 @@ async fn start_model_install(
     // Une installation déjà à la révision courante est idempotemment refusée,
     // mais une révision distante plus récente suit le même job atomique : c'est
     // la voie de mise à jour, sans route spéciale ni perte de l'ID original.
-    if view.installed && !view.update_available {
+    if view.installed && !view.update_available && !bundle_configuration_requested {
         return Err(ApiError::conflict("Ce modèle est déjà installé."));
+    }
+    if bundle_configuration_requested && view.loaded {
+        if let Some(worker) = &state.worker {
+            worker
+                .unload(&entry.storage_id)
+                .await
+                .map_err(ApiError::unavailable)?;
+        }
+        state.runtime.write().await.remove(&entry.id);
     }
     if (entry.gated || entry.private) && entry.access_checked && !entry.access_authorized {
         return Err(ApiError::unauthorized(
@@ -2955,8 +3018,10 @@ async fn start_model_install(
         message: "Vérification du modèle".into(),
         transfer: None,
         dependency: None,
-        cache_status: if state.object_storage.enabled() {
+        cache_status: if state.object_storage.enabled() && auto_cache_models_enabled() {
             Some("CACHE_PENDING".into())
+        } else if state.object_storage.enabled() {
+            Some("CACHE_MANUAL".into())
         } else {
             None
         },
@@ -2972,7 +3037,7 @@ async fn start_model_install(
     let worker_state = state.clone();
     let worker_job = job.clone();
     tokio::spawn(async move {
-        run_install(worker_state, worker_job, entry).await;
+        run_install(worker_state, worker_job, entry, loras, recipe).await;
     });
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
@@ -3779,6 +3844,8 @@ async fn run_cloud_restore(
                 &manifest.repository,
                 &manifest.revision,
                 &manifest.capabilities,
+                None,
+                None,
             )
             .await;
         let _installed = match installed_result {
@@ -3955,7 +4022,13 @@ async fn upload_model_cache(
 
 /// Worker d'installation : téléchargement en flux, progression mesurée sur le
 /// staging, vérification par SHA-256, installation atomique et état READY.
-async fn run_install(state: Arc<AppState>, job: Job, entry: CatalogEntry) {
+async fn run_install(
+    state: Arc<AppState>,
+    job: Job,
+    entry: CatalogEntry,
+    loras: Option<Vec<serde_json::Value>>,
+    recipe: Option<serde_json::Value>,
+) {
     let result: Result<Option<String>, String> = async {
         let worker = state.worker.as_ref().ok_or_else(|| {
             "VIDIOAI_WORKER_URL est obligatoire pour installer des poids IA.".to_owned()
@@ -3971,9 +4044,10 @@ async fn run_install(state: Arc<AppState>, job: Job, entry: CatalogEntry) {
             .await;
         let settings = state.settings.get().await;
         let model_root = settings.models_dir.join(&entry.storage_id);
-        if state.object_storage.enabled() {
-            // L1 est la VRAM du worker, L2 le volume scratch `models_dir`, L3 le
-            // préfixe S3 validé par manifeste. Un échec n'empêche pas HF de remplir L2.
+        let bundle_configuration_requested = loras.is_some() || recipe.is_some();
+        if state.object_storage.enabled() && !bundle_configuration_requested {
+            // Une reconfiguration de bundle garde le snapshot local exact et
+            // évite un restore S3 inutile avant de modifier LoRA/recette.
             let _ = restore_model_cache(&state, &entry, &model_root).await;
         }
         state
@@ -4001,6 +4075,8 @@ async fn run_install(state: Arc<AppState>, job: Job, entry: CatalogEntry) {
             &entry.repository,
             &entry.revision,
             &install_capabilities,
+            loras.as_deref(),
+            recipe.as_ref(),
         ));
         let installed = loop {
             tokio::select! {
@@ -4087,7 +4163,7 @@ async fn run_install(state: Arc<AppState>, job: Job, entry: CatalogEntry) {
             .to_owned();
         let snapshot_root = model_root.join(&resolved_revision);
         let mut cache_error = None;
-        if state.object_storage.enabled() {
+        if state.object_storage.enabled() && auto_cache_models_enabled() {
             state
                 .update_job(
                     job.id,
@@ -5054,7 +5130,7 @@ async fn generate_image(
         duration_seconds: None,
         requested_duration_seconds: None,
         resolution: None,
-        requested_quality: None,
+        requested_quality: request.quality,
         requested_aspect_ratio: None,
         requested_fps: None,
         requested_frames: None,
@@ -5257,6 +5333,7 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
                         &storage_id(&generation.model_id),
                         &generation.prompt,
                         generation.negative_prompt.as_deref(),
+                        generation.requested_quality.as_deref(),
                         &relative,
                         None,
                         None,
@@ -5378,6 +5455,7 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
                         &storage_id(&generation.model_id),
                         &generation.prompt,
                         generation.negative_prompt.as_deref(),
+                        generation.requested_quality.as_deref(),
                         &relative,
                         Some(&input_path.to_string_lossy()),
                         mask_path
@@ -6675,6 +6753,7 @@ mod tests {
             runtime_dependencies: vec![],
             precision_plan: None,
             memory_plan: None,
+            bundle: None,
             capabilities: vec![],
             capability: None,
             pipeline_class: None,
@@ -6703,6 +6782,7 @@ mod tests {
             runtime_dependencies: vec![],
             precision_plan: None,
             memory_plan: None,
+            bundle: None,
             capabilities: vec![],
             capability: None,
             pipeline_class: None,
@@ -6731,6 +6811,7 @@ mod tests {
             runtime_dependencies: vec![],
             precision_plan: None,
             memory_plan: None,
+            bundle: None,
             capabilities: vec![],
             capability: None,
             pipeline_class: None,

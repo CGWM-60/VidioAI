@@ -156,6 +156,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             request.repository,
             request.revision,
             request.capabilities,
+            (
+                [
+                    item.model_dump(exclude_none=True)
+                    for item in request.loras
+                ]
+                if request.loras is not None
+                else None
+            ),
+            (
+                request.recipe.model_dump(exclude_none=True)
+                if request.recipe is not None
+                else None
+            ),
         )
 
     @application.post("/v1/models/load")

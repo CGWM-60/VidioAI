@@ -9,8 +9,12 @@ from .base import RuntimeAdapter, log_diffusers_call
 class ImageToImageAdapter(RuntimeAdapter):
     def capabilities(self) -> list[str]:
         return [
-            "IMAGE_TO_IMAGE", "INPAINTING", "OUTPAINTING",
-            "IMAGE_VARIATION", "IMAGE_UPSCALE", "CONTROLLED_IMAGE_GENERATION",
+            "IMAGE_TO_IMAGE",
+            "INPAINTING",
+            "OUTPAINTING",
+            "IMAGE_VARIATION",
+            "IMAGE_UPSCALE",
+            "CONTROLLED_IMAGE_GENERATION",
         ]
 
     def supports_model(self, metadata: dict[str, Any]) -> bool:
@@ -27,8 +31,16 @@ class ImageToImageAdapter(RuntimeAdapter):
             "ram_bytes": 10 * 1024 * 1024 * 1024,
         }
 
-    def load(self, snapshot: str, settings: dict[str, Any], runtime: Any) -> Any:
-        from diffusers import AutoPipelineForImage2Image, DiffusionPipeline
+    def load(
+        self,
+        snapshot: str,
+        settings: dict[str, Any],
+        runtime: Any,
+    ) -> Any:
+        from diffusers import (
+            AutoPipelineForImage2Image,
+            DiffusionPipeline,
+        )
 
         try:
             return AutoPipelineForImage2Image.from_pretrained(
@@ -48,8 +60,18 @@ class ImageToImageAdapter(RuntimeAdapter):
     def unload(self, pipeline: Any, runtime: Any) -> None:
         del pipeline
 
-    def generate(self, pipeline: Any, runtime: Any, request: dict[str, Any]) -> dict[str, Any]:
-        capability = str(request.get("capability") or "IMAGE_TO_IMAGE").upper()
+    def generate(
+        self,
+        pipeline: Any,
+        runtime: Any,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        capability = str(
+            request.get("capability") or "IMAGE_TO_IMAGE"
+        ).upper()
+
+        # Aucun default universel. La recette résolue par RuntimeManager est
+        # explicite ; tout le reste est laissé au default natif de Diffusers.
         kwargs: dict[str, Any] = {
             "prompt": request.get("prompt"),
             "negative_prompt": request.get("negative_prompt"),
@@ -57,28 +79,32 @@ class ImageToImageAdapter(RuntimeAdapter):
             "generator": runtime.get("generator"),
             "mask_image": request.get("mask_image"),
             "control_image": request.get("control_image"),
+            "width": request.get("width"),
+            "height": request.get("height"),
+            "num_inference_steps": request.get("steps"),
+            "guidance_scale": request.get("guidance_scale"),
+            "true_cfg_scale": request.get("true_cfg_scale"),
+            "strength": request.get("strength"),
+            "max_sequence_length": request.get("max_sequence_length"),
         }
-
-        if request.get("strength") is not None:
-            kwargs["strength"] = request.get("strength")
-        if request.get("steps") is not None:
-            kwargs["num_inference_steps"] = request.get("steps")
-        if request.get("guidance_scale") is not None:
-            kwargs["guidance_scale"] = request.get("guidance_scale")
-        if request.get("width") is not None:
-            kwargs["width"] = request.get("width")
-        if request.get("height") is not None:
-            kwargs["height"] = request.get("height")
 
         if capability == "IMAGE_VARIATION":
             kwargs.pop("strength", None)
 
-        accepted = set(inspect.signature(pipeline.__call__).parameters)
+        accepted = set(
+            inspect.signature(pipeline.__call__).parameters
+        )
         filtered = {
             key: value
             for key, value in kwargs.items()
             if key in accepted and value is not None
         }
-        log_diffusers_call(pipeline, filtered, capability)
+        log_diffusers_call(
+            pipeline,
+            filtered,
+            capability,
+        )
         output = pipeline(**filtered)
-        return {"images": getattr(output, "images", [])}
+        return {
+            "images": getattr(output, "images", []),
+        }

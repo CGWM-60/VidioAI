@@ -13,7 +13,8 @@ def log_diffusers_call(pipeline: Any, kwargs: dict[str, Any], capability: str) -
     """Journalise le contrat d'appel sans contenu utilisateur ni asset privé."""
     public_scalars = {
         "width", "height", "num_frames", "video_length", "fps",
-        "num_inference_steps", "guidance_scale", "strength", "decode_chunk_size",
+        "num_inference_steps", "guidance_scale", "true_cfg_scale",
+        "strength", "max_sequence_length", "decode_chunk_size",
     }
     parameters = {
         key: value if key in public_scalars and isinstance(value, (int, float, bool, str))

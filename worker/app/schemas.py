@@ -41,11 +41,36 @@ class CompatibilityStatus(StrEnum):
     UNSUPPORTED = "UNSUPPORTED"
 
 
+class LoraSpec(BaseModel):
+    repository: str = Field(min_length=3, max_length=256)
+    revision: str = Field(default="main", min_length=1, max_length=128)
+    adapter_name: str | None = Field(default=None, min_length=1, max_length=64)
+    weight_name: str | None = Field(default=None, min_length=1, max_length=512)
+    scale: float = Field(default=1.0, ge=0.0, le=2.0)
+    enabled: bool = True
+
+
+class InferenceRecipe(BaseModel):
+    quality_mode: Literal["native", "fast", "balanced", "quality"] = "native"
+    width: int | None = Field(default=None, ge=64, le=2048)
+    height: int | None = Field(default=None, ge=64, le=2048)
+    num_inference_steps: int | None = Field(default=None, ge=1, le=100)
+    guidance_scale: float | None = Field(default=None, ge=0.0, le=30.0)
+    true_cfg_scale: float | None = Field(default=None, ge=0.0, le=30.0)
+    strength: float | None = Field(default=None, ge=0.0, le=1.0)
+    max_sequence_length: int | None = Field(default=None, ge=16, le=8192)
+    inference_fps: int | None = Field(default=None, ge=1, le=60)
+
+
 class InstallModelRequest(BaseModel):
     model_id: str = Field(min_length=2, max_length=128)
     repository: str = Field(min_length=3, max_length=256)
     revision: str = Field(default="main", min_length=1, max_length=128)
     capabilities: list[str] = Field(default_factory=lambda: ["TEXT_TO_IMAGE"])
+    # None = ne pas modifier le bundle lors d'une installation idempotente.
+    # [] = retirer tous les LoRA.
+    loras: list[LoraSpec] | None = None
+    recipe: InferenceRecipe | None = None
 
 
 class ModelRequest(BaseModel):
@@ -70,10 +95,12 @@ class GenerateImageRequest(BaseModel):
     output_relative_path: str = Field(min_length=5, max_length=512)
     width: int | None = Field(default=None, ge=64, le=2048)
     height: int | None = Field(default=None, ge=64, le=2048)
-    quality: str | None = Field(default=None, max_length=16)
+    quality: Literal["native", "fast", "balanced", "quality"] | None = None
     steps: int | None = Field(default=None, ge=1, le=100)
     guidance_scale: float | None = Field(default=None, ge=0.0, le=30.0)
+    true_cfg_scale: float | None = Field(default=None, ge=0.0, le=30.0)
     strength: float | None = Field(default=None, ge=0.0, le=1.0)
+    max_sequence_length: int | None = Field(default=None, ge=16, le=8192)
     capability: str | None = Field(default=None, max_length=32)
     seed: int | None = Field(default=None, ge=0)
     input_path: str | None = Field(default=None, max_length=2048)
@@ -93,6 +120,9 @@ class GenerateVideoRequest(BaseModel):
     aspect_ratio: Literal["16:9", "9:16", "1:1"] = "16:9"
     steps: int | None = Field(default=None, ge=1, le=100)
     guidance_scale: float | None = Field(default=None, ge=0.0, le=30.0)
+    true_cfg_scale: float | None = Field(default=None, ge=0.0, le=30.0)
+    max_sequence_length: int | None = Field(default=None, ge=16, le=8192)
+    inference_fps: int | None = Field(default=None, ge=1, le=60)
     duration_seconds: int | None = Field(default=None, ge=1, le=20)
     fps: int | None = Field(default=None, ge=1, le=60)
     frames: int | None = Field(default=None, ge=1, le=180)

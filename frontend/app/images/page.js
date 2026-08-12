@@ -46,6 +46,7 @@ export default function ImagesPage() {
   const [modelId, setModelId] = useState("");
   const [prompt, setPrompt] = useState("Une voiture volante traverse une ville futuriste au coucher du soleil, ambiance cinématographique.");
   const [negativePrompt, setNegativePrompt] = useState("");
+  const [imageQuality, setImageQuality] = useState("quality");
   const [sourceAsset, setSourceAsset] = useState(null);
   const [sourcePreview, setSourcePreview] = useState("");
   const [generation, setGeneration] = useState(null);
@@ -164,6 +165,7 @@ export default function ImagesPage() {
           prompt,
           negative_prompt: negativePrompt || null,
           model_id: selectedModelId,
+          quality: imageQuality,
           input_asset_id: activeMode.needsSource ? sourceAsset.id : null,
           mask_asset_id: ["INPAINTING", "OUTPAINTING"].includes(mode) ? maskAsset?.id || null : null,
           control_asset_id: mode === "CONTROLLED_IMAGE_GENERATION" ? controlAsset?.id || null : null,
@@ -230,12 +232,13 @@ export default function ImagesPage() {
           <label className={styles.formGroup}><span>Prompt <small>{prompt.length} / 1000</small></span><textarea maxLength={1000} rows={5} value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
           <label className={styles.formGroup}><span>Prompt négatif <small>(optionnel)</small></span><textarea maxLength={1000} rows={2} value={negativePrompt} onChange={(event) => setNegativePrompt(event.target.value)} placeholder="flou, texte, watermark…" /></label>
           <label className={styles.formGroup}><span>Modèle</span><select value={selectedModelId} onChange={(event) => setModelId(event.target.value)}>{availableModels.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.engine}</option>)}</select></label>
+          <label className={styles.formGroup}><span>Qualité</span><select value={imageQuality} onChange={(event) => setImageQuality(event.target.value)}><option value="quality">Quality</option><option value="balanced">Balanced</option><option value="fast">Fast</option><option value="native">Native pipeline</option></select></label>
           {!availableModels.length && <div className={styles.warningBanner}>Aucun modèle {CAPABILITY_LABELS[mode] || mode} installé et READY. Le pipeline n’est pas remplacé par une génération factice.</div>}
 
           <div className={styles.presetGrid}>
             <div className={styles.selectedPreset}><BsCheckCircleFill /><strong>Réaliste</strong><small>Style</small></div>
             <div><strong>1:1</strong><small>Ratio</small></div>
-            <div><strong>1024p</strong><small>Qualité</small></div>
+            <div><strong>{imageQuality === "quality" ? "Quality" : imageQuality}</strong><small>Recette</small></div>
           </div>
           <button className={styles.generateButton} disabled={busy || uploading || !selectedModelId || prompt.trim().length < 3}><BsStars /> {busy ? "Génération en cours…" : `Lancer ${CAPABILITY_LABELS[mode] || "la génération"}`}</button>
           <p className={styles.costNote}>Exécution locale · aucun crédit externe utilisé</p>

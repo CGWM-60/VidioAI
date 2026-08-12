@@ -37,6 +37,8 @@ from .pipeline_resolver import PipelineResolutionError, PipelineResolver
 from .dependency_installer import DependencyInstaller
 from .dependency_resolver import DependencyResolutionError, DependencyResolver
 from .model_profile import ModelRuntimeProfile
+from .model_bundle import BundleError, ModelBundleManager
+from .inference_recipe import InferenceRecipeResolver, RecipeError
 from .resolution_resolver import ResolutionResolver
 from .config import Settings
 from .dtype_resolver import DTypeResolver, PrecisionPlan
@@ -82,6 +84,7 @@ class LoadedModel:
     metadata: dict[str, Any] | None = None
     precision_plan: PrecisionPlan | None = None
     memory_plan: MemoryPlan | None = None
+    bundle: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +119,8 @@ class RuntimeManager:
         self._memory_planner = MemoryPlanner()
         self._video_frame_planner = VideoFramePlanner()
         self._resolution_resolver = ResolutionResolver()
+        self._bundle_manager = ModelBundleManager()
+        self._inference_recipe = InferenceRecipeResolver()
         self._input_normalizer = InputNormalizer(self.settings.work_dir)
         self._output_normalizer = OutputNormalizer(self.settings.work_dir)
 
@@ -1152,6 +1157,8 @@ class RuntimeManager:
         repository: str,
         revision: str,
         capabilities: list[str],
+        loras: list[dict[str, Any]] | None = None,
+        recipe: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         model_id = self._safe_segment(model_id)
         self._log_model_state(model_id, "DISCOVERED", "COMPATIBILITY_CHECK")
@@ -1166,12 +1173,63 @@ class RuntimeManager:
 
         if snapshot is not None and pointer is not None and pointer.get("revision") == revision:
             try:
+                if loras is not None or recipe is not None:
+                    with self._lock:
+                        if model_id in self._loaded:
+                            raise WorkerError(
+                                "Déchargez le modèle avant de modifier ses LoRA ou sa recette.",
+                                409,
+                                code="MODEL_MUST_BE_UNLOADED",
+                                retryable=False,
+                            )
+                    manifest = self._read_manifest(snapshot)
+                    normalized_recipe = (
+                        self._inference_recipe.normalize_recipe(recipe)
+                        if recipe is not None
+                        else None
+                    )
+                    bundle = self._bundle_manager.materialize(
+                        snapshot=snapshot,
+                        repository=str(pointer.get("repository") or repository),
+                        revision=str(pointer["revision"]),
+                        loras=loras,
+                        recipe=normalized_recipe,
+                        token=self._hf_token(),
+                        cache_dir=self.settings.hf_home,
+                        preserve_existing=True,
+                    )
+                    manifest = {
+                        **manifest,
+                        "bundle": bundle,
+                        "updated_at": int(time.time()),
+                    }
+                    manifest_path = snapshot / "vidioai-model.json"
+                    temporary_manifest = manifest_path.with_suffix(".json.tmp")
+                    temporary_manifest.write_text(
+                        json.dumps(manifest, indent=2),
+                        encoding="utf-8",
+                    )
+                    os.replace(temporary_manifest, manifest_path)
                 return self._cached_install_status(
                     model_id,
                     snapshot,
                     pointer,
                     capabilities,
                 )
+            except BundleError as error:
+                raise WorkerError(
+                    str(error),
+                    error.status_code,
+                    code=error.code,
+                    retryable=error.retryable,
+                ) from error
+            except RecipeError as error:
+                raise WorkerError(
+                    str(error),
+                    422,
+                    code=error.code,
+                    retryable=False,
+                ) from error
             except WorkerError as error:
                 # Un ancien snapshot valide mais incompatible ne doit pas être
                 # présenté comme installé. On ne retélécharge pas la même révision
@@ -1182,6 +1240,7 @@ class RuntimeManager:
                     "PIPELINE_CLASS_NOT_AVAILABLE",
                     "REMOTE_CODE_REQUIRED",
                     "UNSUPPORTED_LIBRARY",
+                    "MODEL_MUST_BE_UNLOADED",
                 }:
                     self._mark_failed(
                         model_id,
@@ -1335,6 +1394,37 @@ class RuntimeManager:
                 raise self._unsupported_pipeline_error(metadata)
 
             runtime_capabilities = list(metadata.get("capabilities") or [])
+            try:
+                normalized_recipe = (
+                    self._inference_recipe.normalize_recipe(recipe)
+                    if recipe is not None
+                    else {}
+                )
+                bundle = self._bundle_manager.materialize(
+                    snapshot=temporary,
+                    repository=repository,
+                    revision=resolved_revision,
+                    loras=loras,
+                    recipe=normalized_recipe,
+                    token=hf_token,
+                    cache_dir=self.settings.hf_home,
+                    preserve_existing=False,
+                )
+            except BundleError as error:
+                raise WorkerError(
+                    str(error),
+                    error.status_code,
+                    code=error.code,
+                    retryable=error.retryable,
+                ) from error
+            except RecipeError as error:
+                raise WorkerError(
+                    str(error),
+                    422,
+                    code=error.code,
+                    retryable=False,
+                ) from error
+
             destination = self._model_root(model_id) / resolved_revision
             destination.parent.mkdir(parents=True, exist_ok=True)
             if destination.exists():
@@ -1356,6 +1446,7 @@ class RuntimeManager:
                 "loaded": False,
                 "ready": False,
                 "state": ModelState.INSTALLED,
+                "bundle": bundle,
                 "runtime_dependencies": runtime_dependencies,
                 "installed_at": int(time.time()),
                 **validation,
@@ -1805,6 +1896,25 @@ class RuntimeManager:
                 "capability": capability,
             },
         )
+        manifest = self._read_manifest(snapshot)
+        bundle = self._bundle_manager.bundle_from_manifest(
+            manifest,
+            repository=str(manifest.get("repository") or ""),
+            revision=str(manifest.get("revision") or snapshot.name),
+        )
+        try:
+            pipeline = self._bundle_manager.apply_loras(
+                pipeline,
+                snapshot,
+                bundle,
+            )
+        except BundleError as error:
+            raise WorkerError(
+                str(error),
+                error.status_code,
+                code=error.code,
+                retryable=error.retryable,
+            ) from error
         pipeline = self._apply_memory_plan(pipeline, memory_plan, device)
         capability_sets = CapabilityResolver().describe(metadata, pipeline)
         resolved_capabilities = capability_sets["runtime_capabilities"]
@@ -1950,6 +2060,11 @@ class RuntimeManager:
             raise WorkerError(status["error"], 503, code="RUNTIME_UNAVAILABLE")
 
         metadata, manifest = self._effective_snapshot_metadata(snapshot)
+        bundle = self._bundle_manager.bundle_from_manifest(
+            manifest,
+            repository=str(pointer.get("repository") or ""),
+            revision=str(pointer.get("revision") or snapshot.name),
+        )
         capability = self._resolve_supported_capability(
             metadata,
             manifest.get("requested_capabilities") or manifest.get("capabilities"),
@@ -2047,7 +2162,13 @@ class RuntimeManager:
             )
         except Exception as error:
             code = error.code if isinstance(
-                error, (WorkerError, PipelineResolutionError, DependencyResolutionError)
+                error,
+                (
+                    WorkerError,
+                    PipelineResolutionError,
+                    DependencyResolutionError,
+                    BundleError,
+                ),
             ) else "LOAD_FAILED"
             self._log_model_state(model_id, "LOADING", "FAILED", reason=code)
             status = {
@@ -2084,6 +2205,10 @@ class RuntimeManager:
                     "DEPENDENCY_PLATFORM_UNSUPPORTED",
                     "PIPELINE_CLASS_NOT_AVAILABLE",
                     "INVALID_MODEL_SNAPSHOT",
+                    "LORA_UNSUPPORTED",
+                    "LORA_LOAD_FAILED",
+                    "LORA_LOCAL_SNAPSHOT_INVALID",
+                    "LORA_SCALE_UNSUPPORTED",
                 }
                 else 503,
                 code=code,
@@ -2154,6 +2279,7 @@ class RuntimeManager:
             metadata=metadata,
             precision_plan=precision_plan,
             memory_plan=memory_plan,
+            bundle=bundle,
         )
         precision_plan.components = self._dtype_resolver.inspect_components(pipeline)
         status = {
@@ -2179,6 +2305,7 @@ class RuntimeManager:
             "precision_plan": precision_plan.as_dict(),
             "memory_plan": memory_plan.as_dict(),
             "memory_strategy": memory_plan.strategy,
+            "bundle": bundle,
             "stage": "ready",
         }
         with self._lock:
@@ -2642,6 +2769,25 @@ class RuntimeManager:
             requested_capability,
         )
         prepared_request = self._resolve_generation_inputs(request, loaded.pipeline)
+        try:
+            recipe_plan = self._inference_recipe.resolve(
+                pipeline=loaded.pipeline,
+                request=prepared_request,
+                bundle=loaded.bundle or {},
+            )
+        except RecipeError as error:
+            raise WorkerError(
+                str(error),
+                422,
+                code=error.code,
+                retryable=False,
+            ) from error
+        for key, value in recipe_plan.values.items():
+            if key == "num_inference_steps":
+                prepared_request["steps"] = value
+            else:
+                prepared_request[key] = value
+        prepared_request["recipe_plan"] = recipe_plan.as_dict()
         is_video_request = requested_capability in VIDEO_CAPABILITIES
         frame_plan = None
         if is_video_request:
@@ -2760,6 +2906,9 @@ class RuntimeManager:
                         "requested_frames": prepared_request.get("requested_frames"),
                         "inference_frames": prepared_request.get("inference_frames"),
                         "steps": prepared_request.get("steps"),
+                        "guidance_scale": prepared_request.get("guidance_scale"),
+                        "true_cfg_scale": prepared_request.get("true_cfg_scale"),
+                        "recipe_plan": prepared_request.get("recipe_plan"),
                         "decode_chunk_size": prepared_request.get("decode_chunk_size"),
                         "forward_chunking": bool(
                             memory_plan and "FORWARD_CHUNKING" in memory_plan.optimizations

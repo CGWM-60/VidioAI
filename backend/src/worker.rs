@@ -72,6 +72,8 @@ pub struct WorkerModelStatus {
     #[serde(default)]
     pub memory_plan: Option<serde_json::Value>,
     #[serde(default)]
+    pub bundle: Option<serde_json::Value>,
+    #[serde(default)]
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub capability: Option<String>,
@@ -165,6 +167,10 @@ struct InstallModelRequest<'a> {
     repository: &'a str,
     revision: &'a str,
     capabilities: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    loras: Option<&'a [serde_json::Value]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recipe: Option<&'a serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -322,6 +328,8 @@ impl WorkerClient {
         repository: &str,
         revision: &str,
         capabilities: &[String],
+        loras: Option<&[serde_json::Value]>,
+        recipe: Option<&serde_json::Value>,
     ) -> Result<WorkerModelStatus, String> {
         self.json(
             self.request(reqwest::Method::POST, "/v1/models/install")
@@ -331,6 +339,8 @@ impl WorkerClient {
                     repository,
                     revision,
                     capabilities: capabilities.iter().map(String::as_str).collect(),
+                    loras,
+                    recipe,
                 }),
         )
         .await
@@ -388,6 +398,7 @@ impl WorkerClient {
         model_id: &str,
         prompt: &str,
         negative_prompt: Option<&str>,
+        quality: Option<&str>,
         output_path: &Path,
         input_path: Option<&str>,
         mask_path: Option<&str>,
@@ -402,6 +413,7 @@ impl WorkerClient {
             "model_id": model_id,
             "prompt": prompt,
             "negative_prompt": negative_prompt,
+            "quality": quality,
             "seed": null,
             "output_relative_path": relative,
         });

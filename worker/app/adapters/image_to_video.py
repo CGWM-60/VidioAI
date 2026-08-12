@@ -15,7 +15,10 @@ class ImageToVideoAdapter(RuntimeAdapter):
             "KEYFRAMES_TO_VIDEO",
         ]
 
-    def supported_capabilities(self, metadata: dict[str, Any]) -> list[str]:
+    def supported_capabilities(
+        self,
+        metadata: dict[str, Any],
+    ) -> list[str]:
         detected = {
             str(value).upper()
             for value in metadata.get("capabilities", [])
@@ -37,7 +40,9 @@ class ImageToVideoAdapter(RuntimeAdapter):
 
     @staticmethod
     def _is_wan(metadata: dict[str, Any]) -> bool:
-        class_name = str(metadata.get("class_name") or "").lower()
+        class_name = str(
+            metadata.get("class_name") or ""
+        ).lower()
         architectures = [
             str(value).lower()
             for value in metadata.get("architectures", [])
@@ -61,13 +66,18 @@ class ImageToVideoAdapter(RuntimeAdapter):
             return {
                 "min_input_images": 1,
                 "max_input_images": 1,
-                "supported_image_roles": ["start", "start_frame"],
+                "supported_image_roles": [
+                    "start",
+                    "start_frame",
+                ],
                 "supports_start_end_frames": False,
                 "supports_reference_images": False,
                 "supports_keyframes": False,
             }
 
-        model_name = str(metadata.get("class_name") or "").lower()
+        model_name = str(
+            metadata.get("class_name") or ""
+        ).lower()
 
         if "ltx" in model_name:
             return {
@@ -112,12 +122,6 @@ class ImageToVideoAdapter(RuntimeAdapter):
         self,
         request: dict[str, Any],
     ) -> dict[str, Any]:
-        """Préserve l'ordre et les rôles des assets avant résolution.
-
-        Cette méthode est utilisée par le backend/tests pour construire le
-        contrat I2V. En production, RuntimeManager résout ensuite les asset_id
-        vers de vraies images PIL sans changer cet ordre.
-        """
         raw_images = sorted(
             [
                 item
@@ -161,7 +165,6 @@ class ImageToVideoAdapter(RuntimeAdapter):
             str(item.get("role") or "reference").lower()
             for item in raw_items
         ]
-
         resolved = list(
             request.get("resolved_input_images") or []
         )
@@ -173,7 +176,6 @@ class ImageToVideoAdapter(RuntimeAdapter):
                 )
             return resolved, roles[: len(resolved)]
 
-        # Fallback pour tests unitaires/appels directs.
         payload = ImageToVideoAdapter().prepare_pipeline_inputs(
             request
         )
@@ -200,7 +202,6 @@ class ImageToVideoAdapter(RuntimeAdapter):
                 local_files_only=True,
                 torch_dtype=torch.float32,
             )
-
             return WanImageToVideoPipeline.from_pretrained(
                 snapshot,
                 vae=vae,
@@ -251,7 +252,6 @@ class ImageToVideoAdapter(RuntimeAdapter):
             )
 
         image = images[0]
-
         end_image = None
         for index, role in enumerate(roles):
             if (
@@ -264,8 +264,7 @@ class ImageToVideoAdapter(RuntimeAdapter):
         if end_image is None and len(images) > 1:
             end_image = images[-1]
 
-        # Resolution et frames sont résolues en amont.
-        # Aucun steps/guidance/fps arbitraire n'est injecté.
+        # La cadence produit reste distincte de la cadence de conditionnement.
         kwargs: dict[str, Any] = {
             "prompt": request.get("prompt"),
             "negative_prompt": request.get("negative_prompt"),
@@ -281,12 +280,16 @@ class ImageToVideoAdapter(RuntimeAdapter):
             "decode_chunk_size": request.get(
                 "decode_chunk_size"
             ),
-            # Le FPS de livraison n'est pas automatiquement
-            # un paramètre de conditionnement du modèle.
             "fps": request.get("inference_fps"),
             "num_inference_steps": request.get("steps"),
             "guidance_scale": request.get(
                 "guidance_scale"
+            ),
+            "true_cfg_scale": request.get(
+                "true_cfg_scale"
+            ),
+            "max_sequence_length": request.get(
+                "max_sequence_length"
             ),
             "generator": runtime.get("generator"),
         }
@@ -296,7 +299,6 @@ class ImageToVideoAdapter(RuntimeAdapter):
                 pipeline.__call__
             ).parameters
         )
-
         filtered = {
             key: value
             for key, value in kwargs.items()
@@ -311,7 +313,6 @@ class ImageToVideoAdapter(RuntimeAdapter):
                 or "IMAGE_TO_VIDEO"
             ),
         )
-
         output = pipeline(**filtered)
 
         return {

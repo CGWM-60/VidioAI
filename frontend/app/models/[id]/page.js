@@ -32,6 +32,40 @@ function runtimeStatus(model) {
   return model.runtime_compatibility || (model.runtime_supported ? "SUPPORTED" : "UNSUPPORTED");
 }
 
+function parseLoraLines(value) {
+  return value
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line, index) => {
+      const [repository, scale = "1", weightName = "", revision = "main"] = line.split("|").map((item) => item.trim());
+      if (!repository || !repository.includes("/")) throw new Error(`LoRA ligne ${index + 1}: owner/model attendu.`);
+      const parsedScale = Number(scale);
+      if (!Number.isFinite(parsedScale) || parsedScale < 0 || parsedScale > 2) throw new Error(`LoRA ligne ${index + 1}: scale doit etre entre 0 et 2.`);
+      return {
+        repository,
+        revision: revision || "main",
+        scale: parsedScale,
+        enabled: true,
+        ...(weightName ? { weight_name: weightName } : {}),
+      };
+    });
+}
+
+function optionalInteger(value) {
+  if (`${value}`.trim() === "") return null;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) throw new Error(`Entier invalide: ${value}`);
+  return parsed;
+}
+
+function optionalFloat(value) {
+  if (`${value}`.trim() === "") return null;
+  const parsed = Number.parseFloat(value);
+  if (!Number.isFinite(parsed)) throw new Error(`Nombre invalide: ${value}`);
+  return parsed;
+}
+
 /** Page de détail alimentée par la route query-safe `/api/models/by-id`. */
 function ModelDetailsContent() {
   const { id } = useParams();
@@ -43,10 +77,43 @@ function ModelDetailsContent() {
   const [model, setModel] = useState(null);
   const [runtimeBusy, setRuntimeBusy] = useState(false);
   const [error, setError] = useState("");
+  const [loraText, setLoraText] = useState("");
+  const [recipeQuality, setRecipeQuality] = useState("native");
+  const [recipeWidth, setRecipeWidth] = useState("");
+  const [recipeHeight, setRecipeHeight] = useState("");
+  const [recipeSteps, setRecipeSteps] = useState("");
+  const [recipeGuidance, setRecipeGuidance] = useState("");
+  const [recipeTrueCfg, setRecipeTrueCfg] = useState("");
+  const [recipeStrength, setRecipeStrength] = useState("");
+  const [recipeMaxSequence, setRecipeMaxSequence] = useState("");
+  const [recipeInferenceFps, setRecipeInferenceFps] = useState("");
 
   const refresh = useCallback(async () => {
-    try { setModel(await apiFetch(`/api/models/by-id?model_id=${encodeURIComponent(modelId)}`)); setError(""); }
-    catch (requestError) { setError(requestError.message); }
+    try {
+      const nextModel = await apiFetch(`/api/models/by-id?model_id=${encodeURIComponent(modelId)}`);
+      const bundle = nextModel.bundle || {};
+      const recipe = bundle.recipe || {};
+
+      setModel(nextModel);
+      setLoraText((bundle.loras || []).map((item) => [
+        item.repository,
+        item.scale ?? 1,
+        item.weight_name || "",
+        item.requested_revision || item.revision || "main",
+      ].join(" | ")).join("\n"));
+      setRecipeQuality(recipe.quality_mode || "native");
+      setRecipeWidth(recipe.width ?? "");
+      setRecipeHeight(recipe.height ?? "");
+      setRecipeSteps(recipe.num_inference_steps ?? "");
+      setRecipeGuidance(recipe.guidance_scale ?? "");
+      setRecipeTrueCfg(recipe.true_cfg_scale ?? "");
+      setRecipeStrength(recipe.strength ?? "");
+      setRecipeMaxSequence(recipe.max_sequence_length ?? "");
+      setRecipeInferenceFps(recipe.inference_fps ?? "");
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    }
   }, [modelId]);
 
   useEffect(() => {
@@ -74,7 +141,22 @@ function ModelDetailsContent() {
         method: "POST",
         timeoutMs: MODEL_PREFLIGHT_TIMEOUT_MS,
         timeoutCode: "MODEL_PREFLIGHT_TIMEOUT",
-        body: JSON.stringify({ model_id: model.id, revision: model.revision }),
+        body: JSON.stringify({
+          model_id: model.id,
+          revision: model.installed ? (model.installed_revision || model.revision) : model.revision,
+          loras: parseLoraLines(loraText),
+          recipe: {
+            quality_mode: recipeQuality,
+            width: optionalInteger(recipeWidth),
+            height: optionalInteger(recipeHeight),
+            num_inference_steps: optionalInteger(recipeSteps),
+            guidance_scale: optionalFloat(recipeGuidance),
+            true_cfg_scale: optionalFloat(recipeTrueCfg),
+            strength: optionalFloat(recipeStrength),
+            max_sequence_length: optionalInteger(recipeMaxSequence),
+            inference_fps: optionalInteger(recipeInferenceFps),
+          },
+        }),
       });
       router.push(`/models/install?model_id=${encodeURIComponent(model.id)}&job=${job.id}`);
     } catch (requestError) { setError(requestError.message); setRuntimeBusy(false); }
@@ -112,6 +194,27 @@ function ModelDetailsContent() {
       </section>
       {model.repository_url && <section className={styles.largePanel}><h2>Source officielle</h2><a className={styles.repositoryLink} href={model.repository_url} target="_blank" rel="noreferrer">{model.repository}</a></section>}
       <section className={styles.largePanel}>
+        <h2>Bundle VidioAI</h2>
+        <p><strong>Base :</strong> {model.bundle?.base_model?.repository || model.repository} @ {(model.bundle?.base_model?.revision || model.revision).slice(0, 12)}</p>
+        <label className={styles.formGroup}>
+          <span>LoRA(s) · une ligne par adapter</span>
+          <textarea rows={4} value={loraText} onChange={(event) => setLoraText(event.target.value)} placeholder={"owner/lora | 0.8 | pytorch_lora_weights.safetensors | main\nowner/autre-lora | 0.5"} />
+          <small>repository | scale | weight_name optionnel | revision optionnelle</small>
+        </label>
+        <div className={styles.detailsGrid}>
+          <label className={styles.formGroup}><span>Profil</span><select value={recipeQuality} onChange={(event) => setRecipeQuality(event.target.value)}><option value="native">Native</option><option value="fast">Fast</option><option value="balanced">Balanced</option><option value="quality">Quality</option></select></label>
+          <label className={styles.formGroup}><span>Largeur</span><input value={recipeWidth} onChange={(event) => setRecipeWidth(event.target.value)} placeholder="1024" /></label>
+          <label className={styles.formGroup}><span>Hauteur</span><input value={recipeHeight} onChange={(event) => setRecipeHeight(event.target.value)} placeholder="1024" /></label>
+          <label className={styles.formGroup}><span>Steps</span><input value={recipeSteps} onChange={(event) => setRecipeSteps(event.target.value)} placeholder="default natif si vide" /></label>
+          <label className={styles.formGroup}><span>Guidance</span><input value={recipeGuidance} onChange={(event) => setRecipeGuidance(event.target.value)} placeholder="default natif si vide" /></label>
+          <label className={styles.formGroup}><span>True CFG</span><input value={recipeTrueCfg} onChange={(event) => setRecipeTrueCfg(event.target.value)} placeholder="si supporte" /></label>
+          <label className={styles.formGroup}><span>Strength I2I</span><input value={recipeStrength} onChange={(event) => setRecipeStrength(event.target.value)} placeholder="0 a 1" /></label>
+          <label className={styles.formGroup}><span>Max sequence</span><input value={recipeMaxSequence} onChange={(event) => setRecipeMaxSequence(event.target.value)} placeholder="si supporte" /></label>
+          <label className={styles.formGroup}><span>FPS inference</span><input value={recipeInferenceFps} onChange={(event) => setRecipeInferenceFps(event.target.value)} placeholder="distinct du FPS final" /></label>
+        </div>
+        <p className={styles.measuredNote}>Priorite : generation explicite → recette du bundle → default reel de la pipeline. Aucun branchement par nom de modele.</p>
+      </section>
+      <section className={styles.largePanel}>
         <h2>Capacités</h2>
         <div className={styles.capabilityCards}>{model.capabilities.map((item) => <span key={item}><BsCheck2 /> {item.replaceAll("_", " ")}</span>)}</div>
       </section>
@@ -134,10 +237,10 @@ function ModelDetailsContent() {
           </div>
         ))}</div>
       </section>}
-      {model.cache_status === "CACHE_FAILED" && <section className={styles.largePanel}>
-        <h2>Cache S3 à reprendre</h2>
-        <p>Le modèle reste installé localement. {model.cache_error}</p>
-        <button className={styles.secondaryButton} disabled={runtimeBusy} onClick={retryCache}>Réessayer la sauvegarde S3</button>
+      {["CACHE_FAILED", "CACHE_MANUAL"].includes(model.cache_status) && <section className={styles.largePanel}>
+        <h2>{model.cache_status === "CACHE_MANUAL" ? "Sauvegarde S3 manuelle" : "Cache S3 à reprendre"}</h2>
+        <p>{model.cache_status === "CACHE_MANUAL" ? "La sauvegarde automatique des modèles est temporairement désactivée. Le modèle est installé localement." : `Le modèle reste installé localement. ${model.cache_error || ""}`}</p>
+        <button className={styles.secondaryButton} disabled={runtimeBusy} onClick={retryCache}>{model.cache_status === "CACHE_MANUAL" ? "Sauvegarder maintenant" : "Réessayer la sauvegarde S3"}</button>
       </section>}
       <section className={styles.largePanel}>
         <h2>Pourquoi ce modèle est-il utilisable ou non ?</h2>
@@ -181,6 +284,7 @@ function ModelDetailsContent() {
       <div className={styles.footerActions}>
         {model.installed && !model.loaded && <button className={styles.primaryButton} disabled={runtimeBusy} onClick={() => changeRuntime("load")}><BsPlay /> Charger le modèle</button>}
         {model.loaded && <button className={styles.secondaryButton} disabled={runtimeBusy} onClick={() => changeRuntime("unload")}><BsStop /> Décharger</button>}
+        {model.installed && <button className={styles.primaryButton} disabled={runtimeBusy} onClick={startInstall}><BsCloudDownload /> Appliquer LoRA / recette</button>}
         {!model.installed && <button className={styles.primaryButton} disabled={!model.installable || runtimeBusy} onClick={startInstall}><BsCloudDownload /> {model.gated && !model.access_authorized ? "Accès Hugging Face requis" : runtimeStatus(model) === "SUPPORTED" ? "Installer cette révision" : runtimeStatus(model) === "UNKNOWN" ? "Installer pour valider" : "Pipeline non implémenté"}</button>}
       </div>
     </div>

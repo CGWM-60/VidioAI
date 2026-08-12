@@ -182,7 +182,7 @@ export default function ModelsPage() {
                       ? <span className={styles.successPill}><BsCheckCircle /> Installé</span>
                       : null}
                 </div>
-                <div className={styles.modelMetadata}><span>{model.author || "Auteur inconnu"}</span><span>{formatBytes(model.estimated_size_bytes)}</span>{Number.isFinite(model.downloads) && <span>{model.downloads.toLocaleString("fr-FR")} téléchargements</span>}{Number.isFinite(model.likes) && <span>{model.likes.toLocaleString("fr-FR")} likes</span>}</div>
+                <div className={styles.modelMetadata}><span>{model.author || "Auteur inconnu"}</span><span>{formatBytes(model.estimated_size_bytes)}</span>{Number.isFinite(model.downloads) && <span>{model.downloads.toLocaleString("fr-FR")} téléchargements</span>}{Number.isFinite(model.likes) && <span>{model.likes.toLocaleString("fr-FR")} likes</span>}{model.bundle?.loras?.length > 0 && <span>Base + {model.bundle.loras.length} LoRA</span>}{model.bundle?.recipe?.quality_mode && <span>Recette {model.bundle.recipe.quality_mode}</span>}</div>
                 <div className={styles.capabilityList}>
                   {model.capabilities.map((capability) => <span key={capability}>{CAPABILITY_LABELS[capability] || capability}</span>)}
                 </div>
