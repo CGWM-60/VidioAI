@@ -5265,12 +5265,8 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
                     ),
                 )
                 .await?;
-                let worker_width = worker_result
-                    .actual_width
-                    .unwrap_or(worker_result.width);
-                let worker_height = worker_result
-                    .actual_height
-                    .unwrap_or(worker_result.height);
+                let worker_width = worker_result.actual_width.unwrap_or(worker_result.width);
+                let worker_height = worker_result.actual_height.unwrap_or(worker_result.height);
                 if worker_result.job_id != job_id.to_string()
                     || worker_result.state != "COMPLETED"
                     || worker_result.output_relative_path != relative.to_string_lossy()
@@ -5396,12 +5392,8 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
                     ),
                 )
                 .await?;
-                let worker_width = worker_result
-                    .actual_width
-                    .unwrap_or(worker_result.width);
-                let worker_height = worker_result
-                    .actual_height
-                    .unwrap_or(worker_result.height);
+                let worker_width = worker_result.actual_width.unwrap_or(worker_result.width);
+                let worker_height = worker_result.actual_height.unwrap_or(worker_result.height);
                 if worker_result.job_id != job_id.to_string()
                     || worker_result.state != "COMPLETED"
                     || worker_result.output_relative_path != relative.to_string_lossy()
