@@ -46,7 +46,7 @@ import transformers
 from huggingface_hub import HfApi, snapshot_download
 
 expected = {
-    "diffusers": "0.39.0",
+    "diffusers": "0.40.0.dev0",
     "transformers": "5.14.1",
     "accelerate": "1.14.0",
     "huggingface-hub": "1.24.0",
@@ -68,6 +68,7 @@ for class_name in (
     "WanPipeline",
     "HunyuanVideoPipeline",
     "LTXPipeline",
+    "MiniMaxH3ModularPipeline",
 ):
     assert getattr(diffusers, class_name, None) is not None, class_name
 assert torch.__version__
