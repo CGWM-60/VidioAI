@@ -24,3 +24,4 @@ einops==0.8.2
 ftfy==6.3.1
 imageio==2.37.4
 imageio-ffmpeg==0.6.0
+
