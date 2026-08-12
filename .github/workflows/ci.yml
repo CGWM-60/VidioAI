@@ -9,17 +9,45 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      - name: Install backend system dependencies
+      - name: Prepare APT repositories
+        shell: bash
         run: |
-          sudo apt-get update
+          set -Eeuo pipefail
 
-          sudo apt-get install -y \
+          echo "Removing unused Microsoft APT repositories..."
+
+          if [ -f /etc/apt/sources.list ]; then
+            sudo sed -i '\|packages.microsoft.com|d' /etc/apt/sources.list
+          fi
+
+          if [ -d /etc/apt/sources.list.d ]; then
+            grep -rl "packages.microsoft.com" /etc/apt/sources.list.d 2>/dev/null \
+              | xargs -r sudo rm -f
+          fi
+
+          echo "Remaining Microsoft repositories:"
+          grep -R "packages.microsoft.com" \
+            /etc/apt/sources.list \
+            /etc/apt/sources.list.d \
+            2>/dev/null || true
+
+      - name: Install backend system dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          sudo apt-get update \
+            -o Acquire::Retries=3
+
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             protobuf-compiler \
             libdrm-dev \
             pkg-config
@@ -30,87 +58,151 @@ jobs:
           ldconfig -p | grep libdrm || true
 
           echo "Checking development libraries..."
-          find /usr/lib -name 'libdrm.so' -o -name 'libdrm_amdgpu.so'
+          find /usr/lib \
+            \( -name 'libdrm.so' -o -name 'libdrm_amdgpu.so' \) \
+            -print
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Configure Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
           workspaces: backend
 
-      - run: cargo fmt --check
+      - name: Rust format
         working-directory: backend
+        run: cargo fmt --check
 
-      - run: cargo clippy --all-targets -- -D warnings
+      - name: Rust Clippy
         working-directory: backend
+        run: cargo clippy --all-targets -- -D warnings
 
-      - run: cargo test
+      - name: Backend tests
         working-directory: backend
+        run: cargo test
+
+
   frontend:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Install Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - run: npm ci
+      - name: Install frontend dependencies
         working-directory: frontend
+        run: npm ci
 
-      - run: npm test
+      - name: Frontend tests
         working-directory: frontend
+        run: npm test
 
-      - run: npm run lint
+      - name: Frontend lint
         working-directory: frontend
+        run: npm run lint
 
-      - run: npm run build
+      - name: Frontend build
         working-directory: frontend
+        run: npm run build
 
 
   worker:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Install Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: worker/requirements-test.txt
 
-      - name: Install Worker media dependencies
+      - name: Prepare APT repositories
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          set -Eeuo pipefail
+
+          echo "Removing unused Microsoft APT repositories..."
+
+          if [ -f /etc/apt/sources.list ]; then
+            sudo sed -i '\|packages.microsoft.com|d' /etc/apt/sources.list
+          fi
+
+          if [ -d /etc/apt/sources.list.d ]; then
+            grep -rl "packages.microsoft.com" /etc/apt/sources.list.d 2>/dev/null \
+              | xargs -r sudo rm -f
+          fi
+
+          echo "Remaining Microsoft repositories:"
+          grep -R "packages.microsoft.com" \
+            /etc/apt/sources.list \
+            /etc/apt/sources.list.d \
+            2>/dev/null || true
+
+      - name: Install Worker media dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          sudo apt-get update \
+            -o Acquire::Retries=3
+
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            ffmpeg
+
           ffmpeg -version
           ffprobe -version
 
-      - run: pip install -r requirements-test.txt
+      - name: Install Worker test dependencies
         working-directory: worker
+        run: pip install -r requirements-test.txt
 
-      - run: python -m compileall -q app
+      - name: Compile Worker Python
         working-directory: worker
+        run: python -m compileall -q app
 
-      - run: pytest -q
+      - name: Worker tests
         working-directory: worker
+        run: pytest -q
+
 
   deployment-scripts:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Validate shell syntax and S3 release paths
+        shell: bash
         run: |
-          bash -n deploy/scripts/*.sh deploy/scripts/lib/*.sh deploy/tests/*.sh
+          set -Eeuo pipefail
+
+          bash -n \
+            deploy/scripts/*.sh \
+            deploy/scripts/lib/*.sh \
+            deploy/tests/*.sh
+
           bash deploy/tests/test-s3-paths.sh
           bash deploy/tests/test-build-release-immutability.sh
           bash deploy/tests/test-production-compose-contract.sh
 
 
   containers:
-    needs: [backend, frontend, worker, deployment-scripts]
+    needs:
+      - backend
+      - frontend
+      - worker
+      - deployment-scripts
+
     runs-on:
       - self-hosted
       - Linux
@@ -123,18 +215,34 @@ jobs:
       VIDIOAI_ADMIN_TOKEN: ${{ secrets.VIDIOAI_ADMIN_TOKEN }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - run: docker compose --profile gpu config
+      - name: Validate development compose
+        run: docker compose --profile gpu config
 
-      - run: docker compose --profile gpu build
+      - name: Build containers
+        run: docker compose --profile gpu build
 
-      - name: Validate the final Worker image contract
+      - name: Validate final Worker image contract
+        shell: bash
         run: |
-          WORKER_IMAGE=$(docker compose --profile gpu config --format json \
-            | jq -r '.services.worker.image // empty')
-          test -n "${WORKER_IMAGE}"
+          set -Eeuo pipefail
+
+          WORKER_IMAGE=$(
+            docker compose --profile gpu config --format json \
+              | jq -r '.services.worker.image // empty'
+          )
+
+          if [ -z "${WORKER_IMAGE}" ]; then
+            echo "Worker image name is missing from docker compose config."
+            exit 1
+          fi
+
+          echo "Worker image: ${WORKER_IMAGE}"
+
           docker image inspect "${WORKER_IMAGE}" >/dev/null
+
           bash deploy/scripts/test-worker-image.sh "${WORKER_IMAGE}"
 
       - name: Validate production compose
@@ -145,4 +253,8 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ci-secret
           AWS_S3_BUCKET: ci-bucket
           VIDIOAI_SCRATCH_DIR: /scratch/vidioai
-        run: docker compose -f compose.production.yml config --quiet
+        run: |
+          docker compose \
+            -f compose.production.yml \
+            config \
+            --quiet
