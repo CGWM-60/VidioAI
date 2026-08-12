@@ -573,6 +573,8 @@ pub struct Generation {
     #[serde(default)]
     pub duration_seconds: Option<u32>,
     #[serde(default)]
+    pub requested_duration_seconds: Option<f64>,
+    #[serde(default)]
     pub resolution: Option<String>,
     #[serde(default)]
     pub requested_quality: Option<String>,
@@ -581,6 +583,10 @@ pub struct Generation {
     #[serde(default)]
     pub requested_fps: Option<u32>,
     #[serde(default)]
+    pub requested_frames: Option<u32>,
+    #[serde(default)]
+    pub inference_frames: Option<u32>,
+    #[serde(default)]
     pub actual_width: Option<u32>,
     #[serde(default)]
     pub actual_height: Option<u32>,
@@ -588,6 +594,8 @@ pub struct Generation {
     pub actual_fps: Option<f64>,
     #[serde(default)]
     pub actual_frames: Option<u32>,
+    #[serde(default)]
+    pub actual_duration: Option<f64>,
     #[serde(default)]
     pub audio: bool,
 }
@@ -5044,14 +5052,18 @@ async fn generate_image(
         created_at: unix_now(),
         updated_at: unix_now(),
         duration_seconds: None,
+        requested_duration_seconds: None,
         resolution: None,
         requested_quality: None,
         requested_aspect_ratio: None,
         requested_fps: None,
+        requested_frames: None,
+        inference_frames: None,
         actual_width: None,
         actual_height: None,
         actual_fps: None,
         actual_frames: None,
+        actual_duration: None,
         audio: false,
     };
     state
@@ -5649,14 +5661,18 @@ async fn generate_video(
         created_at: unix_now(),
         updated_at: unix_now(),
         duration_seconds: Some(duration),
+        requested_duration_seconds: Some(f64::from(duration)),
         resolution: Some(quality.clone()),
         requested_quality: Some(quality),
         requested_aspect_ratio: Some(aspect_ratio),
         requested_fps: Some(requested_fps),
+        requested_frames: Some(duration.saturating_mul(requested_fps)),
+        inference_frames: None,
         actual_width: None,
         actual_height: None,
         actual_fps: None,
         actual_frames: None,
+        actual_duration: None,
         audio: request.audio,
     };
     update_generation(&state, generation.clone()).await;
@@ -5881,6 +5897,14 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
             generation.actual_height = worker_result.actual_height.or(Some(worker_result.height));
             generation.actual_fps = worker_result.actual_fps;
             generation.actual_frames = worker_result.actual_frames;
+            generation.actual_duration = worker_result.actual_duration;
+            generation.requested_duration_seconds = worker_result.requested_duration_seconds
+                .or(generation.requested_duration_seconds);
+            generation.requested_fps = worker_result.requested_fps
+                .or(generation.requested_fps);
+            generation.requested_frames = worker_result.requested_frames
+                .or(generation.requested_frames);
+            generation.inference_frames = worker_result.inference_frames;
             generation.requested_quality = worker_result.requested_quality
                 .or_else(|| generation.requested_quality.clone());
             generation.requested_aspect_ratio = worker_result.requested_aspect_ratio
@@ -5964,6 +5988,14 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
             generation.actual_height = worker_result.actual_height.or(Some(worker_result.height));
             generation.actual_fps = worker_result.actual_fps;
             generation.actual_frames = worker_result.actual_frames;
+            generation.actual_duration = worker_result.actual_duration;
+            generation.requested_duration_seconds = worker_result.requested_duration_seconds
+                .or(generation.requested_duration_seconds);
+            generation.requested_fps = worker_result.requested_fps
+                .or(generation.requested_fps);
+            generation.requested_frames = worker_result.requested_frames
+                .or(generation.requested_frames);
+            generation.inference_frames = worker_result.inference_frames;
             generation.requested_quality = worker_result.requested_quality
                 .or_else(|| generation.requested_quality.clone());
             generation.requested_aspect_ratio = worker_result.requested_aspect_ratio
@@ -6086,6 +6118,7 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
             generation.actual_width = asset.width.or(generation.actual_width);
             generation.actual_height = asset.height.or(generation.actual_height);
             generation.actual_fps = asset.fps.or(generation.actual_fps);
+            generation.actual_duration = asset.duration_seconds.or(generation.actual_duration);
             if generation.actual_frames.is_none() {
                 generation.actual_frames = asset
                     .duration_seconds

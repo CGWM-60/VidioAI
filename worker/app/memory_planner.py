@@ -30,6 +30,8 @@ class MemoryPlan:
     frames: int
     optimizations: list[str] = field(default_factory=list)
     reason: str = ""
+    activation_estimate_bytes: int = 0
+    observed_previous_peak_bytes: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -67,6 +69,7 @@ class MemoryPlanner:
         height: int = 1024,
         frames: int = 1,
         current_strategy: str | None = None,
+        observed_previous_peak_bytes: int = 0,
     ) -> MemoryPlan:
         if vram_total_bytes <= 0:
             return MemoryPlan(
@@ -113,15 +116,20 @@ class MemoryPlanner:
             precision=precision,
         )
         transient_buffers = max(1 * GIB, int(vram_total_bytes * 0.05))
-        inference_headroom = activations + transient_buffers
+        observed_activation = max(
+            0,
+            int(observed_previous_peak_bytes) - pipeline_resident,
+        )
+        adaptive_activation = max(activations, int(observed_activation * 1.15))
+        inference_headroom = adaptive_activation + transient_buffers
         model_already_resident = pipeline_resident > 0 and current_strategy == "FULL_GPU"
         full_required = inference_headroom if model_already_resident else resident + inference_headroom
         model_offload_required = int(resident * 0.35) + int(inference_headroom * 0.85)
         sequential_required = int(resident * 0.12) + int(inference_headroom * 0.55)
 
-        optimizations = []
-        if "VIDEO" in capability:
-            optimizations.extend(["VAE_SLICING", "VAE_TILING"])
+        # Cette liste décrit uniquement ce qui a réellement été activé. Le
+        # runtime la remplit après introspection de la pipeline.
+        optimizations: list[str] = []
 
         model_offload_ram = int(resident * 0.75) + int(activations * 0.25)
         sequential_ram = int(resident * 0.92) + int(activations * 0.35)
@@ -195,4 +203,6 @@ class MemoryPlanner:
             frames=frames,
             optimizations=list(dict.fromkeys(optimizations)),
             reason=reason,
+            activation_estimate_bytes=activations,
+            observed_previous_peak_bytes=max(0, int(observed_previous_peak_bytes)),
         )

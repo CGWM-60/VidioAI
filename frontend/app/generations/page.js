@@ -33,6 +33,18 @@ const DEFAULT_INPUT_PROFILE = {
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
 
+function generationErrorMessage(generation) {
+  const raw = generation?.error || "La génération a échoué.";
+  if (raw.includes("INSUFFICIENT_VRAM")) {
+    return `Le plan mémoire n'a pas permis cette génération. ${raw}`;
+  }
+  return raw;
+}
+
+function secondsLabel(value) {
+  return Number.isFinite(Number(value)) ? `${Number(value).toFixed(2).replace(/\.00$/, "")} s` : "—";
+}
+
 function GenerationsContent() {
   const sourceAssetId = useSearchParams().get("asset");
   const fileInputRef = useRef(null);
@@ -332,7 +344,15 @@ function GenerationsContent() {
             {outputId ? <video src={assetUrl(outputId)} controls autoPlay loop /> : inputAsset ? (sourceIsVideo ? <video src={assetUrl(inputAsset.id)} controls /> : <Image unoptimized width={1280} height={720} src={assetUrl(inputAsset.id)} alt="Aperçu de la génération" />) : <div className={styles.videoPlaceholder}><BsCameraVideo /><h2>Votre vidéo apparaîtra ici</h2><p>Choisissez un mode et décrivez le mouvement souhaité.</p></div>}
             {isRunning && <div className={styles.videoProgressOverlay}><strong>{generation.progress}%</strong><div><span style={{ width: `${generation.progress}%` }} /></div><p>Encodage et optimisation du résultat…</p></div>}
           </div>
-          {generation?.status === "failed" && <div className={styles.errorBanner}>{generation.error}</div>}
+          {generation && <div className={styles.resultTopline}>
+            <div><span>Durée demandée</span><strong>{secondsLabel(generation.requested_duration_seconds ?? generation.duration_seconds)}</strong></div>
+            <div><span>FPS demandé</span><strong>{generation.requested_fps ?? "—"}</strong></div>
+            <div><span>Frames d’inférence</span><strong>{generation.inference_frames ?? "—"}</strong></div>
+            <div><span>Frames générées</span><strong>{generation.actual_frames ?? "—"}</strong></div>
+            <div><span>FPS réel</span><strong>{generation.actual_fps ? Number(generation.actual_fps).toFixed(2) : "—"}</strong></div>
+            <div><span>Durée réelle</span><strong>{secondsLabel(generation.actual_duration)}</strong></div>
+          </div>}
+          {generation?.status === "failed" && <div className={styles.errorBanner}>{generationErrorMessage(generation)}</div>}
           <div className={styles.videoResultActions}>
             {isRunning && <button type="button" className={styles.dangerButton} onClick={cancelGeneration}><BsXCircle /> Annuler</button>}
             {outputId && <a className={styles.primaryButton} href={assetUrl(outputId)} download><BsDownload /> Télécharger le MP4</a>}
@@ -345,7 +365,7 @@ function GenerationsContent() {
         <div className={styles.sectionTitle}><div><strong>Résultats récents</strong><span>{history.length} génération(s)</span></div></div>
         <div className={styles.videoHistoryGrid}>
           {history.map((item) => <button type="button" key={item.id} onClick={() => setGeneration(item)} className={styles.historyCard}>
-            <div><BsPlayCircle /><span>{item.duration_seconds || "—"}s</span></div><strong>{item.prompt}</strong><small>{item.status} · {item.requested_quality || item.resolution || "—"} · {item.requested_aspect_ratio || "—"}{item.actual_width && item.actual_height ? ` · ${item.actual_width}×${item.actual_height}` : ""}</small>
+            <div><BsPlayCircle /><span>{secondsLabel(item.actual_duration ?? item.requested_duration_seconds ?? item.duration_seconds)}</span></div><strong>{item.prompt}</strong><small>{item.status} · demandé {secondsLabel(item.requested_duration_seconds ?? item.duration_seconds)} à {item.requested_fps ?? "—"} FPS · réel {item.actual_frames ?? "—"} frames à {item.actual_fps ? Number(item.actual_fps).toFixed(2) : "—"} FPS · {item.requested_quality || item.resolution || "—"} · {item.requested_aspect_ratio || "—"}{item.actual_width && item.actual_height ? ` · ${item.actual_width}×${item.actual_height}` : ""}</small>
           </button>)}
           {!history.length && <div className={styles.emptyHistory}><BsFilm /> Aucune vidéo générée pour le moment.</div>}
         </div>

@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 PROJECT_DIR=${VIDIOAI_PROJECT_DIR:-/opt/vidioai}
 BASE_URL=${1:-http://127.0.0.1:8080}
-TARGET_VERSION=${VIDIOAI_GPU_ACCEPTANCE_VERSION:-2026.08.11-9}
+TARGET_VERSION=${VIDIOAI_GPU_ACCEPTANCE_VERSION:-2026.08.11-10}
 COMPOSE_FILE=${VIDIOAI_COMPOSE_FILE:-${PROJECT_DIR}/compose.production.yml}
 ENV_FILE=${VIDIOAI_ENV_FILE:-${PROJECT_DIR}/.env.production}
 source "${PROJECT_DIR}/deploy/scripts/lib/scratch-storage.sh"
@@ -166,6 +166,8 @@ poll_generation() {
 
 curl -fsS "${BASE_URL}/api/ready" \
   | jq -e '.ready == true and .mode == "ACCEPTING_JOBS"' >/dev/null
+curl -fsS "${BASE_URL}/api/resources" | tee "${RESULT_ROOT}/resources-before-generation.json" \
+  | jq -e '.worker.gpu.vram_total_bytes > 0 and .worker.memory.ram_available_bytes > 0' >/dev/null
 curl -fsS "${BASE_URL}/api/models/installed" \
   | jq -e '.items | type == "array"' >/dev/null
 
@@ -250,18 +252,61 @@ run_video() {
   generation=$(poll_generation "${generation_id}")
   jq -e --arg quality "${quality}" '
     .requested_quality == $quality and .requested_aspect_ratio == "16:9" and
+    (.requested_duration_seconds > 0) and (.requested_fps > 0) and
+    (.requested_frames > 0) and (.inference_frames > 0) and
     (.actual_width > 0) and (.actual_height > 0) and
-    (.actual_fps > 0) and (.actual_frames > 1)
+    (.actual_fps > 0) and (.actual_frames > 1) and (.actual_duration > 0)
   ' <<<"${generation}" >/dev/null
   printf '%s\n' "${generation}" > "${RESULT_ROOT}/${label}.generation.json"
   asset_id=$(jq -er '.output_asset_id' <<<"${generation}")
   validate_video "${label}" "${asset_id}" "${quality}"
 }
 
-# Ordre contractuel économique : aucune 720p avant les deux preuves 480p.
-run_video "t2v-480p" "TEXT_TO_VIDEO" "TEXT_TO_VIDEO" "480p"
+# Ordre contractuel : une seule I2V 480p, inspection du plan réel, puis I2I.
 run_video "i2v-480p" "IMAGE_TO_VIDEO" "IMAGE_TO_VIDEO" "480p" "${source_asset}"
-run_video "t2v-720p" "TEXT_TO_VIDEO" "TEXT_TO_VIDEO" "720p"
+
+generation_plan_line=$(compose logs --no-color worker | grep 'GENERATION_PLAN ' | tail -n 1)
+[[ -n "${generation_plan_line}" ]] || { echo "GENERATION_PLAN absent des logs worker." >&2; exit 1; }
+generation_plan_json=${generation_plan_line#*GENERATION_PLAN }
+printf '%s\n' "${generation_plan_json}" | tee "${RESULT_ROOT}/generation-plan.json" \
+  | jq -e '
+      . as $plan |
+      .capability == "IMAGE_TO_VIDEO" and
+      (.inference_frames > 0) and
+      (.strategy | type == "string") and
+      (.vram_free > 0) and (.ram_available > 0) and
+      (.forward_chunking | type == "boolean") and
+      (($plan.decode_chunk_size == null) or ([1,2,4,8] | index($plan.decode_chunk_size)))
+    ' >/dev/null
+
+i2i_response=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data-binary "$(jq -n --arg model_id "${MODEL_ID}" --arg input_asset_id "${source_asset}" '{
+    model_id:$model_id,
+    mode:"IMAGE_TO_IMAGE",
+    capability:"IMAGE_TO_IMAGE",
+    prompt:"A restrained cinematic color grade",
+    input_asset_id:$input_asset_id
+  }')" "${BASE_URL}/api/images/generate")
+i2i_generation_id=$(jq -er '.id' <<<"${i2i_response}")
+i2i_terminal=""
+for ((attempt=1; attempt<=ATTEMPTS; attempt++)); do
+  i2i_terminal=$(curl -fsS "${BASE_URL}/api/generations/${i2i_generation_id}")
+  i2i_status=$(jq -r '.status | ascii_downcase' <<<"${i2i_terminal}")
+  if [[ "${i2i_status}" == "completed" || "${i2i_status}" == "failed" || "${i2i_status}" == "cancelled" ]]; then
+    break
+  fi
+  sleep 3
+done
+printf '%s\n' "${i2i_terminal}" > "${RESULT_ROOT}/i2i.generation.json"
+i2i_status=$(jq -r '.status | ascii_downcase' <<<"${i2i_terminal}")
+if [[ "${i2i_status}" == "failed" ]]; then
+  jq -e '(.error | type == "string" and length > 0 and (contains("La génération a échoué dans le runtime Diffusers.") | not))' \
+    <<<"${i2i_terminal}" >/dev/null
+  echo "GPU_I2I_STRUCTURED_FAILURE $(jq -r '.error' <<<"${i2i_terminal}")"
+elif [[ "${i2i_status}" != "completed" ]]; then
+  echo "I2I sans état terminal exploitable: ${i2i_status}" >&2
+  exit 1
+fi
 
 jq -n \
   --arg version "${TARGET_VERSION}" \

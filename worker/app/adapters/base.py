@@ -1,7 +1,37 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import json
+import logging
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
+
+
+def log_diffusers_call(pipeline: Any, kwargs: dict[str, Any], capability: str) -> None:
+    """Journalise le contrat d'appel sans contenu utilisateur ni asset privé."""
+    public_scalars = {
+        "width", "height", "num_frames", "video_length", "fps",
+        "num_inference_steps", "guidance_scale", "strength", "decode_chunk_size",
+    }
+    parameters = {
+        key: value if key in public_scalars and isinstance(value, (int, float, bool, str))
+        else type(value).__name__
+        for key, value in sorted(kwargs.items())
+    }
+    logger.info(
+        "DIFFUSERS_CALL %s",
+        json.dumps(
+            {
+                "pipeline": type(pipeline).__name__,
+                "capability": capability,
+                "parameters": parameters,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
 
 
 class RuntimeAdapter(ABC):

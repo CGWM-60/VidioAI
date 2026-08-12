@@ -104,8 +104,6 @@ class ModelRuntimeProfile:
         fps = _positive_int(request.get("fps")) or self.fps
         duration = _positive_int(request.get("duration_seconds")) or 4
         frames = _positive_int(request.get("frames"), self.num_frames)
-        if video and frames is None:
-            frames = duration * fps
         if video and frames is not None:
             frames = self._normalize_frames(frames)
         return {

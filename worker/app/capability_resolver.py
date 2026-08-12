@@ -125,13 +125,16 @@ class CapabilityResolver:
     def _display_hints(self, metadata: dict[str, Any]) -> list[str]:
         """Dernier recours UI, jamais publie comme preuve runtime."""
         hint = " ".join(
-            str(metadata.get(key) or "").lower()
-            for key in ("class_name", "repository", "model_id")
+            str(value).lower()
+            for value in (
+                metadata.get("class_name"),
+            )
+            if value
         )
         capabilities: set[str] = set()
-        if "video" in hint or any(token in hint for token in ("wan", "ltx", "cogvideo")):
+        if "video" in hint:
             capabilities.add("TEXT_TO_VIDEO")
-        elif "image" in hint or "flux" in hint or "stable-diffusion" in hint:
+        elif "image" in hint:
             capabilities.add("TEXT_TO_IMAGE")
         return [value for value in CAPABILITY_ORDER if value in capabilities]
 

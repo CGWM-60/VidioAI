@@ -17,6 +17,7 @@ import hashlib
 import inspect
 import importlib.metadata
 import json
+import logging
 import os
 import resource
 import shutil
@@ -42,6 +43,10 @@ from .dtype_resolver import DTypeResolver, PrecisionPlan
 from .generation_progress import GenerationProgressReporter
 from .memory_planner import MemoryPlan, MemoryPlanner
 from .schemas import CompatibilityStatus, JobState, ModelState
+from .video_frame_planner import VideoFramePlanner
+
+
+logger = logging.getLogger(__name__)
 
 
 class WorkerError(RuntimeError):
@@ -109,6 +114,7 @@ class RuntimeManager:
         )
         self._dtype_resolver = DTypeResolver()
         self._memory_planner = MemoryPlanner()
+        self._video_frame_planner = VideoFramePlanner()
         self._resolution_resolver = ResolutionResolver()
         self._input_normalizer = InputNormalizer(self.settings.work_dir)
         self._output_normalizer = OutputNormalizer(self.settings.work_dir)
@@ -1624,6 +1630,7 @@ class RuntimeManager:
         frames: int | None = None,
         vram_pipeline_bytes: int = 0,
         current_strategy: str | None = None,
+        observed_previous_peak_bytes: int = 0,
     ) -> MemoryPlan:
         gpu = self._nvidia_metrics() or {}
         total = int(gpu.get("vram_total_bytes") or 0)
@@ -1636,7 +1643,6 @@ class RuntimeManager:
                 total = 0
                 used = 0
         profile = ModelRuntimeProfile.from_metadata(metadata, None)
-        is_video = capability in VIDEO_CAPABILITIES
         memory = self._memory_metrics()
         return self._memory_planner.plan(
             vram_total_bytes=total,
@@ -1652,8 +1658,9 @@ class RuntimeManager:
             capability=capability,
             width=int(width or profile.width),
             height=int(height or profile.height),
-            frames=int(frames or (97 if is_video else 1)),
+            frames=max(1, int(frames or profile.num_frames or 1)),
             current_strategy=current_strategy,
+            observed_previous_peak_bytes=max(0, int(observed_previous_peak_bytes)),
         )
 
     @staticmethod
@@ -1690,6 +1697,7 @@ class RuntimeManager:
                 code="INSUFFICIENT_VRAM",
                 retryable=True,
             )
+        plan.optimizations = []
         if device != "cuda" or plan.strategy == "CPU":
             return pipeline
 
@@ -1705,6 +1713,7 @@ class RuntimeManager:
             if not self._enable_pipeline_method(pipeline, "enable_model_cpu_offload"):
                 if self._enable_pipeline_method(pipeline, "enable_sequential_cpu_offload"):
                     plan.strategy = "SEQUENTIAL_CPU_OFFLOAD"
+                    plan.optimizations.append("SEQUENTIAL_CPU_OFFLOAD")
                 else:
                     raise WorkerError(
                         "VRAM insuffisante et aucun offload CPU n'est supporté par la pipeline.",
@@ -1712,15 +1721,17 @@ class RuntimeManager:
                         code="INSUFFICIENT_VRAM",
                         retryable=True,
                     )
-        elif plan.strategy == "SEQUENTIAL_CPU_OFFLOAD" and not self._enable_pipeline_method(
-            pipeline, "enable_sequential_cpu_offload"
-        ):
-            raise WorkerError(
-                "VRAM insuffisante et offload séquentiel indisponible.",
-                409,
-                code="INSUFFICIENT_VRAM",
-                retryable=True,
-            )
+            else:
+                plan.optimizations.append("MODEL_CPU_OFFLOAD")
+        elif plan.strategy == "SEQUENTIAL_CPU_OFFLOAD":
+            if not self._enable_pipeline_method(pipeline, "enable_sequential_cpu_offload"):
+                raise WorkerError(
+                    "VRAM insuffisante et offload séquentiel indisponible.",
+                    409,
+                    code="INSUFFICIENT_VRAM",
+                    retryable=True,
+                )
+            plan.optimizations.append("SEQUENTIAL_CPU_OFFLOAD")
         elif plan.strategy == "DISK_OFFLOAD":
             try:
                 from accelerate import disk_offload
@@ -1743,6 +1754,7 @@ class RuntimeManager:
                 if offloaded == 0:
                     raise RuntimeError("aucun composant offloadable")
                 setattr(pipeline, "_vidioai_disk_offload_dir", str(offload_root))
+                plan.optimizations.append("DISK_OFFLOAD")
             except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
                 raise WorkerError(
                     f"Offload Scratch indisponible: {error}",
@@ -1751,12 +1763,25 @@ class RuntimeManager:
                     retryable=True,
                 ) from error
 
-        for optimization, method_name in (
-            ("VAE_SLICING", "enable_vae_slicing"),
-            ("VAE_TILING", "enable_vae_tiling"),
-        ):
-            if optimization in plan.optimizations:
-                self._enable_pipeline_method(pipeline, method_name)
+        if "VIDEO" in plan.capability:
+            for optimization, method_name in (
+                ("VAE_SLICING", "enable_vae_slicing"),
+                ("VAE_TILING", "enable_vae_tiling"),
+            ):
+                if self._enable_pipeline_method(pipeline, method_name):
+                    plan.optimizations.append(optimization)
+            for component_name in ("unet", "transformer"):
+                component = getattr(pipeline, component_name, None)
+                method = getattr(component, "enable_forward_chunking", None)
+                if not callable(method):
+                    continue
+                try:
+                    method()
+                    plan.optimizations.append("FORWARD_CHUNKING")
+                    break
+                except (ImportError, NotImplementedError, RuntimeError, TypeError, ValueError):
+                    continue
+        plan.optimizations = list(dict.fromkeys(plan.optimizations))
         return pipeline
 
     def _load_pipeline(
@@ -1792,18 +1817,6 @@ class RuntimeManager:
                     code="PIPELINE_CAPABILITY_NOT_AVAILABLE",
                 )
 
-        optional_optimizations = []
-        if os.getenv("VIDIOAI_ENABLE_VAE_TILING", "false").lower() in {"1", "true", "yes"}:
-            optional_optimizations.append("enable_vae_tiling")
-        if os.getenv("VIDIOAI_ENABLE_VAE_SLICING", "false").lower() in {"1", "true", "yes"}:
-            optional_optimizations.append("enable_vae_slicing")
-        for method_name in optional_optimizations:
-            method = getattr(pipeline, method_name, None)
-            if callable(method):
-                try:
-                    method()
-                except (NotImplementedError, RuntimeError, ValueError):
-                    pass
         return pipeline
 
     def _validate_loaded_pipeline(
@@ -2007,6 +2020,7 @@ class RuntimeManager:
                 memory_plan=memory_plan.as_dict(),
             )
         gpu_before = self._nvidia_metrics()
+        memory_before_load = self._memory_metrics()
         load_started = time.perf_counter()
         if cuda_available:
             torch.cuda.reset_peak_memory_stats()
@@ -2077,6 +2091,7 @@ class RuntimeManager:
             ) from error
 
         gpu_after = self._nvidia_metrics()
+        memory_after_load = self._memory_metrics()
         process_peak = int(torch.cuda.max_memory_reserved()) if cuda_available else 0
         idle_vram = int((gpu_before or {}).get("vram_used_bytes", 0))
         total_vram = int((gpu_after or gpu_before or {}).get("vram_total_bytes", 0))
@@ -2090,8 +2105,20 @@ class RuntimeManager:
         load_benchmark = {
             "gpu": str((gpu_after or gpu_before or {}).get("name", "CPU")),
             "vram_idle_bytes": idle_vram,
+            "vram_before_load_bytes": idle_vram,
             "vram_after_load_bytes": int((gpu_after or {}).get("vram_used_bytes", 0)),
+            "pipeline_vram_bytes": max(
+                0,
+                int((gpu_after or {}).get("vram_used_bytes", 0)) - idle_vram,
+            ),
             "vram_peak_bytes": observed_peak,
+            "ram_before_load_bytes": memory_before_load["vidioai_ram_bytes"],
+            "ram_after_load_bytes": memory_after_load["vidioai_ram_bytes"],
+            "pipeline_ram_bytes": max(
+                0,
+                memory_after_load["vidioai_ram_bytes"]
+                - memory_before_load["vidioai_ram_bytes"],
+            ),
             "ram_peak_bytes": self._ram_peak_bytes(),
             "runtime": "Diffusers",
             "precision": precision,
@@ -2228,6 +2255,13 @@ class RuntimeManager:
         old_pipeline = loaded.pipeline
         loaded.pipeline = None
         if old_pipeline is not None:
+            self._cleanup_disk_offload(old_pipeline)
+            self._remove_offload_hooks(old_pipeline)
+            if hasattr(old_pipeline, "to"):
+                try:
+                    old_pipeline.to("cpu")
+                except (RuntimeError, TypeError, ValueError):
+                    pass
             del old_pipeline
         gc.collect()
         if loaded.device == "cuda" and torch.cuda.is_available():
@@ -2325,6 +2359,13 @@ class RuntimeManager:
         previous = loaded.pipeline
         loaded.pipeline = None
         if previous is not None:
+            self._cleanup_disk_offload(previous)
+            self._remove_offload_hooks(previous)
+            if hasattr(previous, "to"):
+                try:
+                    previous.to("cpu")
+                except (RuntimeError, TypeError, ValueError):
+                    pass
             del previous
         gc.collect()
         if loaded.device == "cuda" and torch.cuda.is_available():
@@ -2362,6 +2403,128 @@ class RuntimeManager:
     def _is_cuda_oom(error: BaseException) -> bool:
         return "cuda out of memory" in f"{type(error).__name__}: {error}".lower()
 
+    @staticmethod
+    def _decode_chunk_size(
+        pipeline: Any,
+        plan: MemoryPlan | None,
+        *,
+        oom_retry: bool = False,
+    ) -> int | None:
+        if "decode_chunk_size" not in inspect.signature(pipeline.__call__).parameters:
+            return None
+        if oom_retry:
+            return 1
+        if plan is None:
+            return 2
+        if plan.strategy in {"SEQUENTIAL_CPU_OFFLOAD", "DISK_OFFLOAD"}:
+            return 1
+        if plan.strategy == "MODEL_CPU_OFFLOAD":
+            return 2
+        ratio = plan.vram_free_bytes / max(1, plan.vram_total_bytes)
+        if ratio >= 0.50:
+            return 8
+        if ratio >= 0.30:
+            return 4
+        return 2
+
+    @staticmethod
+    def _next_memory_strategy(current: str) -> str | None:
+        order = [
+            "FULL_GPU",
+            "MODEL_CPU_OFFLOAD",
+            "SEQUENTIAL_CPU_OFFLOAD",
+            "DISK_OFFLOAD",
+        ]
+        try:
+            index = order.index(current)
+        except ValueError:
+            index = 0
+        return order[index + 1] if index + 1 < len(order) else None
+
+    def _rebuild_pipeline_after_oom(
+        self,
+        loaded: LoadedModel,
+        adapter: Any,
+        capability: str,
+        prepared_request: dict[str, Any],
+        torch: Any,
+    ) -> None:
+        current_strategy = (
+            loaded.memory_plan.strategy if loaded.memory_plan is not None else "FULL_GPU"
+        )
+        next_strategy = self._next_memory_strategy(current_strategy)
+        if next_strategy is None or loaded.precision_plan is None:
+            self._release_pipeline_after_oom(loaded)
+            raise WorkerError(
+                "VRAM insuffisante pendant l'inférence ; aucune stratégie plus conservatrice n'est disponible.",
+                409,
+                code="INSUFFICIENT_VRAM",
+                retryable=True,
+            )
+
+        previous = loaded.pipeline
+        loaded.pipeline = None
+        if previous is not None:
+            self._cleanup_disk_offload(previous)
+            self._remove_offload_hooks(previous)
+            if hasattr(previous, "to"):
+                try:
+                    previous.to("cpu")
+                except (RuntimeError, TypeError, ValueError):
+                    pass
+            del previous
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        snapshot, _ = self._active_snapshot(loaded.model_id)
+        model_bytes = loaded.memory_plan.model_bytes if loaded.memory_plan is not None else 0
+        memory_plan = self._memory_plan(
+            torch,
+            loaded.metadata or {},
+            capability,
+            loaded.precision_plan,
+            model_bytes,
+            width=int(prepared_request.get("width") or 1),
+            height=int(prepared_request.get("height") or 1),
+            frames=int(prepared_request.get("frames") or 1),
+            current_strategy=next_strategy,
+            observed_previous_peak_bytes=int(
+                loaded.load_benchmark.get("vram_peak_bytes") or 0
+            ),
+        )
+        if not memory_plan.feasible:
+            self._release_pipeline_after_oom(loaded)
+            raise WorkerError(
+                "VRAM insuffisante après recalcul des ressources.",
+                409,
+                code="INSUFFICIENT_VRAM",
+                retryable=True,
+            )
+        try:
+            loaded.pipeline = self._load_pipeline(
+                snapshot=snapshot,
+                metadata=loaded.metadata or {},
+                capability=capability,
+                adapter=adapter,
+                device=loaded.device,
+                dtype=self._dtype_resolver.materialize(torch, loaded.precision_plan),
+                memory_plan=memory_plan,
+            )
+        except Exception as error:
+            self._release_pipeline_after_oom(loaded)
+            if isinstance(error, WorkerError):
+                raise
+            raise WorkerError(
+                f"Rechargement après OOM impossible: {type(error).__name__}: {error}",
+                409,
+                code="INSUFFICIENT_VRAM",
+                retryable=True,
+            ) from error
+        loaded.memory_plan = memory_plan
+        loaded.load_benchmark["memory_strategy"] = memory_plan.strategy
+        loaded.load_benchmark["memory_plan"] = memory_plan.as_dict()
+
     def _release_pipeline_after_oom(self, loaded: LoadedModel) -> None:
         pipeline = loaded.pipeline
         loaded.pipeline = None
@@ -2384,6 +2547,7 @@ class RuntimeManager:
             }
         if pipeline is not None:
             self._cleanup_disk_offload(pipeline)
+            self._remove_offload_hooks(pipeline)
             del pipeline
         gc.collect()
         try:
@@ -2420,6 +2584,9 @@ class RuntimeManager:
             frames=int(prepared_request.get("frames") or 1),
             vram_pipeline_bytes=pipeline_vram_bytes,
             current_strategy=current_strategy,
+            observed_previous_peak_bytes=int(
+                loaded.load_benchmark.get("vram_peak_bytes") or 0
+            ),
         )
         if not request_plan.feasible:
             raise WorkerError(
@@ -2448,8 +2615,12 @@ class RuntimeManager:
             loaded.load_benchmark["memory_strategy"] = request_plan.strategy
             loaded.load_benchmark["cpu_offload"] = request_plan.strategy != "DISK_OFFLOAD"
             loaded.load_benchmark["disk_offload"] = request_plan.strategy == "DISK_OFFLOAD"
+        elif loaded.memory_plan is not None:
+            request_plan.optimizations = list(loaded.memory_plan.optimizations)
         loaded.memory_plan = request_plan
         loaded.load_benchmark["memory_plan"] = request_plan.as_dict()
+        loaded.load_benchmark["vram_free_before_inference"] = request_plan.vram_free_bytes
+        loaded.load_benchmark["ram_available_before_inference"] = request_plan.ram_available_bytes
         with self._lock:
             current = self._model_states.get(loaded.model_id)
             if current is not None:
@@ -2472,6 +2643,7 @@ class RuntimeManager:
         )
         prepared_request = self._resolve_generation_inputs(request, loaded.pipeline)
         is_video_request = requested_capability in VIDEO_CAPABILITIES
+        frame_plan = None
         if is_video_request:
             profile = ModelRuntimeProfile.from_metadata(loaded.metadata or {}, loaded.pipeline)
             try:
@@ -2501,16 +2673,45 @@ class RuntimeManager:
                     "dimension_multiple": resolution.dimension_multiple,
                 }
             )
-            normalized = profile.normalize(prepared_request, video=True)
+            normalized = profile.normalize(
+                {**prepared_request, "frames": None},
+                video=False,
+            )
+            gpu = self._nvidia_metrics() or {}
+            memory = self._memory_metrics()
+            frame_plan = self._video_frame_planner.plan(
+                pipeline=loaded.pipeline,
+                metadata=loaded.metadata or {},
+                capability=requested_capability,
+                requested_duration=normalized["duration_seconds"],
+                requested_fps=normalized["fps"],
+                requested_frames=request.get("frames"),
+                vram_free_bytes=max(
+                    0,
+                    int(gpu.get("vram_total_bytes") or 0)
+                    - int(gpu.get("vram_used_bytes") or 0),
+                ),
+                ram_available_bytes=memory["ram_available_bytes"],
+                width=resolution.width,
+                height=resolution.height,
+            )
             prepared_request.update(
                 {
                     "fps": normalized["fps"],
                     "duration_seconds": normalized["duration_seconds"],
-                    "frames": normalized["num_frames"],
+                    "requested_duration_seconds": frame_plan.requested_duration_seconds,
+                    "requested_fps": frame_plan.requested_fps,
+                    "requested_frames": frame_plan.requested_frames,
+                    "inference_frames": frame_plan.inference_frames,
+                    "frame_plan": frame_plan.as_dict(),
                     "steps": normalized["num_inference_steps"],
                     "guidance_scale": normalized["guidance_scale"],
                 }
             )
+            if frame_plan.inference_frames is None:
+                prepared_request.pop("frames", None)
+            else:
+                prepared_request["frames"] = frame_plan.inference_frames
 
         with self._lock:
             cancel_event = self._cancel_events.get(job_id)
@@ -2531,6 +2732,48 @@ class RuntimeManager:
         self._adapt_memory_plan_for_request(
             loaded, prepared_request, requested_capability, torch
         )
+        decode_chunk_size = self._decode_chunk_size(
+            loaded.pipeline,
+            loaded.memory_plan,
+        )
+        if decode_chunk_size is None:
+            prepared_request.pop("decode_chunk_size", None)
+        else:
+            prepared_request["decode_chunk_size"] = decode_chunk_size
+
+        def log_generation_plan(stage: str) -> None:
+            memory_plan = loaded.memory_plan
+            logger.info(
+                "GENERATION_PLAN %s",
+                json.dumps(
+                    {
+                        "stage": stage,
+                        "model_id": loaded.model_id,
+                        "capability": requested_capability,
+                        "pipeline": type(loaded.pipeline).__name__,
+                        "precision": loaded.precision,
+                        "strategy": memory_plan.strategy if memory_plan else None,
+                        "width": prepared_request.get("width"),
+                        "height": prepared_request.get("height"),
+                        "requested_duration": prepared_request.get("requested_duration_seconds"),
+                        "requested_fps": prepared_request.get("requested_fps"),
+                        "requested_frames": prepared_request.get("requested_frames"),
+                        "inference_frames": prepared_request.get("inference_frames"),
+                        "steps": prepared_request.get("steps"),
+                        "decode_chunk_size": prepared_request.get("decode_chunk_size"),
+                        "forward_chunking": bool(
+                            memory_plan and "FORWARD_CHUNKING" in memory_plan.optimizations
+                        ),
+                        "optimizations": memory_plan.optimizations if memory_plan else [],
+                        "vram_total": memory_plan.vram_total_bytes if memory_plan else 0,
+                        "vram_free": memory_plan.vram_free_bytes if memory_plan else 0,
+                        "ram_total": memory_plan.ram_total_bytes if memory_plan else 0,
+                        "ram_available": memory_plan.ram_available_bytes if memory_plan else 0,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
         generation_started = time.perf_counter()
         if loaded.device == "cuda":
             torch.cuda.reset_peak_memory_stats()
@@ -2547,45 +2790,66 @@ class RuntimeManager:
             "metadata": loaded.metadata or {},
             "capability": requested_capability,
         }
+        log_generation_plan("initial")
         try:
-            try:
-                output = adapter.generate(loaded.pipeline, runtime, prepared_request)
-            except Exception as retry_error:
-                if self._dtype_resolver.is_dtype_mismatch(retry_error):
-                    raise WorkerError(
-                        f"DTYPE_MISMATCH: {type(retry_error).__name__}: {retry_error}",
-                        422,
-                        code="DTYPE_MISMATCH",
-                        retryable=False,
-                    ) from retry_error
-                raise
+            output = adapter.generate(loaded.pipeline, runtime, prepared_request)
         except Exception as error:
             if self._is_cuda_oom(error):
-                self._release_pipeline_after_oom(loaded)
-                raise WorkerError(
-                    "VRAM insuffisante pendant l'inférence ; ressources CUDA libérées.",
-                    409,
-                    code="INSUFFICIENT_VRAM",
-                    retryable=True,
-                ) from error
-            self._recover_dtype_pipeline(
-                loaded,
-                requested_capability,
-                adapter,
-                error,
-            )
-            try:
-                output = adapter.generate(loaded.pipeline, runtime, prepared_request)
-            except Exception as retry_error:
-                if self._is_cuda_oom(retry_error):
-                    self._release_pipeline_after_oom(loaded)
-                    raise WorkerError(
-                        "VRAM insuffisante pendant la récupération dtype ; ressources CUDA libérées.",
-                        409,
-                        code="INSUFFICIENT_VRAM",
-                        retryable=True,
-                    ) from retry_error
-                raise
+                self._rebuild_pipeline_after_oom(
+                    loaded,
+                    adapter,
+                    requested_capability,
+                    prepared_request,
+                    torch,
+                )
+                prepared_request["decode_chunk_size"] = self._decode_chunk_size(
+                    loaded.pipeline,
+                    loaded.memory_plan,
+                    oom_retry=True,
+                )
+                if prepared_request["decode_chunk_size"] is None:
+                    prepared_request.pop("decode_chunk_size")
+                log_generation_plan("oom_retry")
+                try:
+                    output = adapter.generate(loaded.pipeline, runtime, prepared_request)
+                except Exception as retry_error:
+                    if self._is_cuda_oom(retry_error):
+                        self._release_pipeline_after_oom(loaded)
+                        raise WorkerError(
+                            "VRAM insuffisante après l'unique récupération OOM ; ressources CUDA libérées.",
+                            409,
+                            code="INSUFFICIENT_VRAM",
+                            retryable=True,
+                        ) from retry_error
+                    raise
+            else:
+                self._recover_dtype_pipeline(
+                    loaded,
+                    requested_capability,
+                    adapter,
+                    error,
+                )
+                decode_chunk_size = self._decode_chunk_size(
+                    loaded.pipeline,
+                    loaded.memory_plan,
+                )
+                if decode_chunk_size is None:
+                    prepared_request.pop("decode_chunk_size", None)
+                else:
+                    prepared_request["decode_chunk_size"] = decode_chunk_size
+                log_generation_plan("dtype_retry")
+                try:
+                    output = adapter.generate(loaded.pipeline, runtime, prepared_request)
+                except Exception as retry_error:
+                    if self._is_cuda_oom(retry_error):
+                        self._release_pipeline_after_oom(loaded)
+                        raise WorkerError(
+                            "VRAM insuffisante pendant la récupération dtype ; ressources CUDA libérées.",
+                            409,
+                            code="INSUFFICIENT_VRAM",
+                            retryable=True,
+                        ) from retry_error
+                    raise
         if cancel_event.is_set():
             raise InterruptedError("Job annulé.")
 
@@ -2667,10 +2931,15 @@ class RuntimeManager:
             "height": height,
             "requested_quality": prepared_request.get("quality") if is_video_request else None,
             "requested_aspect_ratio": prepared_request.get("aspect_ratio") if is_video_request else None,
+            "requested_duration_seconds": prepared_request.get("requested_duration_seconds") if is_video_request else None,
+            "requested_fps": prepared_request.get("requested_fps") if is_video_request else None,
+            "requested_frames": prepared_request.get("requested_frames") if is_video_request else None,
+            "inference_frames": prepared_request.get("inference_frames") if is_video_request else None,
             "actual_width": width,
             "actual_height": height,
             "actual_fps": media_probe.get("fps") if is_video_request else None,
             "actual_frames": media_probe.get("frames") if is_video_request else None,
+            "actual_duration": media_probe.get("duration") if is_video_request else None,
             "sha256": self._sha256(output_path),
             "benchmark": benchmark,
         }
@@ -2712,10 +2981,44 @@ class RuntimeManager:
                 retryable = error.retryable
                 status_code = error.status_code
             else:
-                message = "La génération a échoué dans le runtime Diffusers."
-                error_code = "GENERATION_FAILED"
+                if isinstance(error, NormalizationError):
+                    error_code = error.code
+                    status_code = 422 if error.code in {
+                        "INVALID_INPUT_ASSET",
+                        "INVALID_OUTPUT_PATH",
+                        "RESOLUTION_UNSUPPORTED",
+                    } else 500
+                elif isinstance(error, (TypeError, ValueError)):
+                    error_code = "PIPELINE_ARGUMENT_ERROR"
+                    status_code = 422
+                else:
+                    error_code = "GENERATION_FAILED"
+                    status_code = 500
+                message = (
+                    str(error)
+                    if status_code < 500
+                    else "La génération a échoué dans le runtime Diffusers."
+                )
                 retryable = False
-                status_code = 500
+                logger.exception(
+                    "GENERATION_EXCEPTION %s",
+                    json.dumps(
+                        {
+                            "exception_type": type(error).__name__,
+                            "exception_message": str(error),
+                            "capability": request.get("capability"),
+                            "pipeline_class": type(loaded.pipeline).__name__ if loaded.pipeline is not None else None,
+                            "memory_strategy": loaded.memory_plan.strategy if loaded.memory_plan is not None else None,
+                            "precision": loaded.precision,
+                            "width": request.get("width"),
+                            "height": request.get("height"),
+                            "frames": request.get("frames"),
+                            "steps": request.get("steps"),
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
             result = {
                 "job_id": job_id,
                 "state": JobState.FAILED,

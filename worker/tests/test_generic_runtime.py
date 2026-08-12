@@ -506,7 +506,7 @@ def test_output_normalizer_rejects_png_for_video(tmp_path: Path) -> None:
     assert caught.value.code == "INVALID_OUTPUT_PATH"
 
 
-def test_model_profile_uses_metadata_and_normalizes_constraints() -> None:
+def test_model_profile_never_derives_frames_from_duration_times_fps() -> None:
     profile = ModelRuntimeProfile.from_metadata(
         {
             "model_index": {
@@ -526,8 +526,7 @@ def test_model_profile_uses_metadata_and_normalizes_constraints() -> None:
     assert values["guidance_scale"] == 4.5
     assert values["width"] % 32 == 0
     assert values["height"] % 32 == 0
-    assert (values["num_frames"] - 1) % 4 == 0
-    assert values["num_frames"] == 49
+    assert values["num_frames"] is None
 
 
 @pytest.mark.parametrize(
@@ -588,7 +587,7 @@ def test_resolution_resolver_prefers_closest_720p_size_over_overscaling() -> Non
     assert (result.width, result.height) == (1280, 704)
 
 
-def test_temporal_normalization_chooses_97_frames_for_four_seconds_at_24_fps() -> None:
+def test_temporal_normalization_does_not_convert_product_target_to_inference_frames() -> None:
     profile = ModelRuntimeProfile.from_metadata(
         {"config": {"temporal_compression_ratio": 4}}
     )
@@ -597,7 +596,7 @@ def test_temporal_normalization_chooses_97_frames_for_four_seconds_at_24_fps() -
         video=True,
     )
     assert values["fps"] == 24
-    assert values["num_frames"] == 97
+    assert values["num_frames"] is None
 
 
 def test_worker_compatibility_reports_installed_class_and_real_capabilities(tmp_path: Path) -> None:

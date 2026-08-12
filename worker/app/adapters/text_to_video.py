@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 from typing import Any
 
-from .base import RuntimeAdapter
+from .base import RuntimeAdapter, log_diffusers_call
 
 
 class TextToVideoAdapter(RuntimeAdapter):
@@ -86,17 +86,11 @@ class TextToVideoAdapter(RuntimeAdapter):
         width = int(request.get("width") or 512)
         height = int(request.get("height") or 320)
         fps = int(request.get("fps") or 24)
-        duration = int(request.get("duration_seconds") or 4)
         frames = request.get("frames")
         steps = request.get("steps")
         guidance = request.get("guidance_scale")
 
         if is_wan:
-            if not frames or int(frames) <= 8:
-                frames = duration * fps + 1
-            frames = int(frames)
-            frames = round((frames - 1) / 4) * 4 + 1
-            frames = max(5, frames)
             if not steps or int(steps) <= 4:
                 steps = 50
             if guidance is None or float(guidance) <= 0.0:
@@ -108,6 +102,8 @@ class TextToVideoAdapter(RuntimeAdapter):
             "height": height,
             "width": width,
             "num_frames": frames,
+            "video_length": frames,
+            "decode_chunk_size": request.get("decode_chunk_size"),
             "fps": fps,
             "num_inference_steps": steps or 4,
             "guidance_scale": guidance if guidance is not None else 0.0,
@@ -120,6 +116,7 @@ class TextToVideoAdapter(RuntimeAdapter):
             for key, value in kwargs.items()
             if key in accepted and value is not None
         }
+        log_diffusers_call(pipeline, filtered, str(request.get("capability") or "TEXT_TO_VIDEO"))
         output = pipeline(**filtered)
         return {
             "frames": getattr(output, "frames", []),

@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 from typing import Any
 
-from .base import RuntimeAdapter
+from .base import RuntimeAdapter, log_diffusers_call
 
 
 class TextToImageAdapter(RuntimeAdapter):
@@ -54,5 +54,6 @@ class TextToImageAdapter(RuntimeAdapter):
             for key, value in kwargs.items()
             if key in accepted and value is not None
         }
+        log_diffusers_call(pipeline, filtered, str(request.get("capability") or "TEXT_TO_IMAGE"))
         output = pipeline(**filtered)
         return {"images": getattr(output, "images", [])}

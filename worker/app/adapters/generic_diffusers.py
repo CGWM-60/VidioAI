@@ -7,7 +7,7 @@ from ..capability_resolver import CapabilityResolver
 from ..model_profile import ModelRuntimeProfile
 from ..normalizers import NormalizationError, assign_alias
 from ..pipeline_resolver import PipelineResolver
-from .base import RuntimeAdapter
+from .base import RuntimeAdapter, log_diffusers_call
 
 
 class GenericDiffusersAdapter(RuntimeAdapter):
@@ -142,6 +142,7 @@ class GenericDiffusersAdapter(RuntimeAdapter):
             "guidance_scale": values["guidance_scale"],
             "generator": runtime.get("generator"),
             "fps": values["fps"],
+            "decode_chunk_size": request.get("decode_chunk_size"),
             "strength": request.get("strength"),
             "callback_on_step_end": runtime.get("callback"),
         }
@@ -180,5 +181,6 @@ class GenericDiffusersAdapter(RuntimeAdapter):
             for key, value in kwargs.items()
             if key in accepted and value is not None
         }
+        log_diffusers_call(pipeline, filtered, capability)
         output = pipeline(**filtered)
         return self._normalize_output(output, capability, values)

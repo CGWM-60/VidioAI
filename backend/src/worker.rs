@@ -198,6 +198,14 @@ pub struct GenerateResponse {
     #[serde(default)]
     pub requested_aspect_ratio: Option<String>,
     #[serde(default)]
+    pub requested_duration_seconds: Option<f64>,
+    #[serde(default)]
+    pub requested_fps: Option<u32>,
+    #[serde(default)]
+    pub requested_frames: Option<u32>,
+    #[serde(default)]
+    pub inference_frames: Option<u32>,
+    #[serde(default)]
     pub actual_width: Option<u32>,
     #[serde(default)]
     pub actual_height: Option<u32>,
@@ -205,6 +213,8 @@ pub struct GenerateResponse {
     pub actual_fps: Option<f64>,
     #[serde(default)]
     pub actual_frames: Option<u32>,
+    #[serde(default)]
+    pub actual_duration: Option<f64>,
     pub sha256: String,
     #[serde(default)]
     pub benchmark: Option<WorkerBenchmarkObservation>,

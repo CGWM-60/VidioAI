@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 from typing import Any
 
-from .base import RuntimeAdapter
+from .base import RuntimeAdapter, log_diffusers_call
 
 
 class VideoToVideoAdapter(RuntimeAdapter):
@@ -51,6 +51,8 @@ class VideoToVideoAdapter(RuntimeAdapter):
             "height": request.get("height", 320),
             "width": request.get("width", 512),
             "num_frames": request.get("frames"),
+            "video_length": request.get("frames"),
+            "decode_chunk_size": request.get("decode_chunk_size"),
             "fps": request.get("fps"),
             "num_inference_steps": request.get("steps", 4),
             "guidance_scale": request.get("guidance_scale", 0.0),
@@ -64,5 +66,6 @@ class VideoToVideoAdapter(RuntimeAdapter):
             for key, value in kwargs.items()
             if key in accepted and value is not None
         }
+        log_diffusers_call(pipeline, filtered, str(request.get("capability") or "VIDEO_TO_VIDEO"))
         output = pipeline(**filtered)
         return {"frames": getattr(output, "frames", [])}
