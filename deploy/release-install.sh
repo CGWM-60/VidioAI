@@ -33,8 +33,8 @@ finish() {
 trap finish EXIT
 
 stage() {
-  CURRENT_STEP=${1:?numéro d'étape requis}
-  CURRENT_STAGE=${2:?nom d'étape requis}
+  CURRENT_STEP=${1:?numero_etape_requis}
+  CURRENT_STAGE=${2:?nom_etape_requis}
   printf '[%s/7] %s\n' "${CURRENT_STEP}" "${CURRENT_STAGE}"
 }
 
