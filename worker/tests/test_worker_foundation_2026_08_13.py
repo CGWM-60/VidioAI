@@ -744,14 +744,28 @@ def test_preflight_ready_path_is_atomic_and_uses_built_workflow(tmp_path: Path) 
         fps=None,
     )
 
-    result = PreflightService(WorkflowBuilder(WORKFLOWS_DIRECTORY)).run(
+    builder = WorkflowBuilder(WORKFLOWS_DIRECTORY)
+    template = builder.load(pack.workflow_for("TEXT_TO_IMAGE") or "")
+    available_node_types = sorted(
+        {
+            str(node["class_type"])
+            for node in template["workflow"].values()
+            if isinstance(node, dict) and node.get("class_type")
+        }
+    )
+
+    result = PreflightService(builder).run(
         model_id="flux-test",
         pack=pack,
         capability="TEXT_TO_IMAGE",
         request=request,
         snapshot=snapshot,
         execution_plan=plan,
-        engine_health=lambda: {"ready": True, "engine": "comfyui-mock"},
+        engine_health=lambda: {
+            "ready": True,
+            "engine": "comfyui-mock",
+            "available_node_types": available_node_types,
+        },
         dependency_errors=[],
         diagnostics={"source": "unit-test"},
     )

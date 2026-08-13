@@ -2,7 +2,7 @@
   "schema_version": 1,
   "id": "minimax-h3-diffusers-v1",
   "family": "minimax-h3",
-  "status": "READY",
+  "status": "EXPERIMENTAL",
   "engine": "diffusers",
   "capabilities": ["TEXT_TO_VIDEO", "IMAGE_TO_VIDEO", "START_END_IMAGE_TO_VIDEO", "MULTI_IMAGE_TO_VIDEO"],
   "architectures": ["MiniMaxH3ModularPipeline", "MiniMaxH3Transformer3DModel"],

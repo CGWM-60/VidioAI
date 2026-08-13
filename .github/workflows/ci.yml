@@ -187,6 +187,7 @@ jobs:
           set -Eeuo pipefail
 
           bash -n \
+            deploy/release-install.sh \
             deploy/scripts/*.sh \
             deploy/scripts/lib/*.sh \
             deploy/tests/*.sh
@@ -194,6 +195,7 @@ jobs:
           bash deploy/tests/test-s3-paths.sh
           bash deploy/tests/test-build-release-immutability.sh
           bash deploy/tests/test-production-compose-contract.sh
+          echo "Validation release-install..."
           bash deploy/tests/test-release-install.sh
 
 

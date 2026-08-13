@@ -133,7 +133,7 @@ grep -Fxq shutdown "${LOG_FILE}"
 grep -Fxq "deploy:${VERSION}" "${LOG_FILE}"
 grep -Fxq "pull:registry.example/comfyui@${DIGEST}" "${LOG_FILE}"
 grep -Fxq worker-health "${LOG_FILE}"
-[[ "$(grep -nE 'shutdown|deploy:' "${LOG_FILE}" | cut -d: -f2 | tr '\n' ' ')" == "shutdown deploy:${VERSION} " ]]
+[[ "$(grep -nE 'shutdown|deploy:' "${LOG_FILE}" | cut -d: -f2- | tr '\n' ' ')" == "shutdown deploy:${VERSION} " ]]
 
 # Un fichier injecté mais absent de SHA256SUMS doit être refusé pendant Verify,
 # avant pull, arrêt ou installation.

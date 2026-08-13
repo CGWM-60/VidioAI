@@ -35,6 +35,8 @@ jq -e '
   (.services.comfyui.profiles == ["comfyui"]) and
   (.services.comfyui.image | contains("@sha256:")) and
   (.services.comfyui.healthcheck.test | any(contains("http://127.0.0.1:8188/system_stats"))) and
+  (.services.comfyui.command | index("--reserve-vram") != null) and
+  (.services.comfyui.command | index("12") != null) and
   (.services.comfyui.volumes | any(.target == "/models")) and
   (.services.comfyui.volumes | any(.target == "/opt/comfyui/models")) and
   (.services.comfyui.volumes | any(.target == "/work")) and

@@ -991,14 +991,19 @@ mod tests {
         let registry = VersionedPackRegistry::open(root.clone(), vec![pack()], Some(&source), 10)
             .await
             .unwrap();
-        let path = artifact_path(&root, "fixture-pack", "1.0.0");
+        let version = registry
+            .active_version("fixture-pack")
+            .await
+            .expect("fixture-pack actif")
+            .version;
+        let path = artifact_path(&root, "fixture-pack", &version);
         let mut artifact: Value = serde_json::from_slice(&fs::read(&path).await.unwrap()).unwrap();
         artifact["sha256"] = json!("0".repeat(64));
         fs::write(&path, serde_json::to_vec(&artifact).unwrap())
             .await
             .unwrap();
         let error = registry
-            .activate("fixture-pack", "1.0.0", env!("CARGO_PKG_VERSION"))
+            .activate("fixture-pack", &version, env!("CARGO_PKG_VERSION"))
             .await
             .unwrap_err();
         assert!(error.starts_with("MODEL_PACK_CHECKSUM_MISMATCH"));
@@ -1015,6 +1020,11 @@ mod tests {
         let publisher = VersionedPackRegistry::open(first.clone(), vec![pack()], Some(&source), 10)
             .await
             .unwrap();
+        let version = publisher
+            .active_version("fixture-pack")
+            .await
+            .expect("fixture-pack actif")
+            .version;
         publisher
             .publish("fixture-pack", None, &storage, 11)
             .await
@@ -1026,13 +1036,9 @@ mod tests {
                 .await
                 .contains_key("model-packs/registry.json")
         );
-        assert!(
-            storage
-                .objects
-                .read()
-                .await
-                .contains_key("model-packs/fixture-pack/1.0.0/workflows/fixture.json")
-        );
+        let workflow_key =
+            format!("model-packs/fixture-pack/{version}/workflows/fixture.json");
+        assert!(storage.objects.read().await.contains_key(&workflow_key));
 
         let consumer = VersionedPackRegistry::open(second.clone(), Vec::new(), None, 20)
             .await
@@ -1040,11 +1046,11 @@ mod tests {
         let discovered = consumer.synchronize_from_storage(&storage).await.unwrap();
         assert_eq!(discovered.len(), 1);
         consumer
-            .ensure_local_from_storage("fixture-pack", "1.0.0", &storage)
+            .ensure_local_from_storage("fixture-pack", &version, &storage)
             .await
             .unwrap();
         consumer
-            .activate("fixture-pack", "1.0.0", env!("CARGO_PKG_VERSION"))
+            .activate("fixture-pack", &version, env!("CARGO_PKG_VERSION"))
             .await
             .unwrap();
         assert_eq!(consumer.active_packs().await.unwrap(), [pack()]);
