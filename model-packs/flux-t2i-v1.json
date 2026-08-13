@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "id": "flux-t2i-v1",
+  "family": "flux",
+  "status": "READY",
+  "engine": "comfyui",
+  "capabilities": ["TEXT_TO_IMAGE"],
+  "architectures": ["FluxTransformer2DModel"],
+  "pipeline_classes": ["FluxPipeline"],
+  "workflow_by_capability": {"TEXT_TO_IMAGE": "flux_t2i.json"},
+  "inputs": {"required": ["prompt"], "optional": ["negative_prompt"], "advanced_parameters": ["seed", "steps", "cfg", "sampler", "scheduler", "resolution"]},
+  "outputs": {"media": "image", "format": "png"},
+  "components": {"checkpoint": "transformer", "vae": "vae", "text_encoders": ["text_encoder", "text_encoder_2"], "loras": []},
+  "defaults": {"sampler": "euler", "scheduler": "simple", "steps": 28, "cfg": 3.5, "resolution": {"width": 1024, "height": 1024}, "fps": 0, "frames": 1, "dtype": "BF16", "quantization": null},
+  "memory_policy": {"cuda_required": true, "safety_reserve_bytes": 4294967296, "supports_cpu_offload": true, "supports_sequential_offload": true, "supports_quantization": true, "efficient_attention": true, "component_placement": {"transformer": "gpu", "text_encoder": "cpu_offload", "vae": "gpu_temporary"}},
+  "presets": {"FAST": {"steps": 12}, "BALANCED": {"steps": 28}, "QUALITY": {"steps": 40}}
+}

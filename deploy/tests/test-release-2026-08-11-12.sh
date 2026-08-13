@@ -8,7 +8,8 @@ test -f worker/app/model_bundle.py
 test -f worker/app/inference_recipe.py
 test -f worker/tests/test_release_2026_08_11_12.py
 
-grep -q '^VIDIOAI_VERSION=2026.08.11-12$' deploy/config/production.env.example
+# Ce test historique verrouille le bundle/recette, pas la release active.
+grep -Eq '^VIDIOAI_VERSION=[A-Za-z0-9][A-Za-z0-9._-]+$' deploy/config/production.env.example
 grep -q '^VIDIOAI_AUTO_CACHE_MODELS=false$' deploy/config/production.env.example
 grep -q 'VIDIOAI_AUTO_CACHE_MODELS: ${VIDIOAI_AUTO_CACHE_MODELS:-false}' compose.production.yml
 
@@ -25,7 +26,8 @@ grep -q 'InferenceRecipeResolver' worker/app/runtime.py
 grep -q '"true_cfg_scale"' worker/app/adapters/image_to_image.py
 grep -q '"true_cfg_scale"' worker/app/adapters/image_to_video.py
 
-grep -q 'quality: imageQuality' frontend/app/images/page.js
+grep -q 'preset: imagePreset' frontend/app/images/page.js
+grep -q 'advanced_parameters: advancedParameters' frontend/app/images/page.js
 grep -q 'Appliquer LoRA / recette' 'frontend/app/models/[id]/page.js'
 
 echo "Contrat release 2026.08.11-12: OK"

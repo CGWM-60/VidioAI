@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "id": "diffusers_legacy",
+  "workflow": {"1": {"class_type": "VidioAIDiffusersLegacy", "inputs": {"prompt": ""}}},
+  "bindings": {"prompt": {"node": "1", "field": "prompt", "required": true}},
+  "output_nodes": ["1"]
+}

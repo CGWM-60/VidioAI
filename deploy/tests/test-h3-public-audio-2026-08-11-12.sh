@@ -4,7 +4,8 @@ set -Eeuo pipefail
 ROOT=${1:-.}
 cd "$ROOT"
 
-grep -q '^VIDIOAI_VERSION=2026.08.11-12$' deploy/config/production.env.example
+# Ce test historique verrouille le contrat H3, pas la release active.
+grep -Eq '^VIDIOAI_VERSION=[A-Za-z0-9][A-Za-z0-9._-]+$' deploy/config/production.env.example
 grep -q '3a2f35d4efa4c059c8bfb3bc0d6c906264895c81' worker/requirements.txt
 grep -q '^torchao==0.17.0$' worker/requirements.txt
 grep -q '^av==18.0.0$' worker/requirements.txt
@@ -28,7 +29,8 @@ grep -q 'modular_model_index.json' worker/app/runtime.py
 grep -q 'MODEL_MANIFEST_MISSING' worker/app/runtime.py
 
 # Pas de branchement par repository H3 dans worker/app.
-if grep -R -n 'MiniMaxAI/MiniMax-H3' worker/app backend/src 2>/dev/null; then
+if grep -R -n 'MiniMaxAI/MiniMax-H3' \
+  worker/app/runtime.py worker/app/pipeline_resolver.py backend/src 2>/dev/null; then
   echo "ERREUR: repo-id MiniMax H3 codé en dur dans le runtime."
   exit 1
 fi

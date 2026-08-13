@@ -7,6 +7,7 @@ import {
   BsExclamationTriangle, BsHddStack,
 } from "react-icons/bs";
 import { apiFetch, closeWebSocketSafely, eventsUrl } from "../../lib/api";
+import ModelNavigation from "../ModelNavigation";
 import styles from "../../studio.module.css";
 import { CLOUD_TERMINAL_STATUSES, cloudJobPresentation, cloudRestorePayload, restoredModelHref } from "./cloud-state.mjs";
 
@@ -148,9 +149,7 @@ export default function CloudModelsPage() {
 
   return (
     <div className={styles.page}>
-      <nav className={styles.modelNavigation} aria-label="Navigation modèles">
-        <Link href="/models">Catalogue</Link><Link href="/models/installed">Installés</Link><Link className={styles.modelNavigationActive} href="/models/cloud">Sauvegardes cloud</Link>
-      </nav>
+      <ModelNavigation active="cloud" />
       <header className={styles.pageHeading}>
         <div><h1><BsCloudCheck /> Sauvegardes cloud</h1><p>Modèles sauvegardés dans Scaleway Object Storage</p></div>
         <div className={styles.headingActions}>

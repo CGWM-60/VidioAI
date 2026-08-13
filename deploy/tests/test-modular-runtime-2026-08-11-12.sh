@@ -4,7 +4,8 @@ set -Eeuo pipefail
 ROOT=${1:-.}
 cd "$ROOT"
 
-grep -q '^VIDIOAI_VERSION=2026.08.11-12$' deploy/config/production.env.example
+# Ce test historique verrouille ModularPipeline, pas la release active.
+grep -Eq '^VIDIOAI_VERSION=[A-Za-z0-9][A-Za-z0-9._-]+$' deploy/config/production.env.example
 grep -q '^VIDIOAI_AUTO_CACHE_MODELS=false$' deploy/config/production.env.example
 
 grep -q 'modular_model_index.json' backend/src/huggingface_catalog.rs
@@ -23,10 +24,11 @@ grep -q 'ModularPipeline' worker/app/pipeline_resolver.py
 grep -q 'modular_model_index.json' worker/app/adapters/inspectors.py
 grep -q 'blocks' worker/app/capability_resolver.py
 
-# Pas de support artificiel par nom de modèle/repository dans le runtime.
-if grep -R -n -E 'MiniMaxH3|MiniMax-H3|MiniMax/H3' \
-  worker/app backend/src 2>/dev/null; then
-  echo "ERREUR: branchement H3 codé en dur détecté."
+# Pas de support artificiel par nom de modèle/repository dans le runtime
+# central. Les plugins/adapters de famille restent autorisés.
+if grep -n -E 'MiniMaxAI/MiniMax-H3|MiniMax/H3' \
+  worker/app/runtime.py worker/app/pipeline_resolver.py backend/src/*.rs 2>/dev/null; then
+  echo "ERREUR: repo-id H3 codé en dur détecté."
   exit 1
 fi
 

@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "id": "flux_t2i",
+  "workflow": {
+    "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "", "weight_dtype": "default"}},
+    "2": {"class_type": "DualCLIPLoader", "inputs": {"clip_name1": "", "clip_name2": "", "type": "flux", "device": "default"}},
+    "3": {"class_type": "VAELoader", "inputs": {"vae_name": ""}},
+    "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["2", 0]}},
+    "5": {"class_type": "EmptySD3LatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+    "6": {"class_type": "KSampler", "inputs": {"seed": 0, "steps": 28, "cfg": 3.5, "sampler_name": "euler", "scheduler": "simple", "model": ["1", 0], "positive": ["4", 0], "negative": ["4", 0], "latent_image": ["5", 0]}},
+    "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["3", 0]}},
+    "8": {"class_type": "SaveImage", "inputs": {"filename_prefix": "vidioai", "images": ["7", 0]}}
+  },
+  "bindings": {
+    "checkpoint": {"node": "1", "field": "unet_name", "required": true},
+    "text_encoder_1": {"node": "2", "field": "clip_name1", "required": true},
+    "text_encoder_2": {"node": "2", "field": "clip_name2", "required": true},
+    "vae": {"node": "3", "field": "vae_name", "required": true},
+    "prompt": {"node": "4", "field": "text", "required": true},
+    "width": {"node": "5", "field": "width", "required": true},
+    "height": {"node": "5", "field": "height", "required": true},
+    "batch": {"node": "5", "field": "batch_size", "required": true},
+    "seed": {"node": "6", "field": "seed"},
+    "steps": {"node": "6", "field": "steps", "required": true},
+    "cfg": {"node": "6", "field": "cfg", "required": true},
+    "sampler": {"node": "6", "field": "sampler_name", "required": true},
+    "scheduler": {"node": "6", "field": "scheduler", "required": true},
+    "dtype": {"node": "1", "field": "weight_dtype", "transform": "comfy_dtype", "required": true},
+    "quantization": {"node": "1", "field": "weight_dtype", "transform": "comfy_quantization"},
+    "attention": {"node": "8", "section": "_meta", "field": "vidioai_attention"},
+    "vae_tiling": {"node": "8", "section": "_meta", "field": "vidioai_vae_tiling"},
+    "vae_slicing": {"node": "8", "section": "_meta", "field": "vidioai_vae_slicing"},
+    "model_cpu_offload": {"node": "8", "section": "_meta", "field": "vidioai_model_cpu_offload"},
+    "sequential_cpu_offload": {"node": "8", "section": "_meta", "field": "vidioai_sequential_cpu_offload"},
+    "component_placement": {"node": "8", "section": "_meta", "field": "vidioai_component_placement", "required": true}
+  },
+  "output_nodes": ["8"]
+}

@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "id": "wan22_i2v",
+  "workflow": {
+    "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "", "weight_dtype": "default"}},
+    "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "", "type": "wan", "device": "default"}},
+    "3": {"class_type": "VAELoader", "inputs": {"vae_name": ""}},
+    "4": {"class_type": "LoadImage", "inputs": {"image": ""}},
+    "5": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["2", 0]}},
+    "6": {"class_type": "WanImageToVideo", "inputs": {"width": 832, "height": 480, "length": 81, "batch_size": 1, "positive": ["5", 0], "negative": ["5", 0], "vae": ["3", 0], "start_image": ["4", 0]}},
+    "7": {"class_type": "KSampler", "inputs": {"seed": 0, "steps": 30, "cfg": 5.0, "sampler_name": "uni_pc", "scheduler": "simple", "model": ["1", 0], "positive": ["6", 0], "negative": ["6", 1], "latent_image": ["6", 2]}},
+    "8": {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": ["3", 0]}},
+    "9": {"class_type": "VHS_VideoCombine", "inputs": {"frame_rate": 24, "format": "video/h264-mp4", "images": ["8", 0]}}
+  },
+  "bindings": {
+    "checkpoint": {"node": "1", "field": "unet_name", "required": true},
+    "text_encoder_1": {"node": "2", "field": "clip_name", "required": true},
+    "vae": {"node": "3", "field": "vae_name", "required": true},
+    "input_image": {"node": "4", "field": "image", "required": true},
+    "prompt": {"node": "5", "field": "text", "required": true},
+    "width": {"node": "6", "field": "width", "required": true},
+    "height": {"node": "6", "field": "height", "required": true},
+    "frames": {"node": "6", "field": "length", "required": true},
+    "batch": {"node": "6", "field": "batch_size", "required": true},
+    "seed": {"node": "7", "field": "seed"},
+    "steps": {"node": "7", "field": "steps", "required": true},
+    "cfg": {"node": "7", "field": "cfg", "required": true},
+    "sampler": {"node": "7", "field": "sampler_name", "required": true},
+    "scheduler": {"node": "7", "field": "scheduler", "required": true},
+    "fps": {"node": "9", "field": "frame_rate", "required": true},
+    "dtype": {"node": "1", "field": "weight_dtype", "transform": "comfy_dtype", "required": true},
+    "quantization": {"node": "1", "field": "weight_dtype", "transform": "comfy_quantization"},
+    "attention": {"node": "9", "section": "_meta", "field": "vidioai_attention"},
+    "vae_tiling": {"node": "9", "section": "_meta", "field": "vidioai_vae_tiling"},
+    "vae_slicing": {"node": "9", "section": "_meta", "field": "vidioai_vae_slicing"},
+    "model_cpu_offload": {"node": "9", "section": "_meta", "field": "vidioai_model_cpu_offload"},
+    "sequential_cpu_offload": {"node": "9", "section": "_meta", "field": "vidioai_sequential_cpu_offload"},
+    "component_placement": {"node": "9", "section": "_meta", "field": "vidioai_component_placement", "required": true}
+  },
+  "output_nodes": ["9"]
+}

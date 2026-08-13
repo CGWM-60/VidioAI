@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "id": "minimax-h3-diffusers-v1",
+  "family": "minimax-h3",
+  "status": "READY",
+  "engine": "diffusers",
+  "capabilities": ["TEXT_TO_VIDEO", "IMAGE_TO_VIDEO", "START_END_IMAGE_TO_VIDEO", "MULTI_IMAGE_TO_VIDEO"],
+  "architectures": ["MiniMaxH3ModularPipeline", "MiniMaxH3Transformer3DModel"],
+  "pipeline_classes": ["MiniMaxH3ModularPipeline"],
+  "workflow_by_capability": {"TEXT_TO_VIDEO": "minimax_h3_t2v.json", "IMAGE_TO_VIDEO": "minimax_h3_i2v.json", "START_END_IMAGE_TO_VIDEO": "minimax_h3_i2v.json", "MULTI_IMAGE_TO_VIDEO": "minimax_h3_ref2v.json"},
+  "inputs": {"required": ["prompt"], "optional": ["input_image", "references", "audio"], "advanced_parameters": ["seed", "steps", "fps", "frames", "resolution"]},
+  "outputs": {"media": "video", "format": "mp4", "native_audio": true},
+  "components": {"checkpoint": "transformer", "vae": "vae", "text_encoders": ["text_encoder"], "loras": []},
+  "defaults": {"sampler": null, "scheduler": "native", "steps": 30, "cfg": 0, "resolution": {"width": 768, "height": 512}, "fps": 24, "frames": 124, "dtype": "BF16", "quantization": null},
+  "memory_policy": {"cuda_required": true, "safety_reserve_bytes": 12884901888, "force_strategy": "MODEL_CPU_OFFLOAD", "supports_cpu_offload": true, "supports_sequential_offload": true, "supports_quantization": true, "efficient_attention": true, "component_placement": {"transformer": "gpu_temporary", "text_encoder": "cpu_offload", "vae": "gpu_temporary"}},
+  "presets": {"FAST": {"steps": 20}, "BALANCED": {"steps": 30}, "QUALITY": {"steps": 40}}
+}

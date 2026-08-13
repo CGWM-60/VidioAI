@@ -29,6 +29,10 @@ class Settings:
     default_model_id: str
     default_repository: str
     runtime_deps_dir: Path | None = None
+    comfyui_url: str | None = None
+    packs_dir: Path | None = None
+    workflows_dir: Path | None = None
+    model_pack_registry_dir: Path | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -66,6 +70,24 @@ class Settings:
             default_repository=os.getenv(
                 "VIDIOAI_DEFAULT_AI_REPOSITORY", "stabilityai/sd-turbo"
             ),
+            comfyui_url=(os.getenv("VIDIOAI_COMFYUI_URL") or "").strip() or None,
+            packs_dir=Path(
+                os.getenv(
+                    "VIDIOAI_MODEL_PACKS_DIR",
+                    str(Path(__file__).resolve().parents[2] / "model-packs"),
+                )
+            ),
+            workflows_dir=Path(
+                os.getenv(
+                    "VIDIOAI_WORKFLOWS_DIR",
+                    str(Path(__file__).resolve().parents[2] / "workflows"),
+                )
+            ),
+            model_pack_registry_dir=(
+                Path(value)
+                if (value := os.getenv("VIDIOAI_MODEL_PACK_REGISTRY_DIR", "").strip())
+                else None
+            ),
         )
 
     def ensure_directories(self) -> None:
@@ -81,6 +103,18 @@ class Settings:
     @property
     def runtime_dependencies_path(self) -> Path:
         return self.runtime_deps_dir or self.hf_home.parent / "runtime-deps"
+
+    @property
+    def model_packs_path(self) -> Path:
+        return self.packs_dir or Path(__file__).resolve().parents[2] / "model-packs"
+
+    @property
+    def workflow_templates_path(self) -> Path:
+        return self.workflows_dir or Path(__file__).resolve().parents[2] / "workflows"
+
+    @property
+    def active_model_pack_registry_path(self) -> Path | None:
+        return self.model_pack_registry_dir
 
     def configuration_errors(self) -> list[str]:
         errors: list[str] = []

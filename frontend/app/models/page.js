@@ -9,6 +9,7 @@ import {
 } from "react-icons/bs";
 import { apiFetch } from "../lib/api";
 import { accessStatus, CATALOG_TIMEOUT_MS, MODEL_PREFLIGHT_TIMEOUT_MS } from "./catalog-state.mjs";
+import ModelNavigation from "./ModelNavigation";
 import styles from "../studio.module.css";
 
 // Les filtres décrivent uniquement des catégories d'interface. Les modèles et
@@ -144,9 +145,7 @@ export default function ModelsPage() {
 
   return (
     <div className={styles.page}>
-      <nav className={styles.modelNavigation} aria-label="Navigation modèles">
-        <Link className={styles.modelNavigationActive} href="/models">Catalogue</Link><Link href="/models/installed">Installés</Link><Link href="/models/cloud">Sauvegardes cloud</Link>
-      </nav>
+      <ModelNavigation active="catalog" />
       <header className={styles.pageHeading}>
         <div><h1>Catalogue de modèles</h1><p>Découvrez, téléchargez et installez des modèles en un clic.</p></div>
         <span className={styles.avatar}>A</span>

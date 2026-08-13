@@ -1,6 +1,9 @@
 ARG PYTORCH_IMAGE=pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime
+ARG VIDIOAI_VERSION=dev
 
 FROM ${PYTORCH_IMAGE}
+ARG VIDIOAI_VERSION
+LABEL org.opencontainers.image.version="${VIDIOAI_VERSION}"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -9,7 +12,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     VIDIOAI_RUNTIME_DEPS_DIR=/cache/runtime-deps \
     VIDIOAI_MODELS_DIR=/models \
     VIDIOAI_WORK_DIR=/work \
-    VIDIOAI_OUTPUTS_DIR=/outputs
+    VIDIOAI_OUTPUTS_DIR=/outputs \
+    VIDIOAI_MODEL_PACKS_DIR=/opt/vidioai/model-packs \
+    VIDIOAI_WORKFLOWS_DIR=/opt/vidioai/workflows \
+    VIDIOAI_MODEL_PACK_REGISTRY_DIR=/registry \
+    VIDIOAI_VERSION=${VIDIOAI_VERSION}
 
 # Dépendances système du worker.
 # python3-venv permet d'éviter le blocage PEP 668.
@@ -45,7 +52,7 @@ RUN python --version \
 # Dépendances Python VidioAI
 # ------------------------------------------------------------
 
-COPY requirements.txt ./
+COPY worker/requirements.txt ./
 
 RUN python -m pip install \
     --no-cache-dir \
@@ -70,9 +77,14 @@ RUN useradd \
         /models \
         /cache \
         /work \
-        /outputs
+        /outputs \
+        /opt/vidioai/model-packs \
+        /opt/vidioai/workflows \
+        /registry
 
-COPY --chown=worker:worker app ./app
+COPY --chown=worker:worker worker/app ./app
+COPY --chown=worker:worker model-packs /opt/vidioai/model-packs
+COPY --chown=worker:worker workflows /opt/vidioai/workflows
 
 USER worker
 

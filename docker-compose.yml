@@ -4,17 +4,24 @@ services:
 
   backend:
     build:
-      context: ./backend
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        VIDIOAI_VERSION: ${VIDIOAI_VERSION:-dev}
 
     restart: unless-stopped
 
     environment:
       APP_ENV: LOCAL
+      VIDIOAI_VERSION: ${VIDIOAI_VERSION:-dev}
       VIDIOAI_STATE_DIR: /data/state
-      VIDIOAI_MODELS_DIR: /data/models
+      VIDIOAI_MODELS_DIR: /models
       VIDIOAI_OUTPUTS_DIR: /data/outputs
       VIDIOAI_CACHE_DIR: /data/cache
       VIDIOAI_WORK_DIR: /data/work
+      VIDIOAI_MODEL_PACKS_DIR: /opt/vidioai/model-packs
+      VIDIOAI_WORKFLOWS_DIR: /opt/vidioai/workflows
+      VIDIOAI_MODEL_PACK_REGISTRY_DIR: /registry
       VIDIOAI_WORKER_URL: ${VIDIOAI_WORKER_URL:-}
       HOST_AGENT_URL: ${HOST_AGENT_URL:-}
       HOST_AGENT_TOKEN: ${HOST_AGENT_TOKEN:-}
@@ -25,6 +32,11 @@ services:
 
     volumes:
       - vidioai-data:/data
+      - vidioai-models:/models
+      - vidioai-pack-registry:/registry
+
+    labels:
+      org.opencontainers.image.version: ${VIDIOAI_VERSION:-dev}
 
     expose:
       - "8080"
@@ -37,7 +49,7 @@ services:
         - CMD
         - curl
         - --fail
-        - http://localhost:8080/api/ready
+        - http://localhost:8080/api/health
       interval: 15s
       timeout: 5s
       retries: 8
@@ -51,11 +63,18 @@ services:
       context: ./frontend
       args:
         NEXT_PUBLIC_API_URL: ""
+        VIDIOAI_VERSION: ${VIDIOAI_VERSION:-dev}
+        NEXT_PUBLIC_VIDIOAI_VERSION: ${VIDIOAI_VERSION:-dev}
 
     restart: unless-stopped
 
     environment:
       VIDIOAI_BACKEND_URL: http://backend:8080
+      VIDIOAI_VERSION: ${VIDIOAI_VERSION:-dev}
+      NEXT_PUBLIC_VIDIOAI_VERSION: ${VIDIOAI_VERSION:-dev}
+
+    labels:
+      org.opencontainers.image.version: ${VIDIOAI_VERSION:-dev}
 
     expose:
       - "3000"
@@ -83,7 +102,10 @@ services:
     image: ${VIDIOAI_WORKER_IMAGE:-vidioai-worker:local}
 
     build:
-      context: ./worker
+      context: .
+      dockerfile: worker/Dockerfile
+      args:
+        VIDIOAI_VERSION: ${VIDIOAI_VERSION:-dev}
 
     profiles:
       - gpu
@@ -92,6 +114,7 @@ services:
 
     environment:
       APP_ENV: LOCAL
+      VIDIOAI_VERSION: ${VIDIOAI_VERSION:-dev}
       GPU_REQUIRED: "false"
       HF_HOME: /data/cache/huggingface
       HF_HUB_CACHE: /data/cache/huggingface/hub
@@ -107,10 +130,25 @@ services:
       VIDIOAI_RUNTIME_DEPS_DIR: /data/cache/runtime-deps
       VIDIOAI_WORK_DIR: /data/worker-work
       VIDIOAI_OUTPUTS_DIR: /data/work
+      VIDIOAI_MODEL_PACKS_DIR: /opt/vidioai/model-packs
+      VIDIOAI_WORKFLOWS_DIR: /opt/vidioai/workflows
+      VIDIOAI_MODEL_PACK_REGISTRY_DIR: /registry
+      COMFYUI_URL: ${COMFYUI_URL:-http://comfyui:8188}
+      VIDIOAI_COMFYUI_URL: ${COMFYUI_URL:-http://comfyui:8188}
 
     volumes:
       - vidioai-models:/models
       - vidioai-data:/data
+      - vidioai-pack-registry:/registry:ro
+
+    labels:
+      org.opencontainers.image.version: ${VIDIOAI_VERSION:-dev}
+
+    # Le backend initialise le volume de registre avec l'UID d'écriture. Le
+    # worker ne fait ensuite que lire les snapshots actifs.
+    depends_on:
+      backend:
+        condition: service_started
 
     deploy:
       resources:
@@ -151,3 +189,4 @@ services:
 volumes:
   vidioai-data:
   vidioai-models:
+  vidioai-pack-registry:

@@ -10,12 +10,31 @@ Raccourcis :
 # Runner de build/CI, jamais l'Instance GPU
 VIDIOAI_REGISTRY=... ./deploy/scripts/build-release.sh <version>
 
-# Instance GPU préalablement bootstrappée
-./deploy/scripts/deploy.sh <version>
+# Instance GPU préalablement bootstrappée : commande d'installation canonique
+./deploy/release-install.sh <version>
 ./deploy/scripts/smoke-test.sh http://127.0.0.1:8080
 ./deploy/scripts/shutdown.sh
 ./deploy/scripts/rollback.sh
 ```
+
+`release-install.sh` accepte une archive locale (`VIDIOAI_RELEASE_ARCHIVE`),
+une URL (`VIDIOAI_RELEASE_URL` ou `VIDIOAI_RELEASE_BASE_URL`) ou la release S3
+`s3://$AWS_S3_BUCKET/releases/<version>/`. Il vérifie le manifest, les trois
+tags et leurs digests avant tout arrêt, copie le bundle vérifié, réutilise
+`shutdown.sh` puis `deploy.sh`, et termine par des contrôles HTTP sans lancer de
+génération GPU.
+
+ComfyUI est un moteur headless interne optionnel. Définir
+`COMPOSE_PROFILES=comfyui` dans `.env.production` l'active; son image est
+épinglée par digest par défaut et reste remplaçable avec
+`VIDIOAI_COMFYUI_IMAGE`. Le worker le joint via `COMFYUI_URL`.
+
+Les ModelPacks livrés dans les images restent le socle de secours immuable. Le
+backend initialise puis met à jour le registre indépendant dans
+`$VIDIOAI_STATE_DIR/model-pack-registry`; ce répertoire est monté en lecture-
+écriture dans le backend et en lecture seule dans le worker. Les activations,
+rollbacks et publications passent par le Lab administrateur, conservent les
+anciennes versions et sont vérifiés par SHA-256 avant rechargement à chaud.
 
 `compose.production.yml` ne possède aucune directive `build` et refuse les
 variables critiques absentes. Le proxy écoute la boucle locale tant qu'un TLS

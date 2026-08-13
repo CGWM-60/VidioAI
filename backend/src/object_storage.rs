@@ -12,10 +12,13 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::{fs, process::Command, task};
+use tokio::{fs, process::Command, sync::Notify, task};
 use uuid::Uuid;
 
 pub const MIN_MULTIPART_CHUNK_SIZE: u64 = 128 * 1024 * 1024;
@@ -23,6 +26,71 @@ pub const MULTIPART_HEADROOM_PARTS: u64 = 900;
 pub const MAX_MULTIPART_PARTS: u64 = 1000;
 pub const SNAPSHOT_MANIFEST_NAME: &str = "manifest.json";
 pub const SNAPSHOT_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const CLOUD_BACKUP_CANCELLED_ERROR: &str = "CLOUD_BACKUP_CANCELLED: sauvegarde cloud annulée";
+
+#[derive(Debug, Default)]
+struct TransferCancellationState {
+    cancelled: AtomicBool,
+    notification: Notify,
+}
+
+/// Jeton coopératif partagé par la route d'annulation et l'uploader S3.
+///
+/// Il ne dépend ni de CUDA ni du worker. Une commande AWS active est abandonnée
+/// dès la notification; dans le cas multipart, l'appelant exécute ensuite
+/// explicitement `abort-multipart-upload`.
+#[derive(Debug, Clone, Default)]
+pub struct TransferCancellationToken {
+    state: Arc<TransferCancellationState>,
+}
+
+impl TransferCancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        if !self.state.cancelled.swap(true, Ordering::SeqCst) {
+            self.state.notification.notify_waiters();
+            // Conserve aussi un permis si l'annulation tombe précisément entre
+            // la création de `Notified` et son premier poll.
+            self.state.notification.notify_one();
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.state.cancelled.load(Ordering::SeqCst)
+    }
+
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.state.notification.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+            if self.is_cancelled() {
+                return;
+            }
+        }
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if self.is_cancelled() {
+            Err(CLOUD_BACKUP_CANCELLED_ERROR.into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+pub fn is_cloud_backup_cancelled(error: &str) -> bool {
+    error.starts_with("CLOUD_BACKUP_CANCELLED")
+}
+
+fn check_cancellation(token: Option<&TransferCancellationToken>) -> Result<(), String> {
+    token.map_or(Ok(()), TransferCancellationToken::check)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotFile {
@@ -108,8 +176,12 @@ pub struct UploadOutcome {
 #[async_trait]
 pub trait ObjectStorage: Send + Sync {
     fn enabled(&self) -> bool;
+    fn snapshot_uri(&self, repository: &str, revision: &str) -> Result<String, String>;
     async fn health(&self) -> Result<(), String>;
     async fn upload_file(&self, local: &Path, key: &str) -> Result<(), String>;
+    async fn download_file(&self, _key: &str, _local: &Path) -> Result<bool, String> {
+        Ok(false)
+    }
     async fn restore_snapshot(
         &self,
         repository: &str,
@@ -124,6 +196,7 @@ pub trait ObjectStorage: Send + Sync {
         revision: &str,
         local: &Path,
         progress: Option<UploadProgressCallback>,
+        cancellation: Option<TransferCancellationToken>,
     ) -> Result<UploadOutcome, String>;
 }
 
@@ -232,7 +305,7 @@ impl S3Storage {
         Ok(())
     }
 
-    pub fn snapshot_uri(&self, repository: &str, revision: &str) -> Result<String, String> {
+    fn snapshot_uri_value(&self, repository: &str, revision: &str) -> Result<String, String> {
         Ok(format!(
             "s3://{}/{}/{}",
             self.bucket,
@@ -266,10 +339,15 @@ impl S3Storage {
         serde_json::from_slice(&bytes?).map_err(|error| format!("S3_MANIFEST_INVALID: {error}"))
     }
 
-    async fn aws_output(&self, args: &[String]) -> Result<Vec<u8>, String> {
+    async fn aws_output_cancellable(
+        &self,
+        args: &[String],
+        cancellation: Option<&TransferCancellationToken>,
+    ) -> Result<Vec<u8>, String> {
         if !self.enabled {
             return Ok(Vec::new());
         }
+        check_cancellation(cancellation)?;
         self.validate()?;
         let mut command = Command::new("aws");
         command
@@ -282,12 +360,28 @@ impl S3Storage {
         if let Some(endpoint) = &self.endpoint {
             command.arg("--endpoint-url").arg(endpoint);
         }
-        let output = command.output().await.map_err(|error| error.to_string())?;
+        let child = command.spawn().map_err(|error| error.to_string())?;
+        let output = if let Some(cancellation) = cancellation {
+            tokio::select! {
+                output = child.wait_with_output() => output.map_err(|error| error.to_string())?,
+                _ = cancellation.cancelled() => return Err(CLOUD_BACKUP_CANCELLED_ERROR.into()),
+            }
+        } else {
+            child
+                .wait_with_output()
+                .await
+                .map_err(|error| error.to_string())?
+        };
+        check_cancellation(cancellation)?;
         if output.status.success() {
             Ok(output.stdout)
         } else {
             Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
         }
+    }
+
+    async fn aws_output(&self, args: &[String]) -> Result<Vec<u8>, String> {
+        self.aws_output_cancellable(args, None).await
     }
 
     async fn aws(&self, args: &[String]) -> Result<(), String> {
@@ -325,19 +419,32 @@ impl S3Storage {
     }
 
     async fn put_object(&self, local: &Path, key: &str) -> Result<(), String> {
-        self.aws(&[
-            "s3api".into(),
-            "put-object".into(),
-            "--bucket".into(),
-            self.bucket.clone(),
-            "--key".into(),
-            key.into(),
-            "--body".into(),
-            local.to_string_lossy().into_owned(),
-            "--storage-class".into(),
-            self.storage_class.clone(),
-        ])
+        self.put_object_cancellable(local, key, None).await
+    }
+
+    async fn put_object_cancellable(
+        &self,
+        local: &Path,
+        key: &str,
+        cancellation: Option<&TransferCancellationToken>,
+    ) -> Result<(), String> {
+        self.aws_output_cancellable(
+            &[
+                "s3api".into(),
+                "put-object".into(),
+                "--bucket".into(),
+                self.bucket.clone(),
+                "--key".into(),
+                key.into(),
+                "--body".into(),
+                local.to_string_lossy().into_owned(),
+                "--storage-class".into(),
+                self.storage_class.clone(),
+            ],
+            cancellation,
+        )
         .await
+        .map(|_| ())
     }
 
     async fn upload_large_file<F>(
@@ -345,29 +452,34 @@ impl S3Storage {
         local: &Path,
         key: &str,
         size: u64,
+        cancellation: Option<&TransferCancellationToken>,
         mut part_complete: F,
     ) -> Result<(), String>
     where
         F: FnMut(u64),
     {
+        check_cancellation(cancellation)?;
         let chunk_size = multipart_chunk_size(size)?;
         let part_count = size.div_ceil(chunk_size);
         if part_count > MAX_MULTIPART_PARTS {
             return Err("S3_MULTIPART_CONFIGURATION_INVALID: trop de parties".into());
         }
         let created = self
-            .aws_output(&[
-                "s3api".into(),
-                "create-multipart-upload".into(),
-                "--bucket".into(),
-                self.bucket.clone(),
-                "--key".into(),
-                key.into(),
-                "--storage-class".into(),
-                self.storage_class.clone(),
-                "--output".into(),
-                "json".into(),
-            ])
+            .aws_output_cancellable(
+                &[
+                    "s3api".into(),
+                    "create-multipart-upload".into(),
+                    "--bucket".into(),
+                    self.bucket.clone(),
+                    "--key".into(),
+                    key.into(),
+                    "--storage-class".into(),
+                    self.storage_class.clone(),
+                    "--output".into(),
+                    "json".into(),
+                ],
+                cancellation,
+            )
             .await?;
         let upload_id = serde_json::from_slice::<serde_json::Value>(&created)
             .ok()
@@ -377,6 +489,7 @@ impl S3Storage {
         let result: Result<Vec<serde_json::Value>, String> = async {
             let mut completed = Vec::with_capacity(part_count as usize);
             for index in 0..part_count {
+                check_cancellation(cancellation)?;
                 let offset = index * chunk_size;
                 let length = chunk_size.min(size - offset);
                 let source = local.to_path_buf();
@@ -399,25 +512,29 @@ impl S3Storage {
                 })
                 .await
                 .map_err(|error| error.to_string())??;
+                check_cancellation(cancellation)?;
 
                 let part_number = (index + 1).to_string();
                 let uploaded = self
-                    .aws_output(&[
-                        "s3api".into(),
-                        "upload-part".into(),
-                        "--bucket".into(),
-                        self.bucket.clone(),
-                        "--key".into(),
-                        key.into(),
-                        "--part-number".into(),
-                        part_number.clone(),
-                        "--upload-id".into(),
-                        upload_id.clone(),
-                        "--body".into(),
-                        temporary.to_string_lossy().into_owned(),
-                        "--output".into(),
-                        "json".into(),
-                    ])
+                    .aws_output_cancellable(
+                        &[
+                            "s3api".into(),
+                            "upload-part".into(),
+                            "--bucket".into(),
+                            self.bucket.clone(),
+                            "--key".into(),
+                            key.into(),
+                            "--part-number".into(),
+                            part_number.clone(),
+                            "--upload-id".into(),
+                            upload_id.clone(),
+                            "--body".into(),
+                            temporary.to_string_lossy().into_owned(),
+                            "--output".into(),
+                            "json".into(),
+                        ],
+                        cancellation,
+                    )
                     .await;
                 let _ = fs::remove_file(&temporary).await;
                 let uploaded = uploaded?;
@@ -430,6 +547,7 @@ impl S3Storage {
                     "PartNumber": index + 1,
                 }));
                 part_complete(length);
+                check_cancellation(cancellation)?;
             }
             Ok(completed)
         }
@@ -461,22 +579,42 @@ impl S3Storage {
         fs::write(&completion_file, payload)
             .await
             .map_err(|error| error.to_string())?;
+        check_cancellation(cancellation)?;
         let completion = self
-            .aws(&[
-                "s3api".into(),
-                "complete-multipart-upload".into(),
-                "--bucket".into(),
-                self.bucket.clone(),
-                "--key".into(),
-                key.into(),
-                "--upload-id".into(),
-                upload_id,
-                "--multipart-upload".into(),
-                format!("file://{}", completion_file.to_string_lossy()),
-            ])
-            .await;
+            .aws_output_cancellable(
+                &[
+                    "s3api".into(),
+                    "complete-multipart-upload".into(),
+                    "--bucket".into(),
+                    self.bucket.clone(),
+                    "--key".into(),
+                    key.into(),
+                    "--upload-id".into(),
+                    upload_id.clone(),
+                    "--multipart-upload".into(),
+                    format!("file://{}", completion_file.to_string_lossy()),
+                ],
+                cancellation,
+            )
+            .await
+            .map(|_| ());
         let _ = fs::remove_file(completion_file).await;
-        completion
+        if let Err(error) = completion {
+            let _ = self
+                .aws(&[
+                    "s3api".into(),
+                    "abort-multipart-upload".into(),
+                    "--bucket".into(),
+                    self.bucket.clone(),
+                    "--key".into(),
+                    key.into(),
+                    "--upload-id".into(),
+                    upload_id,
+                ])
+                .await;
+            return Err(error);
+        }
+        check_cancellation(cancellation)
     }
 
     async fn snapshot_files(local: &Path) -> Result<Vec<(PathBuf, SnapshotFile)>, String> {
@@ -614,6 +752,10 @@ impl ObjectStorage for S3Storage {
         self.enabled
     }
 
+    fn snapshot_uri(&self, repository: &str, revision: &str) -> Result<String, String> {
+        self.snapshot_uri_value(repository, revision)
+    }
+
     async fn health(&self) -> Result<(), String> {
         self.aws(&[
             "s3api".into(),
@@ -633,9 +775,48 @@ impl ObjectStorage for S3Storage {
             .map_err(|error| error.to_string())?
             .len();
         if size > MIN_MULTIPART_CHUNK_SIZE {
-            self.upload_large_file(local, key, size, |_| {}).await
+            self.upload_large_file(local, key, size, None, |_| {}).await
         } else {
             self.put_object(local, key).await
+        }
+    }
+
+    async fn download_file(&self, key: &str, local: &Path) -> Result<bool, String> {
+        if !self.enabled {
+            return Ok(false);
+        }
+        if !key.starts_with("model-packs/")
+            || key.starts_with('/')
+            || key.split('/').any(|part| part.is_empty() || part == "..")
+        {
+            return Err("S3_MODEL_PACK_KEY_INVALID: clé de registre invalide".into());
+        }
+        if let Some(parent) = local.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        match self
+            .aws(&[
+                "s3api".into(),
+                "get-object".into(),
+                "--bucket".into(),
+                self.bucket.clone(),
+                "--key".into(),
+                key.into(),
+                local.to_string_lossy().into_owned(),
+            ])
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(error)
+                if error.contains("Not Found")
+                    || error.contains("404")
+                    || error.contains("NoSuchKey") =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -799,9 +980,12 @@ impl ObjectStorage for S3Storage {
         revision: &str,
         local: &Path,
         callback: Option<UploadProgressCallback>,
+        cancellation: Option<TransferCancellationToken>,
     ) -> Result<UploadOutcome, String> {
+        check_cancellation(cancellation.as_ref())?;
         let prefix = model_s3_prefix(repository, revision)?;
         let files = Self::snapshot_files(local).await?;
+        check_cancellation(cancellation.as_ref())?;
         let manifest = SnapshotManifest {
             repository: repository.to_owned(),
             revision: revision.to_owned(),
@@ -825,25 +1009,29 @@ impl ObjectStorage for S3Storage {
         Self::emit_progress(&callback, &progress, started);
 
         for (path, file) in &files {
+            check_cancellation(cancellation.as_ref())?;
             progress.current_file = Some(file.path.clone());
             progress.current_file_size = file.size;
             progress.current_file_bytes = 0;
             let key = format!("{prefix}/{}", file.path);
             if self.head_size(&key).await? == Some(file.size) {
+                check_cancellation(cancellation.as_ref())?;
                 mark_existing_file(&mut progress, file.size);
                 Self::emit_progress(&callback, &progress, started);
                 continue;
             }
             if file.size > MIN_MULTIPART_CHUNK_SIZE {
-                self.upload_large_file(path, &key, file.size, |sent| {
+                self.upload_large_file(path, &key, file.size, cancellation.as_ref(), |sent| {
                     mark_transferred_bytes(&mut progress, sent, file.size);
                     Self::emit_progress(&callback, &progress, started);
                 })
                 .await?;
             } else {
-                self.put_object(path, &key).await?;
+                self.put_object_cancellable(path, &key, cancellation.as_ref())
+                    .await?;
                 mark_transferred_bytes(&mut progress, file.size, file.size);
             }
+            check_cancellation(cancellation.as_ref())?;
             if self.head_size(&key).await? != Some(file.size) {
                 return Err(format!("S3_UPLOAD_VALIDATION_FAILED: {}", file.path));
             }
@@ -852,6 +1040,7 @@ impl ObjectStorage for S3Storage {
         }
 
         // Le manifeste est la marque de commit du snapshot et part toujours en dernier.
+        check_cancellation(cancellation.as_ref())?;
         if !snapshot_upload_complete(&progress) {
             return Err(
                 "S3_SNAPSHOT_INCOMPLETE: le manifeste ne peut pas être publié avant les données"
@@ -865,9 +1054,12 @@ impl ObjectStorage for S3Storage {
             .await
             .map_err(|error| error.to_string())?;
         let manifest_key = format!("{prefix}/{SNAPSHOT_MANIFEST_NAME}");
-        let manifest_result = self.put_object(&manifest_path, &manifest_key).await;
+        let manifest_result = self
+            .put_object_cancellable(&manifest_path, &manifest_key, cancellation.as_ref())
+            .await;
         let _ = fs::remove_file(manifest_path).await;
         manifest_result?;
+        check_cancellation(cancellation.as_ref())?;
         if self.head_size(&manifest_key).await? != Some(manifest_bytes.len() as u64) {
             return Err(
                 "S3_MANIFEST_UPLOAD_VALIDATION_FAILED: manifest absent ou incomplet".into(),
@@ -878,6 +1070,7 @@ impl ObjectStorage for S3Storage {
         progress.current_file_size = 0;
         progress.current_file_bytes = 0;
         Self::emit_progress(&callback, &progress, started);
+        check_cancellation(cancellation.as_ref())?;
         Ok(UploadOutcome {
             manifest,
             files_skipped: progress.files_skipped,
@@ -1004,5 +1197,47 @@ mod tests {
         };
         let error = storage.health().await.unwrap_err();
         assert!(error.contains("sans schéma ni préfixe"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_token_wakes_waiters_and_uses_the_public_error_code() {
+        let token = TransferCancellationToken::new();
+        let waiter = token.clone();
+        let task = tokio::spawn(async move {
+            waiter.cancelled().await;
+            waiter.check().unwrap_err()
+        });
+        token.cancel();
+        let error = task.await.unwrap();
+        assert!(is_cloud_backup_cancelled(&error));
+        assert_eq!(error, CLOUD_BACKUP_CANCELLED_ERROR);
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_snapshot_never_invokes_aws_or_commits_a_manifest() {
+        let root = std::env::temp_dir().join(format!("vidioai-cancel-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).await.unwrap();
+        fs::write(root.join("model.safetensors"), b"weights")
+            .await
+            .unwrap();
+        let storage = S3Storage {
+            enabled: true,
+            bucket: "valid-bucket".into(),
+            endpoint: None,
+            storage_class: "STANDARD".into(),
+        };
+        let token = TransferCancellationToken::new();
+        token.cancel();
+        let error = storage
+            .upload_snapshot("owner/model", "revision", &root, None, Some(token))
+            .await
+            .unwrap_err();
+        assert!(is_cloud_backup_cancelled(&error));
+        assert!(
+            fs::metadata(root.join(SNAPSHOT_MANIFEST_NAME))
+                .await
+                .is_err()
+        );
+        let _ = fs::remove_dir_all(root).await;
     }
 }

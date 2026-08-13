@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import io
 import inspect
 import importlib.metadata
 import json
@@ -46,8 +47,19 @@ from .config import Settings
 from .dtype_resolver import DTypeResolver, PrecisionPlan
 from .generation_progress import GenerationProgressReporter
 from .memory_planner import MemoryPlan, MemoryPlanner
+from .engines.comfyui import ComfyUIEngine
+from .engines.base import EngineError
+from .generation.preflight import PreflightResult, PreflightService
+from .hardware.detector import HardwareDetector, HardwareProfile
+from .hardware.execution_plan import ExecutionPlan
+from .hardware.memory_planner import MemoryPlanner as ExecutionMemoryPlanner
+from .packs.registry import ModelPackRegistry
+from .packs.resolver import ModelPackResolution, ModelPackResolver
+from .packs.schema import ModelPack, ModelPackStatus
 from .schemas import CompatibilityStatus, JobState, ModelState
 from .video_frame_planner import VideoFramePlanner
+from .workflows.builder import WorkflowBuilder
+from .workflows.comfy_models import ComfyModelError, ComfyModelMaterializer
 
 
 logger = logging.getLogger(__name__)
@@ -87,6 +99,15 @@ class LoadedModel:
     precision_plan: PrecisionPlan | None = None
     memory_plan: MemoryPlan | None = None
     bundle: dict[str, Any] | None = None
+    model_pack: ModelPack | None = None
+    execution_plan: ExecutionPlan | None = None
+    engine: str = "diffusers"
+    adapter: Any | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ComfyModelHandle:
+    model_pack_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +140,7 @@ class RuntimeManager:
         )
         self._dtype_resolver = DTypeResolver()
         self._memory_planner = MemoryPlanner()
+        self._execution_memory_planner = ExecutionMemoryPlanner()
         self._video_frame_planner = VideoFramePlanner()
         self._resolution_resolver = ResolutionResolver()
         self._bundle_manager = ModelBundleManager()
@@ -126,6 +148,31 @@ class RuntimeManager:
         self._input_normalizer = InputNormalizer(self.settings.work_dir)
         self._output_normalizer = OutputNormalizer(self.settings.work_dir)
         self._native_audio_muxer = NativeAudioMuxer()
+        self._model_pack_registry = ModelPackRegistry(
+            self.settings.model_packs_path,
+            workflows_directory=self.settings.workflow_templates_path,
+            active_directory=self.settings.active_model_pack_registry_path,
+        )
+        self._model_pack_resolver = ModelPackResolver(self._model_pack_registry)
+        self._model_pack_registry_generation = self._model_pack_registry.generation
+        self._workflow_builder = WorkflowBuilder(
+            self._model_pack_registry.workflows_dir,
+            templates=self._model_pack_registry.workflow_templates(),
+        )
+        self._comfy_model_materializer = ComfyModelMaterializer(
+            self.settings.models_dir
+        )
+        self._comfy_model_materializer.prune()
+        self._preflight_service = PreflightService(self._workflow_builder)
+        self._hardware_detector = HardwareDetector(
+            torch_provider=self._hardware_torch,
+            memory_provider=self._memory_metrics,
+        )
+        self._comfyui = (
+            ComfyUIEngine(self.settings.comfyui_url)
+            if self.settings.comfyui_url
+            else None
+        )
 
     @staticmethod
     def _safe_segment(value: str) -> str:
@@ -160,6 +207,335 @@ class RuntimeManager:
             "VIDEO_INPAINTING",
             "VIDEO_UPSCALE",
         ]
+
+    def _resolve_model_pack(
+        self,
+        metadata: dict[str, Any],
+        capability: str | None = None,
+    ) -> ModelPackResolution:
+        self._refresh_model_pack_registry()
+        return self._model_pack_resolver.resolve(metadata, capability)
+
+    def _refresh_model_pack_registry(self, *, force: bool = False) -> bool:
+        """Atomically publish a newly validated pack/workflow snapshot."""
+        changed = self._model_pack_registry.reload_if_changed(force=force)
+        generation = self._model_pack_registry.generation
+        with self._lock:
+            if generation == self._model_pack_registry_generation:
+                return changed
+            builder = WorkflowBuilder(
+                self._model_pack_registry.workflows_dir,
+                templates=self._model_pack_registry.workflow_templates(),
+            )
+            self._workflow_builder = builder
+            self._preflight_service = PreflightService(builder)
+            self._model_pack_registry_generation = generation
+        return True
+
+    def _model_pack_fields(
+        self,
+        metadata: dict[str, Any],
+        capability: str | None = None,
+    ) -> dict[str, Any]:
+        return self._resolve_model_pack(metadata, capability).as_fields(capability)
+
+    def _model_resident_bytes(self) -> int:
+        with self._lock:
+            return sum(
+                max(
+                    0,
+                    int(model.load_benchmark.get("pipeline_vram_bytes") or 0),
+                )
+                for model in self._loaded.values()
+            )
+
+    def _hardware_profile(self) -> HardwareProfile:
+        return self._hardware_detector.detect(
+            model_resident_bytes=self._model_resident_bytes()
+        )
+
+    def _hardware_torch(self) -> Any | None:
+        try:
+            return self._imports().torch
+        except WorkerError:
+            return None
+
+    @staticmethod
+    def _pack_value(
+        pack: ModelPack,
+        request: dict[str, Any],
+        key: str,
+        fallback: Any,
+    ) -> Any:
+        if request.get(key) is not None:
+            return request[key]
+        preset = pack.presets.get(str(request.get("quality") or "BALANCED").upper(), {})
+        if preset.get(key) is not None:
+            return preset[key]
+        if pack.defaults.get(key) is not None:
+            return pack.defaults[key]
+        return fallback
+
+    def _execution_plan_for(
+        self,
+        *,
+        pack: ModelPack,
+        precision_plan: PrecisionPlan,
+        model_bytes: int,
+        request: dict[str, Any] | None = None,
+        hardware: HardwareProfile | None = None,
+    ) -> ExecutionPlan:
+        request = dict(request or {})
+        resolution = pack.defaults.get("resolution") or {}
+        width = int(self._pack_value(pack, request, "width", resolution.get("width") or 512))
+        height = int(self._pack_value(pack, request, "height", resolution.get("height") or 512))
+        frames = int(self._pack_value(pack, request, "frames", 1) or 1)
+        fps_value = self._pack_value(pack, request, "fps", None)
+        dtype = precision_plan.precision
+        if dtype == "AUTO":
+            dtype = str(pack.defaults.get("dtype") or "AUTO")
+        memory = self._memory_metrics()
+        return self._execution_memory_planner.execution_plan(
+            hardware=hardware or self._hardware_profile(),
+            model_pack=pack,
+            weights_memory_bytes=max(0, int(model_bytes)),
+            dtype=dtype,
+            quantization=precision_plan.quantization,
+            width=width,
+            height=height,
+            frames=frames,
+            fps=int(fps_value) if fps_value else None,
+            batch=max(1, int(request.get("batch") or 1)),
+            ram_available_bytes=memory["ram_available_bytes"],
+            scratch_available_bytes=memory["scratch_available_bytes"],
+        )
+
+    @staticmethod
+    def _align_precision_with_execution(
+        precision_plan: PrecisionPlan,
+        execution_plan: ExecutionPlan,
+    ) -> None:
+        mapping = {
+            "FP16": "float16",
+            "BF16": "bfloat16",
+            "FP32": "float32",
+            "AUTO": "auto",
+        }
+        resolved = execution_plan.dtype.upper()
+        if resolved in mapping and resolved != precision_plan.precision:
+            precision_plan.precision = resolved
+            precision_plan.load_dtype = mapping[resolved]
+            precision_plan.source = f"execution_plan({precision_plan.source})"
+        if execution_plan.quantization:
+            precision_plan.quantization = execution_plan.quantization
+
+    @staticmethod
+    def _apply_execution_to_memory_plan(
+        memory_plan: MemoryPlan,
+        execution_plan: ExecutionPlan,
+    ) -> None:
+        memory_plan.strategy = execution_plan.strategy
+        memory_plan.feasible = execution_plan.feasible
+        memory_plan.width = execution_plan.resolution["width"]
+        memory_plan.height = execution_plan.resolution["height"]
+        memory_plan.frames = execution_plan.frames
+        memory_plan.estimated_peak_bytes = execution_plan.estimated_peak_vram_bytes
+        memory_plan.safety_margin_bytes = execution_plan.safety_reserve_bytes
+        memory_plan.optimizations = [
+            optimization
+            for optimization in execution_plan.fallbacks
+            if optimization
+            in {
+                "EFFICIENT_ATTENTION",
+                "VAE_SLICING",
+                "VAE_TILING",
+                "MODEL_CPU_OFFLOAD",
+                "SEQUENTIAL_CPU_OFFLOAD",
+            }
+        ]
+
+    def _engine_health(self, pack: ModelPack, loaded: LoadedModel | None) -> dict[str, Any]:
+        if pack.engine == "comfyui":
+            if self._comfyui is None:
+                return {
+                    "ready": False,
+                    "engine": "comfyui",
+                    "error": "VIDIOAI_COMFYUI_URL n'est pas configuré.",
+                    "error_code": "COMFYUI_UNAVAILABLE",
+                }
+            return self._comfyui.health()
+        return {
+            "ready": bool(loaded is not None and loaded.pipeline is not None),
+            "engine": "diffusers",
+            "error": None if loaded is not None and loaded.pipeline is not None else "Pipeline Diffusers non chargé.",
+        }
+
+    @staticmethod
+    def _merge_advanced_parameters(
+        pack: ModelPack,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        merged = dict(request)
+        advanced = request.get("advanced_parameters") or {}
+        if not isinstance(advanced, dict):
+            raise WorkerError(
+                "advanced_parameters doit être un objet.",
+                422,
+                code="MODEL_PARAMETER_UNSUPPORTED",
+            )
+        allowed = set(pack.advanced_parameters)
+        aliases = {"cfg": "guidance_scale", "resolution": "resolution"}
+        unsupported = sorted(str(key) for key in advanced if str(key) not in allowed)
+        if unsupported:
+            raise WorkerError(
+                f"Paramètres non supportés par {pack.id}: {', '.join(unsupported)}.",
+                422,
+                code="MODEL_PARAMETER_UNSUPPORTED",
+            )
+        for key, value in advanced.items():
+            target = aliases.get(str(key), str(key))
+            if target == "resolution" and isinstance(value, dict):
+                for dimension in ("width", "height"):
+                    if value.get(dimension) is not None:
+                        merged[dimension] = value[dimension]
+                continue
+            merged[target] = value
+        if request.get("preset"):
+            merged["quality"] = str(request["preset"]).upper()
+        resolution = merged.get("resolution")
+        if isinstance(resolution, str) and "x" in resolution.lower():
+            try:
+                width, height = resolution.lower().split("x", maxsplit=1)
+                merged["width"] = int(width)
+                merged["height"] = int(height)
+            except ValueError as error:
+                raise WorkerError(
+                    "advanced_parameters.resolution doit être WIDTHxHEIGHT.",
+                    422,
+                    code="MODEL_PARAMETER_UNSUPPORTED",
+                ) from error
+            merged.pop("resolution", None)
+        return merged
+
+    def preflight_model(self, request: dict[str, Any]) -> PreflightResult:
+        model_id = self._safe_segment(str(request["model_id"]))
+        with self._lock:
+            loaded = self._loaded.get(model_id)
+        loaded_override = request.get("_loaded_for_preflight")
+        if loaded is None and isinstance(loaded_override, LoadedModel):
+            loaded = loaded_override
+        snapshot_is_active = True
+        try:
+            snapshot, _ = self._active_snapshot(model_id)
+            metadata, manifest = self._effective_snapshot_metadata(snapshot)
+        except WorkerError:
+            if loaded is None or loaded.pipeline is None:
+                raise
+            # A pipeline already resident is authoritative for the immediate
+            # preflight even if a CPU integration fixture has no persisted
+            # snapshot. Production loads still originate from _active_snapshot.
+            snapshot_is_active = False
+            snapshot = self.settings.models_dir
+            metadata = dict(loaded.metadata or {})
+            manifest = {}
+        requested_capabilities = (
+            [str(request["capability"])]
+            if request.get("capability")
+            else manifest.get("requested_capabilities") or manifest.get("capabilities")
+        )
+        resolved_capability, _ = self._resolve_pack_capability(
+            metadata,
+            requested_capabilities,
+        )
+        capability = str(
+            request.get("capability")
+            or (loaded.capability if loaded is not None else "")
+            or resolved_capability
+            or ""
+        ).upper()
+        pack_resolution = self._resolve_model_pack(metadata, capability)
+        pack = pack_resolution.pack
+        prepared = self._merge_advanced_parameters(pack, request) if pack is not None else dict(request)
+        execution_plan = None
+        component_values = None
+        component_manifest = None
+        component_error = None
+        if pack is not None:
+            torch = self._imports().torch
+            precision_plan = (
+                loaded.precision_plan
+                if loaded is not None and loaded.precision_plan is not None
+                else self._precision_plan(torch, metadata, bool(torch.cuda.is_available()))
+            )
+            validation = (
+                self.validate_snapshot(snapshot)
+                if snapshot_is_active
+                else {
+                    "weights_bytes": int(
+                        getattr(loaded.memory_plan, "model_bytes", 0)
+                        if loaded is not None
+                        else 0
+                    )
+                }
+            )
+            adapter = self._registry.select_for_capability(metadata, capability)
+            model_bytes = self._adapter_model_bytes(
+                adapter,
+                snapshot,
+                capability,
+                int(validation.get("weights_bytes") or 0),
+            )
+            execution_plan = self._execution_plan_for(
+                pack=pack,
+                precision_plan=precision_plan,
+                model_bytes=model_bytes,
+                request=prepared,
+            )
+            if pack.engine == "comfyui" and snapshot_is_active:
+                try:
+                    materialized = self._comfy_model_materializer.materialize(
+                        snapshot=snapshot,
+                        model_id=model_id,
+                        pack=pack,
+                    )
+                    component_values = materialized.components
+                    component_manifest = materialized.as_dict()
+                except ComfyModelError as error:
+                    component_error = str(error)
+        resources = self.resources()
+        dependencies = list(manifest.get("runtime_dependencies") or [])
+        dependency_errors = [
+            str(value.get("dependency") or value.get("import_name") or "dependency")
+            for value in dependencies
+            if isinstance(value, dict)
+            and str(value.get("status") or "").upper() not in {"", "READY", "INSTALLED", "AVAILABLE"}
+        ]
+        result = self._preflight_service.run(
+            model_id=model_id,
+            pack=pack,
+            capability=capability,
+            request=prepared,
+            snapshot=snapshot,
+            execution_plan=execution_plan,
+            engine_health=lambda: self._engine_health(pack, loaded) if pack else {"ready": False, "error": "ModelPack absent."},
+            dependency_errors=dependency_errors,
+            diagnostics={
+                "model_pack_resolution": {
+                    "score": pack_resolution.score,
+                    "matched_by": list(pack_resolution.matched_by),
+                    "reason": pack_resolution.reason,
+                },
+                "hardware": resources.get("hardware"),
+                "memory": resources.get("diagnostics"),
+                "comfy_models": component_manifest,
+            },
+            model_loaded=loaded is not None and loaded.pipeline is not None,
+            component_values=component_values,
+            component_error=component_error,
+        )
+        if loaded is not None and execution_plan is not None:
+            loaded.execution_plan = execution_plan
+        return result
 
     def _active_pointer(self, model_id: str) -> Path:
         return self._model_root(model_id) / "active.json"
@@ -216,6 +592,8 @@ class RuntimeManager:
             ),
             "config": {},
         }
+        pack_resolution = self._resolve_model_pack(metadata)
+        pack_fields = pack_resolution.as_fields(None)
         if self._pipeline_resolver.requires_remote_code(metadata):
             return {
                 "compatibility_status": CompatibilityStatus.UNSUPPORTED,
@@ -224,6 +602,8 @@ class RuntimeManager:
                 "pipeline_class": class_name,
                 "runtime_reason": "REMOTE_CODE_REQUIRED",
                 "error_code": "REMOTE_CODE_REQUIRED",
+                **pack_fields,
+                "model_pack_status": ModelPackStatus.UNSUPPORTED.value,
             }
         library = str(metadata.get("library_name") or "").lower()
         if library not in {"", "diffusers"}:
@@ -234,6 +614,8 @@ class RuntimeManager:
                 "pipeline_class": class_name,
                 "runtime_reason": f"Bibliotheque non prise en charge: {library}",
                 "error_code": "UNSUPPORTED_LIBRARY",
+                **pack_fields,
+                "model_pack_status": ModelPackStatus.UNSUPPORTED.value,
             }
         try:
             resolution = self._pipeline_resolver.resolve_class(metadata)
@@ -246,6 +628,8 @@ class RuntimeManager:
                 "runtime_reason": str(error),
                 "error_code": error.code,
                 "dependency": error.dependency,
+                **pack_fields,
+                "model_pack_status": ModelPackStatus.UNSUPPORTED.value,
             }
         capability_sets = CapabilityResolver().describe(metadata, resolution.pipeline_cls)
         capabilities = capability_sets["runtime_capabilities"]
@@ -264,6 +648,20 @@ class RuntimeManager:
                 error_code = "DIFFUSERS_VERSION_TOO_OLD"
             else:
                 status = CompatibilityStatus.UNKNOWN
+        if resolution.runtime_supported:
+            pack_resolution = self._resolve_model_pack(metadata)
+        pack_fields = pack_resolution.as_fields(
+            capabilities[0] if capabilities else None
+        )
+        public_pack_status = (
+            pack_resolution.status.value
+            if resolution.runtime_supported and pack_resolution.pack is not None
+            else (
+                ModelPackStatus.DOWNLOADABLE.value
+                if pack_resolution.pack is not None
+                else ModelPackStatus.UNSUPPORTED.value
+            )
+        )
         return {
             "compatibility_status": status,
             "runtime_supported": resolution.runtime_supported,
@@ -273,6 +671,8 @@ class RuntimeManager:
             "pipeline_class": resolution.class_name,
             "runtime_reason": resolution.runtime_reason,
             "error_code": error_code,
+            **pack_fields,
+            "model_pack_status": public_pack_status,
         }
 
     @staticmethod
@@ -335,6 +735,30 @@ class RuntimeManager:
             if adapter is not None:
                 return candidate
         return None
+
+    def _resolve_pack_capability(
+        self,
+        metadata: dict[str, Any],
+        requested_capabilities: list[str] | None = None,
+    ) -> tuple[str | None, ModelPackResolution]:
+        """Resolve a ComfyUI pack without requiring an importable Diffusers class."""
+        unscoped = self._resolve_model_pack(metadata)
+        pack = unscoped.pack
+        if pack is not None and pack.engine == "comfyui":
+            requested = {
+                str(value).strip().upper()
+                for value in (requested_capabilities or [])
+                if isinstance(value, str) and value.strip()
+            }
+            candidates = requested.intersection(pack.capabilities) if requested else set(pack.capabilities)
+            for capability in self._capability_order():
+                if capability in candidates:
+                    return capability, self._resolve_model_pack(metadata, capability)
+            return None, unscoped
+        # A generic pack is descriptive only: capability authority remains the
+        # actual Diffusers metadata/signature, preserving UNKNOWN models as such.
+        capability = self._resolve_supported_capability(metadata, requested_capabilities)
+        return capability, self._resolve_model_pack(metadata, capability) if capability else unscoped
 
     def _unsupported_pipeline_error(
         self,
@@ -850,6 +1274,8 @@ class RuntimeManager:
         local_dir: Path,
         token: str | None,
         model_id: str | None = None,
+        *,
+        experimental: bool = False,
     ) -> dict[str, Any] | None:
         """Ne recupere que les JSON legers avant les poids du snapshot."""
         try:
@@ -908,6 +1334,18 @@ class RuntimeManager:
                 422,
                 code="UNSUPPORTED_LIBRARY",
             )
+        if experimental:
+            # Model Lab inspection never imports an unknown class and never
+            # installs packages declared by untrusted metadata. Full snapshot
+            # validation and a second remote-code check still run after download.
+            capability_sets = CapabilityResolver().describe(metadata, None)
+            metadata.update(capability_sets)
+            metadata["capabilities"] = capability_sets["display_capabilities"]
+            metadata["compatibility_status"] = CompatibilityStatus.UNKNOWN
+            metadata["runtime_supported"] = False
+            metadata["runtime_reason"] = "Inspection expérimentale sans exécution."
+            metadata["runtime_dependencies"] = []
+            return metadata
         resolution, repaired_dependencies = self._dependency_resolver.load_with_repair(
             lambda: self._pipeline_resolver.resolve_class(metadata),
             self._dependency_installer,
@@ -1050,8 +1488,16 @@ class RuntimeManager:
         values = " ".join(f"{name}={value or 'missing'}" for name, value in versions.items())
         print(f"RUNTIME_VERSIONS {values}")
 
-    @staticmethod
-    def _nvidia_metrics() -> dict[str, Any] | None:
+    def _nvidia_metrics(self) -> dict[str, Any] | None:
+        # Never spawn NVIDIA tools on CPU/Apple hosts. CUDA visibility is the
+        # explicit gate; the subprocess is only a production CUDA fallback.
+        torch = self._hardware_torch()
+        probe_disabled = os.getenv(
+            "VIDIOAI_DISABLE_NVIDIA_PROBE",
+            "",
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if probe_disabled or torch is None or not bool(torch.cuda.is_available()):
+            return None
         command = [
             "nvidia-smi",
             "--query-gpu=name,utilization.gpu,memory.total,memory.used,temperature.gpu",
@@ -1119,7 +1565,9 @@ class RuntimeManager:
         }
 
     def resources(self) -> dict[str, Any]:
-        gpu = self._nvidia_metrics()
+        profile = self._hardware_profile()
+        primary = profile.primary_gpu
+        gpu = primary.as_dict() if primary else None
         with self._lock:
             loaded = [
                 {
@@ -1143,6 +1591,10 @@ class RuntimeManager:
                     "benchmark": model.load_benchmark,
                     "pipeline_class": (model.metadata or {}).get("class_name"),
                     "capabilities": list((model.metadata or {}).get("capabilities") or []),
+                    "model_pack_id": model.model_pack.id if model.model_pack else None,
+                    "model_pack_status": model.model_pack.status.value if model.model_pack else ModelPackStatus.UNSUPPORTED.value,
+                    "engine": model.engine,
+                    "execution_plan": model.execution_plan.as_dict() if model.execution_plan else None,
                 }
                 for model in self._loaded.values()
             ]
@@ -1151,13 +1603,19 @@ class RuntimeManager:
                 for job in self._jobs.values()
                 if job["state"] in {JobState.QUEUED, JobState.RUNNING}
             )
+        diagnostics = self._hardware_detector.occupied_diagnostic(
+            profile,
+            loaded_models=len(loaded),
+        )
         return {
             "gpu": gpu,
+            "hardware": profile.as_dict(),
             "memory": self._memory_metrics(),
             "gpu_status": "available" if gpu else "unavailable",
             "worker_status": "ready" if self.runtime_status()["ready"] else "not_ready",
             "active_jobs": active_jobs,
             "loaded_models": loaded,
+            "diagnostics": diagnostics,
         }
 
     @staticmethod
@@ -1286,20 +1744,56 @@ class RuntimeManager:
         snapshot: Path,
         pointer: dict[str, Any],
         capabilities: list[str],
+        *,
+        experimental: bool = False,
+        model_pack_candidate: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         validation = self.validate_snapshot(snapshot)
-        runtime_dependencies = self._prepare_dependencies(snapshot)
         metadata, manifest = self._effective_snapshot_metadata(snapshot, capabilities)
-        resolved_capability = self._resolve_supported_capability(
+        if self._pipeline_resolver.requires_remote_code(metadata):
+            raise WorkerError(
+                "Le modèle exige trust_remote_code; installation refusée.",
+                422,
+                code="REMOTE_CODE_REQUIRED",
+                retryable=False,
+            )
+        resolved_capability, pack_resolution = self._resolve_pack_capability(
             metadata,
             manifest.get("requested_capabilities")
             or manifest.get("capabilities")
             or capabilities,
         )
         if resolved_capability is None:
+            if experimental and manifest.get("experimental") is True:
+                cached = self._experimental_install_manifest(
+                    model_id=model_id,
+                    repository=str(pointer["repository"]),
+                    revision=str(pointer["revision"]),
+                    requested_revision=str(
+                        manifest.get("requested_revision") or pointer["revision"]
+                    ),
+                    capabilities=capabilities,
+                    validation=validation,
+                    candidate=model_pack_candidate
+                    or manifest.get("model_pack_candidate"),
+                    installed_at=int(manifest.get("installed_at") or time.time()),
+                )
+                cached["stage"] = "experimental_installed"
+                cached["metadata"] = {
+                    "pipeline_class": metadata.get("class_name"),
+                    "architectures": list(metadata.get("architectures") or []),
+                    "library_name": metadata.get("library_name"),
+                }
+                with self._lock:
+                    self._model_states[model_id] = cached
+                return cached
             raise self._unsupported_pipeline_error(metadata)
 
+        runtime_dependencies = self._prepare_dependencies(snapshot)
+
         runtime_capabilities = list(metadata.get("capabilities") or [])
+        if not self._metadata_runtime_supported(metadata):
+            runtime_capabilities = []
         precision_plan = None
         memory_plan = None
         try:
@@ -1344,6 +1838,9 @@ class RuntimeManager:
             "ready": False,
             "state": ModelState.INSTALLED,
             "stage": "installed",
+            "experimental": False,
+            "load_allowed": True,
+            "generation_allowed": True,
             "pipeline_class": metadata.get("class_name"),
             "precision_plan": (
                 precision_plan.as_dict() if precision_plan is not None else None
@@ -1353,6 +1850,7 @@ class RuntimeManager:
                 list(manifest.get("runtime_dependencies") or []),
                 runtime_dependencies,
             ),
+            **pack_resolution.as_fields(resolved_capability),
             **validation,
         }
         self._persist_runtime_dependencies(
@@ -1362,6 +1860,81 @@ class RuntimeManager:
             self._model_states[model_id] = cached
         return cached
 
+    @staticmethod
+    def _normalized_model_pack_candidate(
+        candidate: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not candidate:
+            return None
+        allowed = {
+            "id",
+            "family",
+            "version",
+            "engine",
+            "workflow_version",
+            "based_on_pack",
+        }
+        normalized = {
+            key: value
+            for key, value in candidate.items()
+            if key in allowed and isinstance(value, str) and value.strip()
+        }
+        normalized["status"] = ModelPackStatus.EXPERIMENTAL.value
+        return normalized
+
+    def _experimental_install_manifest(
+        self,
+        *,
+        model_id: str,
+        repository: str,
+        revision: str,
+        requested_revision: str,
+        capabilities: list[str],
+        validation: dict[str, Any],
+        candidate: dict[str, Any] | None,
+        installed_at: int,
+    ) -> dict[str, Any]:
+        return {
+            "model_id": model_id,
+            "repository": repository,
+            # The executable pointer and persisted manifest always use the
+            # immutable Hugging Face commit SHA, never the moving branch/tag.
+            "revision": revision,
+            "requested_revision": requested_revision,
+            "capabilities": [],
+            "requested_capabilities": list(capabilities),
+            "downloaded": True,
+            "validated": True,
+            "installed": True,
+            "weights_valid": bool(validation.get("weights_valid")),
+            "runtime_available": self.runtime_status()["runtime_available"],
+            "runtime_compatible": False,
+            "validation_test": False,
+            "loaded": False,
+            "ready": False,
+            "state": ModelState.INSTALLED,
+            "stage": "experimental_installed",
+            "experimental": True,
+            "load_allowed": False,
+            "generation_allowed": False,
+            "model_pack_candidate": self._normalized_model_pack_candidate(candidate),
+            "model_pack_id": None,
+            "model_pack_status": ModelPackStatus.EXPERIMENTAL.value,
+            "engine": None,
+            "workflow": None,
+            "advanced_parameters": [],
+            "presets": {},
+            "model_pack_reason": (
+                "Installation Model Lab mise en quarantaine jusqu'à activation "
+                "d'un ModelPack validé."
+            ),
+            "bundle": None,
+            "modular_dependencies": [],
+            "runtime_dependencies": [],
+            "installed_at": installed_at,
+            **validation,
+        }
+
     def install_model(
         self,
         model_id: str,
@@ -1370,6 +1943,9 @@ class RuntimeManager:
         capabilities: list[str],
         loras: list[dict[str, Any]] | None = None,
         recipe: dict[str, Any] | None = None,
+        *,
+        experimental: bool = False,
+        model_pack_candidate: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         model_id = self._safe_segment(model_id)
         self._log_model_state(model_id, "DISCOVERED", "COMPATIBILITY_CHECK")
@@ -1382,9 +1958,31 @@ class RuntimeManager:
             snapshot = None
             pointer = None
 
-        if snapshot is not None and pointer is not None and pointer.get("revision") == revision:
+        if (
+            snapshot is not None
+            and pointer is not None
+            and revision
+            in {pointer.get("revision"), pointer.get("requested_revision")}
+        ):
             try:
+                existing_manifest = self._read_manifest(snapshot)
+                if existing_manifest.get("experimental") is True and not experimental:
+                    # A quarantined snapshot must not become a normal install
+                    # solely because an idempotent request omitted the flag.
+                    raise WorkerError(
+                        "Ce snapshot est une installation expérimentale sans ModelPack actif.",
+                        409,
+                        code="EXPERIMENTAL_MODEL_NOT_EXECUTABLE",
+                        retryable=False,
+                    )
                 if loras is not None or recipe is not None:
+                    if experimental:
+                        raise WorkerError(
+                            "Les LoRA et recettes ne sont pas applicables à une installation expérimentale.",
+                            422,
+                            code="EXPERIMENTAL_BUNDLE_UNSUPPORTED",
+                            retryable=False,
+                        )
                     with self._lock:
                         if model_id in self._loaded:
                             raise WorkerError(
@@ -1426,6 +2024,8 @@ class RuntimeManager:
                     snapshot,
                     pointer,
                     capabilities,
+                    experimental=experimental,
+                    model_pack_candidate=model_pack_candidate,
                 )
             except BundleError as error:
                 raise WorkerError(
@@ -1452,12 +2052,18 @@ class RuntimeManager:
                     "REMOTE_CODE_REQUIRED",
                     "UNSUPPORTED_LIBRARY",
                     "MODEL_MUST_BE_UNLOADED",
+                    "EXPERIMENTAL_MODEL_NOT_EXECUTABLE",
+                    "EXPERIMENTAL_BUNDLE_UNSUPPORTED",
                 }:
-                    self._mark_failed(
-                        model_id,
-                        error=error,
-                        downloaded=True,
-                    )
+                    if error.code not in {
+                        "EXPERIMENTAL_MODEL_NOT_EXECUTABLE",
+                        "EXPERIMENTAL_BUNDLE_UNSUPPORTED",
+                    }:
+                        self._mark_failed(
+                            model_id,
+                            error=error,
+                            downloaded=True,
+                        )
                     raise
                 # Snapshot incomplet/corrompu : téléchargement propre autorisé.
 
@@ -1495,13 +2101,19 @@ class RuntimeManager:
                 temporary,
                 hf_token,
                 model_id,
+                experimental=experimental,
             )
             if preflight_metadata is not None:
                 preflight_capabilities = preflight_metadata.get("capabilities") or []
                 requested = {
                     str(value).upper() for value in capabilities if isinstance(value, str)
                 }
-                if requested and preflight_capabilities and not requested.intersection(preflight_capabilities):
+                if (
+                    not experimental
+                    and requested
+                    and preflight_capabilities
+                    and not requested.intersection(preflight_capabilities)
+                ):
                     raise WorkerError(
                         "La pipeline disponible ne declare aucune des capabilities demandees.",
                         422,
@@ -1570,12 +2182,16 @@ class RuntimeManager:
                         retryable=True,
                     ) from fallback_error
 
-            modular_dependencies = self._materialize_modular_dependencies(
-                temporary,
-                base_repository=repository,
-                token=hf_token,
-                hf_api=HfApi,
-                snapshot_download=snapshot_download,
+            modular_dependencies = (
+                []
+                if experimental
+                else self._materialize_modular_dependencies(
+                    temporary,
+                    base_repository=repository,
+                    token=hf_token,
+                    hf_api=HfApi,
+                    snapshot_download=snapshot_download,
+                )
             )
 
             self._log_model_state(model_id, "DOWNLOADING", "DOWNLOADED")
@@ -1596,6 +2212,73 @@ class RuntimeManager:
                 self._model_states[model_id][
                     "state"
                 ] = ModelState.RESOLVING_DEPENDENCIES
+            metadata = inspect_model_metadata(temporary)
+            metadata = self._metadata_with_capabilities(metadata)
+            if self._pipeline_resolver.requires_remote_code(metadata):
+                raise WorkerError(
+                    "Le modèle exige trust_remote_code; installation refusée.",
+                    422,
+                    code="REMOTE_CODE_REQUIRED",
+                    retryable=False,
+                )
+            resolved_capability, pack_resolution = self._resolve_pack_capability(
+                metadata,
+                capabilities,
+            )
+            if resolved_capability is None:
+                if not experimental:
+                    raise self._unsupported_pipeline_error(metadata)
+
+                if loras is not None or recipe is not None:
+                    raise WorkerError(
+                        "Les LoRA et recettes ne sont pas applicables à une installation expérimentale.",
+                        422,
+                        code="EXPERIMENTAL_BUNDLE_UNSUPPORTED",
+                        retryable=False,
+                    )
+                destination = self._model_root(model_id) / resolved_revision
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if destination.exists():
+                    shutil.rmtree(destination)
+                manifest = self._experimental_install_manifest(
+                    model_id=model_id,
+                    repository=repository,
+                    revision=resolved_revision,
+                    requested_revision=revision,
+                    capabilities=capabilities,
+                    validation=validation,
+                    candidate=model_pack_candidate,
+                    installed_at=int(time.time()),
+                )
+                manifest["metadata"] = {
+                    "pipeline_class": metadata.get("class_name"),
+                    "architectures": list(metadata.get("architectures") or []),
+                    "library_name": metadata.get("library_name"),
+                }
+                (temporary / "vidioai-model.json").write_text(
+                    json.dumps(manifest, indent=2),
+                    encoding="utf-8",
+                )
+                os.replace(temporary, destination)
+                pointer_payload = {
+                    "model_id": model_id,
+                    "repository": repository,
+                    "revision": resolved_revision,
+                    "requested_revision": revision,
+                }
+                pointer_path = self._active_pointer(model_id)
+                pointer_temporary = pointer_path.with_suffix(".json.tmp")
+                pointer_temporary.write_text(
+                    json.dumps(pointer_payload), encoding="utf-8"
+                )
+                os.replace(pointer_temporary, pointer_path)
+                with self._lock:
+                    self._model_states[model_id] = manifest
+                self._log_model_state(
+                    model_id, "RESOLVING_DEPENDENCIES", "INSTALLED"
+                )
+                return manifest
+
             runtime_dependencies = self._merge_dependency_records(
                 list(
                     (preflight_metadata or {}).get("runtime_dependencies") or []
@@ -1603,16 +2286,9 @@ class RuntimeManager:
                 self._prepare_dependencies(temporary, model_id=model_id),
             )
 
-            metadata = inspect_model_metadata(temporary)
-            metadata = self._metadata_with_capabilities(metadata)
-            resolved_capability = self._resolve_supported_capability(
-                metadata,
-                capabilities,
-            )
-            if resolved_capability is None:
-                raise self._unsupported_pipeline_error(metadata)
-
             runtime_capabilities = list(metadata.get("capabilities") or [])
+            if not self._metadata_runtime_supported(metadata):
+                runtime_capabilities = []
             try:
                 normalized_recipe = (
                     self._inference_recipe.normalize_recipe(recipe)
@@ -1653,6 +2329,7 @@ class RuntimeManager:
                 "model_id": model_id,
                 "repository": repository,
                 "revision": resolved_revision,
+                "requested_revision": revision,
                 "capabilities": runtime_capabilities,
                 "requested_capabilities": list(capabilities),
                 "downloaded": True,
@@ -1669,6 +2346,7 @@ class RuntimeManager:
                 "modular_dependencies": modular_dependencies,
                 "runtime_dependencies": runtime_dependencies,
                 "installed_at": int(time.time()),
+                **pack_resolution.as_fields(resolved_capability),
                 **validation,
             }
             (temporary / "vidioai-model.json").write_text(
@@ -1681,6 +2359,7 @@ class RuntimeManager:
                 "model_id": model_id,
                 "repository": repository,
                 "revision": resolved_revision,
+                "requested_revision": revision,
             }
             pointer_path = self._active_pointer(model_id)
             pointer_temporary = pointer_path.with_suffix(".json.tmp")
@@ -1794,6 +2473,185 @@ class RuntimeManager:
             if temporary.exists():
                 shutil.rmtree(temporary, ignore_errors=True)
 
+    def promote_lab_model(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Explicitly release a pinned experimental snapshot from quarantine.
+
+        Promotion is deliberately metadata-only: it validates the active pack,
+        workflow and hardware plan but never allocates model/GPU memory. A later
+        explicit load is still required before the status can become READY.
+        """
+        model_id = self._safe_segment(str(request.get("model_id") or ""))
+        repository = str(request.get("repository") or "").strip()
+        revision = self._safe_segment(str(request.get("revision") or ""))
+        pack_id = self._safe_segment(str(request.get("model_pack_id") or ""))
+        capability = str(request.get("capability") or "").strip().upper()
+        snapshot, pointer = self._active_snapshot(model_id)
+        manifest = self._read_manifest(snapshot)
+        if manifest.get("experimental") is not True:
+            raise WorkerError(
+                "Le modèle n'est pas une installation Model Lab en quarantaine.",
+                409,
+                code="MODEL_LAB_NOT_EXPERIMENTAL",
+                retryable=False,
+            )
+        if (
+            str(pointer.get("repository") or "") != repository
+            or str(manifest.get("repository") or "") != repository
+            or str(pointer.get("revision") or "") != revision
+            or str(manifest.get("revision") or "") != revision
+            or snapshot.name != revision
+        ):
+            raise WorkerError(
+                "Repository ou révision épinglée du snapshot incohérent.",
+                409,
+                code="MODEL_LAB_REVISION_MISMATCH",
+                retryable=False,
+            )
+        candidate = manifest.get("model_pack_candidate") or {}
+        based_on = str(candidate.get("based_on_pack") or "").strip()
+        if based_on and based_on != pack_id:
+            raise WorkerError(
+                "Le ModelPack demandé ne correspond pas à based_on_pack.",
+                422,
+                code="MODEL_PACK_MISMATCH",
+                retryable=False,
+            )
+        validation = self.validate_snapshot(snapshot)
+        metadata = inspect_model_metadata(snapshot)
+        metadata = self._metadata_with_capabilities(metadata)
+        if self._pipeline_resolver.requires_remote_code(metadata):
+            raise WorkerError(
+                "Le modèle exige trust_remote_code; promotion refusée.",
+                422,
+                code="REMOTE_CODE_REQUIRED",
+                retryable=False,
+            )
+        self._refresh_model_pack_registry()
+        pack = self._model_pack_registry.get(pack_id)
+        if pack is None:
+            raise WorkerError(
+                "Le ModelPack demandé n'est pas actif.",
+                422,
+                code="MODEL_PACK_MISSING",
+                retryable=False,
+            )
+        if capability not in pack.capabilities:
+            raise WorkerError(
+                f"Capability {capability} absente du ModelPack {pack_id}.",
+                422,
+                code="MODEL_INCOMPATIBLE",
+                retryable=False,
+            )
+        resolved = self._resolve_model_pack(metadata, capability)
+        if resolved.pack is None or resolved.pack.id != pack_id:
+            raise WorkerError(
+                "L'architecture inspectée ne résout pas le ModelPack demandé.",
+                422,
+                code="MODEL_PACK_MISMATCH",
+                retryable=False,
+            )
+
+        torch = self._imports().torch
+        precision_plan = self._precision_plan(
+            torch, metadata, bool(torch.cuda.is_available())
+        )
+        adapter = self._registry.select_for_capability(metadata, capability)
+        model_bytes = self._adapter_model_bytes(
+            adapter,
+            snapshot,
+            capability,
+            int(validation.get("weights_bytes") or 0),
+        )
+        execution_plan = self._execution_plan_for(
+            pack=pack,
+            precision_plan=precision_plan,
+            model_bytes=model_bytes,
+        )
+        component_values = None
+        component_manifest = None
+        component_error = None
+        if pack.engine == "comfyui":
+            try:
+                materialized = self._comfy_model_materializer.materialize(
+                    snapshot=snapshot,
+                    model_id=model_id,
+                    pack=pack,
+                )
+                component_values = materialized.components
+                component_manifest = materialized.as_dict()
+            except ComfyModelError as error:
+                component_error = str(error)
+
+        # Promotion validates the engine contract without requiring a loaded
+        # Diffusers pipeline or a live Comfy process. Operational engine health
+        # remains enforced again by load/generation.
+        preflight = self._preflight_service.run(
+            model_id=model_id,
+            pack=pack,
+            capability=capability,
+            request={"capability": capability, "preset": "BALANCED"},
+            snapshot=snapshot,
+            execution_plan=execution_plan,
+            engine_health=lambda: {
+                "ready": True,
+                "engine": pack.engine,
+                "validation_only": True,
+            },
+            dependency_errors=[],
+            diagnostics={
+                "promotion": True,
+                "registry_source": self._model_pack_registry.source,
+                "registry_reload_error": self._model_pack_registry.last_reload_error,
+                "comfy_models": component_manifest,
+            },
+            component_values=component_values,
+            component_error=component_error,
+        )
+        if not preflight.ready:
+            first = preflight.errors[0] if preflight.errors else None
+            raise WorkerError(
+                first.message if first else "Préflight de promotion bloqué.",
+                409,
+                code=first.code if first else "MODEL_LAB_PREFLIGHT_BLOCKED",
+                retryable=bool(first.retryable) if first else False,
+            )
+
+        promoted = {
+            **manifest,
+            **validation,
+            "model_id": model_id,
+            "repository": repository,
+            "revision": revision,
+            "capabilities": list(metadata.get("capabilities") or [capability]),
+            "requested_capabilities": [capability],
+            "downloaded": True,
+            "validated": True,
+            "installed": True,
+            "runtime_available": self.runtime_status()["runtime_available"],
+            "runtime_compatible": True,
+            "validation_test": False,
+            "loaded": False,
+            "ready": False,
+            "state": ModelState.INSTALLED,
+            "stage": "promoted",
+            "experimental": False,
+            "promoted_from_experimental": True,
+            "load_allowed": True,
+            "generation_allowed": False,
+            "capability": capability,
+            "precision_plan": precision_plan.as_dict(),
+            "execution_plan": execution_plan.as_dict(),
+            "preflight": preflight.as_dict(),
+            **resolved.as_fields(capability),
+        }
+        manifest_path = snapshot / "vidioai-model.json"
+        temporary = manifest_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(promoted, indent=2), encoding="utf-8")
+        os.replace(temporary, manifest_path)
+        with self._lock:
+            self._model_states[model_id] = dict(promoted)
+        return promoted
+
     def model_status(self, model_id: str) -> dict[str, Any]:
         model_id = self._safe_segment(model_id)
         with self._lock:
@@ -1807,9 +2665,33 @@ class RuntimeManager:
                 ModelState.RUNTIME_UNAVAILABLE,
                 ModelState.INCOMPATIBLE,
             }:
-                return dict(current)
-            if current is not None and self._active_pointer(model_id).is_file():
-                return dict(current)
+                status = dict(current)
+                status.setdefault("model_pack_id", None)
+                status.setdefault(
+                    "model_pack_status",
+                    ModelPackStatus.UNSUPPORTED.value,
+                )
+                status.setdefault("engine", None)
+                status.setdefault("workflow", None)
+                status.setdefault("advanced_parameters", [])
+                status.setdefault("presets", {})
+                return status
+            if (
+                current is not None
+                and current.get("experimental") is not True
+                and self._active_pointer(model_id).is_file()
+            ):
+                status = dict(current)
+                status.setdefault("model_pack_id", None)
+                status.setdefault(
+                    "model_pack_status",
+                    ModelPackStatus.UNSUPPORTED.value,
+                )
+                status.setdefault("engine", None)
+                status.setdefault("workflow", None)
+                status.setdefault("advanced_parameters", [])
+                status.setdefault("presets", {})
+                return status
 
         try:
             snapshot, _ = self._active_snapshot(model_id)
@@ -1822,11 +2704,37 @@ class RuntimeManager:
                 snapshot,
                 manifest.get("requested_capabilities") or manifest.get("capabilities"),
             )
-            resolved_capability = self._resolve_supported_capability(
+            resolved_capability, pack_resolution = self._resolve_pack_capability(
                 metadata,
                 manifest.get("requested_capabilities") or manifest.get("capabilities"),
             )
             if resolved_capability is None:
+                if manifest.get("experimental") is True:
+                    status = {
+                        **manifest,
+                        **validation,
+                        "model_id": model_id,
+                        "state": ModelState.INSTALLED,
+                        "downloaded": True,
+                        "validated": True,
+                        "installed": True,
+                        "runtime_available": self.runtime_status()["runtime_available"],
+                        "runtime_compatible": False,
+                        "validation_test": False,
+                        "loaded": False,
+                        "ready": False,
+                        "load_allowed": False,
+                        "generation_allowed": False,
+                        "model_pack_id": None,
+                        "model_pack_status": ModelPackStatus.EXPERIMENTAL.value,
+                        "engine": None,
+                        "workflow": None,
+                        "advanced_parameters": [],
+                        "presets": {},
+                    }
+                    with self._lock:
+                        self._model_states[model_id] = dict(status)
+                    return status
                 runtime_error = self._unsupported_pipeline_error(metadata)
                 return {
                     "model_id": model_id,
@@ -1881,6 +2789,9 @@ class RuntimeManager:
                     if loaded is not None and loaded.pipeline is not None
                     else ModelState.INSTALLED
                 ),
+                "experimental": False,
+                "load_allowed": True,
+                "generation_allowed": True,
                 "validation_test": loaded is not None and loaded.validation_test,
                 "device": loaded.device if loaded is not None else None,
                 "capability": resolved_capability,
@@ -1891,12 +2802,20 @@ class RuntimeManager:
                     precision_plan.as_dict() if precision_plan is not None else None
                 ),
                 "memory_plan": memory_plan.as_dict() if memory_plan is not None else None,
+                "execution_plan": (
+                    loaded.execution_plan.as_dict()
+                    if loaded is not None and loaded.execution_plan is not None
+                    else None
+                ),
+                **pack_resolution.as_fields(resolved_capability),
             }
             with self._lock:
                 self._model_states[model_id] = dict(status)
             return status
 
         except WorkerError:
+            if not self._active_pointer(model_id).is_file():
+                self._comfy_model_materializer.remove(model_id)
             return {
                 "model_id": model_id,
                 "state": ModelState.NOT_INSTALLED,
@@ -1909,6 +2828,12 @@ class RuntimeManager:
                 "validation_test": False,
                 "loaded": False,
                 "ready": False,
+                "model_pack_id": None,
+                "model_pack_status": ModelPackStatus.UNSUPPORTED.value,
+                "engine": None,
+                "workflow": None,
+                "advanced_parameters": [],
+                "presets": {},
             }
 
     def _precision_plan(
@@ -2035,16 +2960,29 @@ class RuntimeManager:
                 code="INSUFFICIENT_VRAM",
                 retryable=True,
             )
+        requested_optimizations = set(plan.optimizations)
         plan.optimizations = []
         if device != "cuda" or plan.strategy == "CPU":
             return pipeline
 
         if getattr(pipeline, "_vidioai_components_manager_managed", False):
+            if plan.strategy == "FULL_GPU":
+                raise WorkerError(
+                    "ExecutionPlan FULL_GPU incompatible avec le gestionnaire d'offload actif.",
+                    409,
+                    code="EXECUTION_PLAN_NOT_APPLIED",
+                )
             plan.optimizations.append("COMPONENTS_MANAGER_AUTO_CPU_OFFLOAD")
             plan.optimizations = list(dict.fromkeys(plan.optimizations))
             return pipeline
 
         if getattr(pipeline, "_vidioai_modular_full_gpu", False):
+            if plan.strategy != "FULL_GPU":
+                raise WorkerError(
+                    "L'offload requis par ExecutionPlan ne peut pas être appliqué à cette ModularPipeline.",
+                    409,
+                    code="EXECUTION_PLAN_NOT_APPLIED",
+                )
             plan.optimizations.append("MODULAR_DEVICE_MAP_CUDA")
             plan.optimizations = list(dict.fromkeys(plan.optimizations))
             return pipeline
@@ -2117,13 +3055,38 @@ class RuntimeManager:
                     retryable=True,
                 ) from error
 
-        if "VIDEO" in plan.capability:
-            for optimization, method_name in (
-                ("VAE_SLICING", "enable_vae_slicing"),
-                ("VAE_TILING", "enable_vae_tiling"),
+        requested_vae = {
+            optimization
+            for optimization in ("VAE_SLICING", "VAE_TILING")
+            if optimization in requested_optimizations
+        }
+        for optimization, method_name in (
+            ("VAE_SLICING", "enable_vae_slicing"),
+            ("VAE_TILING", "enable_vae_tiling"),
+        ):
+            if optimization not in requested_vae:
+                continue
+            if self._enable_pipeline_method(pipeline, method_name):
+                plan.optimizations.append(optimization)
+            else:
+                raise WorkerError(
+                    f"ExecutionPlan requiert {optimization}, indisponible sur la pipeline.",
+                    409,
+                    code="EXECUTION_PLAN_NOT_APPLIED",
+                )
+        if "EFFICIENT_ATTENTION" in requested_optimizations:
+            if self._enable_pipeline_method(
+                pipeline,
+                "enable_xformers_memory_efficient_attention",
             ):
-                if self._enable_pipeline_method(pipeline, method_name):
-                    plan.optimizations.append(optimization)
+                plan.optimizations.append("EFFICIENT_ATTENTION")
+            else:
+                raise WorkerError(
+                    "ExecutionPlan requiert une attention mémoire-efficace indisponible.",
+                    409,
+                    code="EXECUTION_PLAN_NOT_APPLIED",
+                )
+        if "VIDEO" in plan.capability:
             for component_name in ("unet", "transformer"):
                 component = getattr(pipeline, component_name, None)
                 method = getattr(component, "enable_forward_chunking", None)
@@ -2297,9 +3260,40 @@ class RuntimeManager:
             current = self._model_states.get(model_id)
             if existing is not None and existing.pipeline is not None and current is not None:
                 return dict(current)
-        self._log_model_state(model_id, "INSTALLED", "LOADING")
         snapshot, pointer = self._active_snapshot(model_id)
         validation = self.validate_snapshot(snapshot)
+        metadata, manifest = self._effective_snapshot_metadata(snapshot)
+        if manifest.get("experimental") is True:
+            candidate_capability, candidate_pack = self._resolve_pack_capability(
+                metadata,
+                manifest.get("requested_capabilities") or manifest.get("capabilities"),
+            )
+            if candidate_capability is None or candidate_pack.pack is None:
+                quarantined = {
+                    **manifest,
+                    **validation,
+                    "state": ModelState.INSTALLED,
+                    "loaded": False,
+                    "ready": False,
+                    "runtime_compatible": False,
+                    "load_allowed": False,
+                    "generation_allowed": False,
+                    "model_pack_status": ModelPackStatus.EXPERIMENTAL.value,
+                    "error_code": "EXPERIMENTAL_MODEL_NOT_EXECUTABLE",
+                    "error": (
+                        "Ce modèle expérimental reste en quarantaine tant qu'aucun "
+                        "ModelPack actif ne couvre son architecture."
+                    ),
+                }
+                with self._lock:
+                    self._model_states[model_id] = quarantined
+                raise WorkerError(
+                    quarantined["error"],
+                    409,
+                    code="EXPERIMENTAL_MODEL_NOT_EXECUTABLE",
+                    retryable=False,
+                )
+        self._log_model_state(model_id, "INSTALLED", "LOADING")
         with self._lock:
             self._model_states[model_id] = {
                 "model_id": model_id,
@@ -2330,13 +3324,12 @@ class RuntimeManager:
                 self._model_states[model_id] = status
             raise WorkerError(status["error"], 503, code="RUNTIME_UNAVAILABLE")
 
-        metadata, manifest = self._effective_snapshot_metadata(snapshot)
         bundle = self._bundle_manager.bundle_from_manifest(
             manifest,
             repository=str(pointer.get("repository") or ""),
             revision=str(pointer.get("revision") or snapshot.name),
         )
-        capability = self._resolve_supported_capability(
+        capability, pack_resolution = self._resolve_pack_capability(
             metadata,
             manifest.get("requested_capabilities") or manifest.get("capabilities"),
         )
@@ -2357,16 +3350,22 @@ class RuntimeManager:
             )
             raise runtime_error
 
+        model_pack = pack_resolution.pack
+        if model_pack is None:
+            raise WorkerError(
+                "Aucun ModelPack ne couvre cette architecture.",
+                422,
+                code="MODEL_PACK_MISSING",
+                retryable=False,
+            )
         adapter = self._registry.select_for_capability(metadata, capability)
-        if adapter is None:
+        if adapter is None and model_pack.engine != "comfyui":
             raise self._unsupported_pipeline_error(metadata, capability)
 
         device = "cuda" if cuda_available else "cpu"
         with self._lock:
             self._model_states[model_id]["stage"] = "resolving_precision"
         precision_plan = self._precision_plan(torch, metadata, cuda_available)
-        dtype = self._dtype_resolver.materialize(torch, precision_plan)
-        precision = precision_plan.precision
         with self._lock:
             self._model_states[model_id]["stage"] = "planning_memory"
         planning_model_bytes = self._adapter_model_bytes(
@@ -2382,7 +3381,16 @@ class RuntimeManager:
             precision_plan,
             planning_model_bytes,
         )
-        if not memory_plan.feasible:
+        execution_plan = self._execution_plan_for(
+            pack=model_pack,
+            precision_plan=precision_plan,
+            model_bytes=planning_model_bytes,
+        )
+        self._align_precision_with_execution(precision_plan, execution_plan)
+        self._apply_execution_to_memory_plan(memory_plan, execution_plan)
+        dtype = self._dtype_resolver.materialize(torch, precision_plan)
+        precision = precision_plan.precision
+        if not execution_plan.feasible:
             status = {
                 "model_id": model_id,
                 "state": ModelState.INSTALLED,
@@ -2394,6 +3402,8 @@ class RuntimeManager:
                 "loaded": False,
                 "ready": False,
                 "memory_plan": memory_plan.as_dict(),
+                "execution_plan": execution_plan.as_dict(),
+                **pack_resolution.as_fields(capability),
                 "error_code": "INSUFFICIENT_VRAM",
                 "error": "Chargement impossible : VRAM insuffisante.",
             }
@@ -2410,6 +3420,8 @@ class RuntimeManager:
                 stage="loading_pipeline",
                 precision_plan=precision_plan.as_dict(),
                 memory_plan=memory_plan.as_dict(),
+                execution_plan=execution_plan.as_dict(),
+                **pack_resolution.as_fields(capability),
             )
         gpu_before = self._nvidia_metrics()
         memory_before_load = self._memory_metrics()
@@ -2418,18 +3430,29 @@ class RuntimeManager:
             torch.cuda.reset_peak_memory_stats()
 
         try:
-            pipeline, repaired_dependencies = self._dependency_resolver.load_with_repair(
-                lambda: self._load_pipeline(
-                    snapshot=snapshot,
-                    metadata=metadata,
-                    capability=capability,
-                    adapter=adapter,
-                    device=device,
-                    dtype=dtype,
-                    memory_plan=memory_plan,
-                ),
-                self._dependency_installer,
-            )
+            if model_pack.engine == "comfyui":
+                health = self._engine_health(model_pack, None)
+                if not health.get("ready"):
+                    raise EngineError(
+                        str(health.get("error") or "ComfyUI indisponible."),
+                        code=str(health.get("error_code") or "COMFYUI_UNAVAILABLE"),
+                        retryable=True,
+                    )
+                pipeline = ComfyModelHandle(model_pack.id)
+                repaired_dependencies = []
+            else:
+                pipeline, repaired_dependencies = self._dependency_resolver.load_with_repair(
+                    lambda: self._load_pipeline(
+                        snapshot=snapshot,
+                        metadata=metadata,
+                        capability=capability,
+                        adapter=adapter,
+                        device=device,
+                        dtype=dtype,
+                        memory_plan=memory_plan,
+                    ),
+                    self._dependency_installer,
+                )
             runtime_dependencies = self._merge_dependency_records(
                 list(manifest.get("runtime_dependencies") or []),
                 repaired_dependencies,
@@ -2446,6 +3469,7 @@ class RuntimeManager:
                     DependencyResolutionError,
                     BundleError,
                     ModularRuntimeError,
+                    EngineError,
                 ),
             ) else "LOAD_FAILED"
             self._log_model_state(model_id, "LOADING", "FAILED", reason=code)
@@ -2461,7 +3485,7 @@ class RuntimeManager:
                 "validation_test": False,
                 "loaded": False,
                 "ready": False,
-                "error": f"Chargement Diffusers impossible: {type(error).__name__}: {error}",
+                "error": f"Chargement {model_pack.engine} impossible: {type(error).__name__}: {error}",
                 "error_code": code,
             }
             if isinstance(
@@ -2527,7 +3551,7 @@ class RuntimeManager:
                 - memory_before_load["vidioai_ram_bytes"],
             ),
             "ram_peak_bytes": self._ram_peak_bytes(),
-            "runtime": "Diffusers",
+            "runtime": model_pack.engine,
             "precision": precision,
             "resolution_width": None,
             "resolution_height": None,
@@ -2562,8 +3586,13 @@ class RuntimeManager:
             precision_plan=precision_plan,
             memory_plan=memory_plan,
             bundle=bundle,
+            model_pack=model_pack,
+            execution_plan=execution_plan,
+            engine=model_pack.engine,
+            adapter=adapter,
         )
-        precision_plan.components = self._dtype_resolver.inspect_components(pipeline)
+        if model_pack.engine == "diffusers":
+            precision_plan.components = self._dtype_resolver.inspect_components(pipeline)
         status = {
             "model_id": model_id,
             "state": ModelState.READY,
@@ -2587,6 +3616,8 @@ class RuntimeManager:
             "precision_plan": precision_plan.as_dict(),
             "memory_plan": memory_plan.as_dict(),
             "memory_strategy": memory_plan.strategy,
+            "execution_plan": execution_plan.as_dict(),
+            **pack_resolution.as_fields(capability),
             "bundle": bundle,
             "stage": "ready",
         }
@@ -2609,8 +3640,22 @@ class RuntimeManager:
             }
             loaded = self._loaded.pop(model_id, None)
         if loaded is not None:
-            self._cleanup_disk_offload(loaded.pipeline)
-            del loaded.pipeline
+            pipeline = loaded.pipeline
+            self._cleanup_disk_offload(pipeline)
+            self._remove_offload_hooks(pipeline)
+            adapter = loaded.adapter
+            if adapter is None and loaded.metadata and loaded.capability:
+                adapter = self._registry.select_for_capability(
+                    loaded.metadata,
+                    loaded.capability,
+                )
+            if adapter is not None and pipeline is not None:
+                try:
+                    adapter.unload(pipeline, {"model_id": model_id})
+                except Exception:
+                    logger.exception("MODEL_ADAPTER_UNLOAD_FAILED model_id=%s", model_id)
+            loaded.pipeline = None
+            del pipeline
             gc.collect()
             try:
                 torch = self._imports().torch
@@ -2639,11 +3684,50 @@ class RuntimeManager:
         return status
 
     def unload_all(self) -> dict[str, Any]:
+        before = self.resources()
         with self._lock:
             model_ids = list(self._loaded)
         for model_id in model_ids:
             self.unload_model(model_id)
-        return {"unloaded": model_ids}
+        comfy_error = None
+        if self._comfyui is not None:
+            try:
+                self._comfyui.free()
+            except EngineError as error:
+                comfy_error = str(error)
+        gc.collect()
+        try:
+            torch = self._imports().torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except WorkerError:
+            pass
+        after = self.resources()
+        return {
+            "success": comfy_error is None,
+            "code": "COMFYUI_FREE_FAILED" if comfy_error else None,
+            "models_unloaded": model_ids,
+            "unloaded": model_ids,
+            "before_memory": {
+                "gpu": before.get("gpu"),
+                "memory": before.get("memory"),
+                "diagnostics": before.get("diagnostics"),
+            },
+            "after_memory": {
+                "gpu": after.get("gpu"),
+                "memory": after.get("memory"),
+                "diagnostics": after.get("diagnostics"),
+            },
+            "message": (
+                f"Nettoyage local terminé, mais libération ComfyUI impossible: {comfy_error}"
+                if comfy_error
+                else
+                f"{len(model_ids)} modèle(s) déchargé(s)."
+                if model_ids
+                else "Aucun modèle déclaré chargé; nettoyage runtime effectué."
+            ),
+            "comfyui_error": comfy_error,
+        }
 
     def _ensure_pipeline_for_capability(
         self,
@@ -2746,6 +3830,94 @@ class RuntimeManager:
             raise WorkerError("Le chemin de sortie quitte le volume autorisé.", 422)
         candidate.parent.mkdir(parents=True, exist_ok=True)
         return candidate
+
+    @staticmethod
+    def _select_comfy_output(
+        outputs: dict[str, Any],
+        *,
+        video: bool,
+    ) -> dict[str, str]:
+        descriptors = ComfyUIEngine.output_descriptors(outputs)
+        if not descriptors:
+            raise WorkerError(
+                "ComfyUI n'a retourné aucun fichier de sortie.",
+                502,
+                code="COMFYUI_OUTPUT_INVALID",
+            )
+        preferred = (
+            {".mp4", ".mov", ".webm", ".mkv"}
+            if video
+            else {".png", ".jpg", ".jpeg", ".webp"}
+        )
+        return next(
+            (
+                descriptor
+                for descriptor in descriptors
+                if Path(descriptor["filename"]).suffix.lower() in preferred
+            ),
+            descriptors[0],
+        )
+
+    def _materialize_comfy_output(
+        self,
+        *,
+        outputs: dict[str, Any],
+        output_relative_path: str,
+        video: bool,
+    ) -> tuple[Path, dict[str, Any], dict[str, str]]:
+        if self._comfyui is None:
+            raise WorkerError(
+                "ComfyUI headless n'est pas disponible.",
+                503,
+                code="COMFYUI_UNAVAILABLE",
+                retryable=True,
+            )
+        output_path = self._output_path(output_relative_path)
+        required_suffix = ".mp4" if video else ".png"
+        if output_path.suffix.lower() != required_suffix:
+            raise WorkerError(
+                f"La sortie {'vidéo' if video else 'image'} doit utiliser {required_suffix}.",
+                422,
+                code="INVALID_OUTPUT_PATH",
+            )
+        descriptor = self._select_comfy_output(outputs, video=video)
+        payload = self._comfyui.view(descriptor)
+        temporary = output_path.with_name(
+            f".{output_path.stem}.{uuid.uuid4().hex}.tmp{required_suffix}"
+        )
+        try:
+            if video:
+                with temporary.open("xb") as target:
+                    target.write(payload)
+                    target.flush()
+                    os.fsync(target.fileno())
+                try:
+                    probe = self._output_normalizer.probe_video(temporary)
+                except NormalizationError as error:
+                    raise WorkerError(
+                        str(error),
+                        502,
+                        code=error.code,
+                    ) from error
+            else:
+                try:
+                    from PIL import Image
+
+                    with Image.open(io.BytesIO(payload)) as source:
+                        source.load()
+                        image = source.convert("RGB")
+                    image.save(temporary, format="PNG")
+                    probe = {"width": image.width, "height": image.height}
+                except Exception as error:
+                    raise WorkerError(
+                        f"Sortie image ComfyUI invalide: {error}",
+                        502,
+                        code="COMFYUI_OUTPUT_INVALID",
+                    ) from error
+            os.replace(temporary, output_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return output_path, probe, descriptor
 
     def _recover_dtype_pipeline(
         self,
@@ -2979,6 +4151,43 @@ class RuntimeManager:
         capability: str,
         torch: Any,
     ) -> None:
+        execution = getattr(loaded, "execution_plan", None)
+        if execution is not None and loaded.memory_plan is not None:
+            if not execution.feasible:
+                raise WorkerError(
+                    execution.reason or "ExecutionPlan infaisable.",
+                    409,
+                    code="INSUFFICIENT_VRAM",
+                    retryable=True,
+                )
+            current_strategy = loaded.memory_plan.strategy
+            ranks = {
+                "FULL_GPU": 0,
+                "MODEL_CPU_OFFLOAD": 1,
+                "SEQUENTIAL_CPU_OFFLOAD": 2,
+                "DISK_OFFLOAD": 3,
+            }
+            self._apply_execution_to_memory_plan(loaded.memory_plan, execution)
+            if (
+                loaded.device == "cuda"
+                and ranks.get(execution.strategy, 0) > ranks.get(current_strategy, 0)
+            ):
+                self._cleanup_disk_offload(loaded.pipeline)
+                self._remove_offload_hooks(loaded.pipeline)
+                if hasattr(loaded.pipeline, "to"):
+                    loaded.pipeline.to("cpu")
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                loaded.pipeline = self._apply_memory_plan(
+                    loaded.pipeline,
+                    loaded.memory_plan,
+                    loaded.device,
+                )
+            loaded.load_benchmark["memory_strategy"] = loaded.memory_plan.strategy
+            loaded.load_benchmark["memory_plan"] = loaded.memory_plan.as_dict()
+            loaded.load_benchmark["execution_plan"] = execution.as_dict()
+            return
         if loaded.device != "cuda" or loaded.precision_plan is None:
             return
         model_bytes = loaded.memory_plan.model_bytes if loaded.memory_plan is not None else 0
@@ -3052,6 +4261,134 @@ class RuntimeManager:
         requested_capability = str(
             request.get("capability") or loaded.capability or "TEXT_TO_IMAGE"
         ).upper()
+        pack_resolution = self._resolve_model_pack(
+            loaded.metadata or {},
+            requested_capability,
+        )
+        if pack_resolution.pack is None:
+            raise WorkerError(
+                "Aucun ModelPack ne couvre cette génération.",
+                422,
+                code="MODEL_PACK_MISSING",
+            )
+        request = self._merge_advanced_parameters(pack_resolution.pack, request)
+        preflight_request = {
+            **request,
+            "model_id": loaded.model_id,
+            "capability": requested_capability,
+        }
+        if pack_resolution.pack.engine == "diffusers":
+            preflight_request["_loaded_for_preflight"] = loaded
+        preflight = self.preflight_model(preflight_request)
+        if not preflight.ready:
+            first = preflight.errors[0]
+            raise WorkerError(
+                first.message,
+                409 if first.retryable else 422,
+                code=first.code,
+                retryable=first.retryable,
+            )
+        loaded.execution_plan = preflight.execution_plan
+        loaded.model_pack = pack_resolution.pack
+        loaded.engine = pack_resolution.pack.engine
+        if preflight.execution_plan is not None and loaded.memory_plan is not None:
+            self._align_precision_with_execution(
+                loaded.precision_plan,
+                preflight.execution_plan,
+            ) if loaded.precision_plan is not None else None
+            request["width"] = preflight.execution_plan.resolution["width"]
+            request["height"] = preflight.execution_plan.resolution["height"]
+            request["frames"] = preflight.execution_plan.frames
+        if pack_resolution.pack.engine == "comfyui":
+            if self._comfyui is None or preflight.built_workflow is None:
+                raise WorkerError(
+                    "ComfyUI headless n'est pas disponible.",
+                    503,
+                    code="COMFYUI_UNAVAILABLE",
+                    retryable=True,
+                )
+            with self._lock:
+                cancel_event = self._cancel_events.get(job_id)
+                if cancel_event is None:
+                    raise WorkerError("Job actif introuvable.", 404)
+
+            def emit_comfy_progress(progress: int) -> None:
+                with self._lock:
+                    self._jobs[job_id]["progress"] = progress
+
+            result = self._comfyui.execute(
+                {"workflow": preflight.built_workflow.workflow},
+                progress=emit_comfy_progress,
+                cancelled=cancel_event.is_set,
+            )
+            if cancel_event.is_set():
+                raise InterruptedError("Job ComfyUI annulé.")
+            outputs = result.get("outputs") or {}
+            is_video_request = requested_capability in VIDEO_CAPABILITIES
+            output_path, media_probe, descriptor = self._materialize_comfy_output(
+                outputs=outputs,
+                output_relative_path=str(request["output_relative_path"]),
+                video=is_video_request,
+            )
+            width = int(
+                media_probe.get("width")
+                or request.get("width")
+                or pack_resolution.pack.defaults.get("width")
+                or 512
+            )
+            height = int(
+                media_probe.get("height")
+                or request.get("height")
+                or pack_resolution.pack.defaults.get("height")
+                or 512
+            )
+            benchmark = {
+                **loaded.load_benchmark,
+                "engine": "comfyui",
+                "execution_plan": (
+                    preflight.execution_plan.as_dict()
+                    if preflight.execution_plan
+                    else None
+                ),
+                "resolution_width": width,
+                "resolution_height": height,
+                "frames": media_probe.get("frames"),
+                "duration_seconds": media_probe.get("duration"),
+                "fps": media_probe.get("fps"),
+            }
+            loaded.load_benchmark = benchmark
+            return {
+                "job_id": job_id,
+                "state": JobState.COMPLETED,
+                "progress": 100,
+                "engine": "comfyui",
+                "model_pack_id": pack_resolution.pack.id,
+                "workflow": preflight.workflow,
+                "execution_plan": preflight.execution_plan.as_dict() if preflight.execution_plan else None,
+                "outputs": outputs,
+                "output_descriptor": descriptor,
+                "prompt_id": result.get("prompt_id"),
+                "output_relative_path": request["output_relative_path"],
+                "width": width,
+                "height": height,
+                "requested_quality": request.get("quality") if is_video_request else None,
+                "requested_aspect_ratio": request.get("aspect_ratio") if is_video_request else None,
+                "requested_duration_seconds": request.get("duration_seconds") if is_video_request else None,
+                "requested_fps": request.get("fps") if is_video_request else None,
+                "requested_frames": request.get("frames") if is_video_request else None,
+                "inference_frames": (
+                    preflight.execution_plan.frames
+                    if is_video_request and preflight.execution_plan
+                    else None
+                ),
+                "actual_width": width,
+                "actual_height": height,
+                "actual_fps": media_probe.get("fps") if is_video_request else None,
+                "actual_frames": media_probe.get("frames") if is_video_request else None,
+                "actual_duration": media_probe.get("duration") if is_video_request else None,
+                "sha256": self._sha256(output_path),
+                "benchmark": benchmark,
+            }
         adapter = self._ensure_pipeline_for_capability(
             loaded,
             requested_capability,
@@ -3461,6 +4798,18 @@ class RuntimeManager:
             "actual_duration": media_probe.get("duration") if is_video_request else None,
             "sha256": self._sha256(output_path),
             "benchmark": benchmark,
+            "engine": loaded.engine,
+            "model_pack_id": loaded.model_pack.id if loaded.model_pack else None,
+            "workflow": (
+                loaded.model_pack.workflow_for(requested_capability)
+                if loaded.model_pack
+                else None
+            ),
+            "execution_plan": (
+                loaded.execution_plan.as_dict()
+                if loaded.execution_plan is not None
+                else None
+            ),
         }
 
     def generate_image(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -3494,7 +4843,12 @@ class RuntimeManager:
                 "error": None,
             }
         except Exception as error:
-            if isinstance(error, WorkerError):
+            if isinstance(error, EngineError):
+                message = str(error)
+                error_code = error.code
+                retryable = error.retryable
+                status_code = 503 if error.retryable else 500
+            elif isinstance(error, WorkerError):
                 message = str(error)
                 error_code = error.code
                 retryable = error.retryable
@@ -3567,283 +4921,3 @@ class RuntimeManager:
             if job is None:
                 raise WorkerError("Job worker introuvable.", 404)
             return dict(job)
-
-# VIDIOAI_FULLVERIFY_WORKER_HOTFIX_V3_RUNTIME
-#
-# Règles restaurées:
-# - métadonnées Diffusers incomplètes => UNKNOWN, pas UNSUPPORTED;
-# - les capacités demandées/catalogue ne sont pas exposées comme réellement
-#   exécutables lorsque runtime_compatible == False.
-_VIDIOAI_V3_ORIGINAL_CHECK_COMPATIBILITY = RuntimeManager.check_compatibility
-_VIDIOAI_V3_ORIGINAL_INSTALL_MODEL = RuntimeManager.install_model
-
-
-def _vidioai_v3_status_is(value, expected):
-    normalized = str(value or "").strip().upper()
-    return normalized == expected or normalized.endswith("." + expected)
-
-
-def _vidioai_v3_unknown_status(current):
-    enum_type = type(current)
-    member = getattr(enum_type, "UNKNOWN", None)
-    if member is not None:
-        return member
-
-    compatibility_type = globals().get("CompatibilityStatus")
-    if compatibility_type is not None:
-        member = getattr(compatibility_type, "UNKNOWN", None)
-        if member is not None:
-            return member
-
-    return "UNKNOWN"
-
-
-def _vidioai_v3_payload_pipeline_class(payload):
-    if not isinstance(payload, dict):
-        return None
-    for key in ("pipeline_class", "class_name", "_class_name"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
-def _vidioai_v3_check_compatibility(self, payload, *args, **kwargs):
-    result = _VIDIOAI_V3_ORIGINAL_CHECK_COMPATIBILITY(
-        self,
-        payload,
-        *args,
-        **kwargs,
-    )
-    if not isinstance(result, dict) or not isinstance(payload, dict):
-        return result
-
-    library = str(payload.get("library_name") or "diffusers").strip().lower()
-    pipeline_class = _vidioai_v3_payload_pipeline_class(payload)
-    current_status = result.get("compatibility_status")
-
-    # Une architecture de composant (Transformer/VAE/etc.) sans classe pipeline
-    # ne prouve pas que le repository est incompatible. Le snapshot doit être
-    # inspecté avant de trancher.
-    if (
-        library in {"", "diffusers"}
-        and pipeline_class is None
-        and _vidioai_v3_status_is(current_status, "UNSUPPORTED")
-    ):
-        patched = dict(result)
-        patched["compatibility_status"] = _vidioai_v3_unknown_status(current_status)
-        patched["runtime_supported"] = False
-
-        explanation = (
-            "Métadonnées Diffusers incomplètes; compatibilité à confirmer "
-            "après inspection du snapshot."
-        )
-        for key in ("runtime_reason", "compatibility_reason", "reason"):
-            if key in patched:
-                patched[key] = explanation
-        return patched
-
-    return result
-
-
-def _vidioai_v3_install_model(self, *args, **kwargs):
-    status = _VIDIOAI_V3_ORIGINAL_INSTALL_MODEL(self, *args, **kwargs)
-    if not isinstance(status, dict):
-        return status
-
-    if (
-        status.get("runtime_compatible") is False
-        and (
-            status.get("installed") is True
-            or _vidioai_v3_status_is(status.get("state"), "INSTALLED")
-        )
-    ):
-        patched = dict(status)
-        patched["capabilities"] = []
-
-        model_id = kwargs.get("model_id")
-        if model_id is None and args:
-            model_id = args[0]
-
-        if isinstance(model_id, str):
-            lock = getattr(self, "_lock", None)
-            states = getattr(self, "_model_states", None)
-            if lock is not None and isinstance(states, dict):
-                with lock:
-                    existing = states.get(model_id)
-                    if isinstance(existing, dict):
-                        existing["capabilities"] = []
-
-        return patched
-
-    return status
-
-
-RuntimeManager.check_compatibility = _vidioai_v3_check_compatibility
-RuntimeManager.install_model = _vidioai_v3_install_model
-
-# VIDIOAI_FULLVERIFY_WORKER_HOTFIX_V4_RUNTIME
-#
-# Couche de contrat finale par-dessus le v3.
-# - conserve le pipeline explicitement demandé lorsqu'il est réellement
-#   exporté par Diffusers (WanPipeline, LTXPipeline, etc.);
-# - UNKNOWN ne conserve jamais DIFFUSERS_VERSION_TOO_OLD.
-_VIDIOAI_V4_PREVIOUS_CHECK_COMPATIBILITY = RuntimeManager.check_compatibility
-
-
-def _vidioai_v4_is_status(value, expected):
-    normalized = str(value or "").strip().upper()
-    return normalized == expected or normalized.endswith("." + expected)
-
-
-def _vidioai_v4_status_member(current, expected):
-    enum_type = type(current)
-    member = getattr(enum_type, expected, None)
-    if member is not None:
-        return member
-
-    compatibility_type = globals().get("CompatibilityStatus")
-    if compatibility_type is not None:
-        member = getattr(compatibility_type, expected, None)
-        if member is not None:
-            return member
-
-    return expected
-
-
-def _vidioai_v4_requested_pipeline_class(payload):
-    if not isinstance(payload, dict):
-        return None
-    for key in ("pipeline_class", "class_name", "_class_name"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
-def _vidioai_v4_diffusers_exports(class_name):
-    if not class_name:
-        return False
-    try:
-        import diffusers
-    except (ImportError, ModuleNotFoundError):
-        return False
-    return getattr(diffusers, class_name, None) is not None
-
-
-def _vidioai_v4_check_compatibility(self, payload, *args, **kwargs):
-    result = _VIDIOAI_V4_PREVIOUS_CHECK_COMPATIBILITY(
-        self,
-        payload,
-        *args,
-        **kwargs,
-    )
-    if not isinstance(result, dict) or not isinstance(payload, dict):
-        return result
-
-    patched = dict(result)
-    library = str(payload.get("library_name") or "diffusers").strip().lower()
-    requested_class = _vidioai_v4_requested_pipeline_class(payload)
-
-    # Le contrat public doit conserver la classe exacte explicitement demandée
-    # lorsque cette classe existe réellement dans la version Diffusers chargée.
-    if (
-        library in {"", "diffusers"}
-        and requested_class
-        and _vidioai_v4_diffusers_exports(requested_class)
-    ):
-        patched["runtime_supported"] = True
-        patched["pipeline_class"] = requested_class
-        patched["compatibility_status"] = _vidioai_v4_status_member(
-            patched.get("compatibility_status"),
-            "SUPPORTED",
-        )
-        if "error_code" in patched:
-            patched["error_code"] = None
-        for key in ("runtime_reason", "compatibility_reason", "reason"):
-            if key in patched and str(patched.get(key) or "").upper().startswith(
-                "DIFFUSERS_VERSION_TOO_OLD"
-            ):
-                patched[key] = None
-        return patched
-
-    # UNKNOWN est non conclusif : un code "version too old" serait contradictoire.
-    if _vidioai_v4_is_status(
-        patched.get("compatibility_status"),
-        "UNKNOWN",
-    ):
-        if "error_code" in patched:
-            patched["error_code"] = None
-
-        neutral = (
-            "Métadonnées Diffusers incomplètes; compatibilité à confirmer "
-            "après inspection du snapshot."
-        )
-        for key in ("runtime_reason", "compatibility_reason", "reason"):
-            value = str(patched.get(key) or "")
-            if "DIFFUSERS_VERSION_TOO_OLD" in value.upper():
-                patched[key] = neutral
-
-    return patched
-
-
-RuntimeManager.check_compatibility = _vidioai_v4_check_compatibility
-
-# VIDIOAI_REMOTE_CODE_PRIORITY_HOTFIX_V6
-#
-# Priorité de sécurité finale :
-# trust_remote_code=True doit toujours gagner sur la détection d'une classe
-# Diffusers installée. Une classe locale existante (ex: WanPipeline) ne rend
-# jamais exécutable un repository qui exige du code distant.
-_VIDIOAI_V6_PREVIOUS_CHECK_COMPATIBILITY = RuntimeManager.check_compatibility
-
-
-def _vidioai_v6_status_member(current, expected):
-    enum_type = type(current)
-    member = getattr(enum_type, expected, None)
-    if member is not None:
-        return member
-
-    compatibility_type = globals().get("CompatibilityStatus")
-    if compatibility_type is not None:
-        member = getattr(compatibility_type, expected, None)
-        if member is not None:
-            return member
-
-    return expected
-
-
-def _vidioai_v6_check_compatibility(self, payload, *args, **kwargs):
-    result = _VIDIOAI_V6_PREVIOUS_CHECK_COMPATIBILITY(
-        self,
-        payload,
-        *args,
-        **kwargs,
-    )
-
-    if not isinstance(result, dict) or not isinstance(payload, dict):
-        return result
-
-    if payload.get("trust_remote_code") is not True:
-        return result
-
-    patched = dict(result)
-    patched["runtime_supported"] = False
-    patched["compatibility_status"] = _vidioai_v6_status_member(
-        patched.get("compatibility_status"),
-        "UNSUPPORTED",
-    )
-    patched["error_code"] = "REMOTE_CODE_REQUIRED"
-
-    reason = (
-        "Le modèle exige trust_remote_code; "
-        "l'exécution de code distant est refusée."
-    )
-    for key in ("runtime_reason", "compatibility_reason", "reason"):
-        if key in patched:
-            patched[key] = reason
-
-    return patched
-
-
-RuntimeManager.check_compatibility = _vidioai_v6_check_compatibility

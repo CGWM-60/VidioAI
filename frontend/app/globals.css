@@ -2421,6 +2421,18 @@ select:focus-visible,
   color: #fff;
 }
 
+.sidebar-brand-copy {
+  display: grid;
+  gap: 1px;
+}
+
+.sidebar-brand-copy small {
+  color: var(--foreground-muted);
+  font-size: 9px;
+  font-weight: 560;
+  letter-spacing: 0.04em;
+}
+
 .sidebar-brand-mark {
   position: relative;
   display: grid;

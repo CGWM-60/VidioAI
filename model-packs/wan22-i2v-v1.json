@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "id": "wan22-i2v-v1",
+  "family": "wan22",
+  "status": "READY",
+  "engine": "comfyui",
+  "capabilities": ["IMAGE_TO_VIDEO"],
+  "architectures": ["WanTransformer3DModel"],
+  "pipeline_classes": ["WanImageToVideoPipeline"],
+  "workflow_by_capability": {"IMAGE_TO_VIDEO": "wan22_i2v.json"},
+  "inputs": {"required": ["prompt", "input_image"], "optional": ["negative_prompt"], "advanced_parameters": ["seed", "steps", "cfg", "sampler", "scheduler", "fps", "frames", "resolution"]},
+  "outputs": {"media": "video", "format": "mp4"},
+  "components": {"checkpoint": "transformer", "vae": "vae", "text_encoders": ["text_encoder"], "loras": []},
+  "defaults": {"sampler": "uni_pc", "scheduler": "simple", "steps": 30, "cfg": 5.0, "resolution": {"width": 832, "height": 480}, "fps": 24, "frames": 81, "dtype": "BF16", "quantization": null},
+  "memory_policy": {"cuda_required": true, "safety_reserve_bytes": 4294967296, "supports_cpu_offload": true, "supports_sequential_offload": true, "supports_quantization": true, "efficient_attention": true, "component_placement": {"transformer": "gpu", "text_encoder": "cpu_offload", "vae": "cpu_offload"}},
+  "presets": {"FAST": {"steps": 20, "frames": 49}, "BALANCED": {"steps": 30, "frames": 81}, "QUALITY": {"steps": 40, "frames": 121}}
+}

@@ -40,6 +40,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::engine_ia::engine::text_messages_ia;
+use crate::execution_plan::{PreflightResult, StructuredRuntimeError};
 use crate::hardware_benchmark_store::HardwareBenchmarkStore;
 use crate::hardware_estimator::{
     CurrentMachine, HardwareBenchmark, HardwareEstimate, HardwareEstimator,
@@ -50,13 +51,21 @@ use crate::huggingface_catalog::{
     ModelCapability, ModelKind, ModelVariant, RepositoryFile, local_runtime_models, storage_id,
 };
 use crate::job_store::JobStore;
+use crate::model_lab::{
+    LabAnalysisResponse, LabLifecycle, LabModel, ModelLabStore, closest_pack, registry_path,
+};
+use crate::model_pack::{
+    CatalogModelStatus, ModelDescriptor, ModelPackRegistry, public_model_status,
+};
+use crate::model_pack_registry::{PackRegistryResponse, PackVersionRecord, VersionedPackRegistry};
 use crate::object_storage::{
-    ObjectStorage, S3Storage, SnapshotManifest, TransferProgressCallback, UploadProgress,
-    UploadProgressCallback, is_snapshot_file, model_s3_prefix,
+    ObjectStorage, S3Storage, SnapshotManifest, TransferCancellationToken,
+    TransferProgressCallback, UploadProgress, UploadProgressCallback, is_cloud_backup_cancelled,
+    is_snapshot_file, model_s3_prefix,
 };
 use crate::worker::{
-    GenerateResponse, WorkerBenchmarkObservation, WorkerClient, WorkerCompatibility, WorkerReady,
-    WorkerResources,
+    GenerateResponse, WorkerBenchmarkObservation, WorkerClient, WorkerCompatibility,
+    WorkerInstallOptions, WorkerReady, WorkerResources, WorkerUnloadAllResponse,
 };
 
 /// Taille maximale d'un asset reçu. La limite protège le processus avant même
@@ -76,12 +85,120 @@ pub(crate) fn unix_now() -> u64 {
 // Erreurs HTTP homogènes
 // -----------------------------------------------------------------------------
 
-/// Une erreur applicative est toujours renvoyée sous la forme
-/// `{ "error": "..." }`, ce qui permet au frontend d'afficher le vrai message.
+/// Une erreur applicative conserve `error` pour les anciens clients et expose
+/// en plus un contrat structuré stable pour les nouvelles interfaces.
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     message: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct ApiErrorBody {
+    error: String,
+    message: String,
+    code: String,
+    retryable: bool,
+}
+
+const KNOWN_ERROR_NAMESPACES: &[&str] = &[
+    "CACHE_",
+    "CLOUD_",
+    "COMFYUI_",
+    "DEPENDENCY_",
+    "ENGINE_",
+    "EXECUTION_PLAN_",
+    "GENERATION_",
+    "GPU_",
+    "H3_",
+    "INSUFFICIENT_",
+    "INVALID_",
+    "JOB_",
+    "MODEL_",
+    "NATIVE_",
+    "NODE_",
+    "OUTPUT_",
+    "PIPELINE_",
+    "PREFLIGHT_",
+    "RESTORE_",
+    "RUNTIME_",
+    "S3_",
+    "SNAPSHOT_",
+    "VIDEO_",
+    "WORKER_",
+    "WORKFLOW_",
+];
+
+fn prefixed_error_code(message: &str) -> Option<&str> {
+    let (candidate, _) = message.split_once(':')?;
+    let candidate = candidate.trim();
+    let syntactically_valid = (3..=64).contains(&candidate.len())
+        && candidate
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_uppercase())
+        && candidate
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
+    (syntactically_valid
+        && KNOWN_ERROR_NAMESPACES
+            .iter()
+            .any(|namespace| candidate.starts_with(namespace)))
+    .then_some(candidate)
+}
+
+fn fallback_http_error_code(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "BAD_REQUEST",
+        StatusCode::UNAUTHORIZED => "UNAUTHORIZED",
+        StatusCode::FORBIDDEN => "FORBIDDEN",
+        StatusCode::NOT_FOUND => "NOT_FOUND",
+        StatusCode::CONFLICT => "CONFLICT",
+        StatusCode::TOO_MANY_REQUESTS => "TOO_MANY_REQUESTS",
+        StatusCode::SERVICE_UNAVAILABLE => "SERVICE_UNAVAILABLE",
+        StatusCode::GATEWAY_TIMEOUT => "GATEWAY_TIMEOUT",
+        StatusCode::INTERNAL_SERVER_ERROR => "INTERNAL_SERVER_ERROR",
+        _ if status.is_client_error() => "CLIENT_ERROR",
+        _ if status.is_server_error() => "SERVER_ERROR",
+        _ => "HTTP_ERROR",
+    }
+}
+
+fn error_is_retryable(status: StatusCode, code: &str) -> bool {
+    status == StatusCode::SERVICE_UNAVAILABLE
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::GATEWAY_TIMEOUT
+        || matches!(
+            code,
+            "ENGINE_UNAVAILABLE"
+                | "GPU_MEMORY_OCCUPIED"
+                | "INSUFFICIENT_VRAM"
+                | "JOB_DISPATCH_TIMEOUT"
+                | "RUNTIME_UNAVAILABLE"
+                | "WORKER_LOST"
+                | "WORKER_START_TIMEOUT"
+                | "WORKER_UNAVAILABLE"
+        )
+}
+
+fn structured_runtime_fields(message: &str) -> (String, bool) {
+    let code = prefixed_error_code(message)
+        .unwrap_or("GENERATION_FAILED")
+        .to_owned();
+    let retryable = error_is_retryable(StatusCode::OK, &code);
+    (code, retryable)
+}
+
+fn structured_error_body(status: StatusCode, message: String) -> ApiErrorBody {
+    let code = prefixed_error_code(&message)
+        .unwrap_or_else(|| fallback_http_error_code(status))
+        .to_owned();
+    ApiErrorBody {
+        error: message.clone(),
+        message,
+        retryable: error_is_retryable(status, &code),
+        code,
+    }
 }
 
 impl ApiError {
@@ -131,7 +248,8 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
+        let body = structured_error_body(self.status, self.message);
+        (self.status, Json(body)).into_response()
     }
 }
 
@@ -341,6 +459,14 @@ pub struct ModelView {
     /// `true` uniquement lorsqu'un runtime exploitable a été validé. Un simple
     /// manifeste Hugging Face ne doit jamais être présenté comme un modèle prêt.
     pub runtime_ready: bool,
+    /// Statut catalogue strict, déterminé par le ModelPack et la readiness
+    /// effective, jamais par la seule présence d'un dépôt téléchargeable.
+    pub model_status: CatalogModelStatus,
+    pub model_pack_id: Option<String>,
+    pub model_pack_status: Option<CatalogModelStatus>,
+    pub workflow: Option<String>,
+    pub advanced_parameters: Vec<String>,
+    pub presets: serde_json::Value,
     /// État lisible par le frontend sans avoir à déduire la situation depuis
     /// plusieurs booléens (`builtin`, `not_installed` ou `ready`).
     pub installation_state: String,
@@ -448,6 +574,53 @@ pub enum JobStatus {
     PendingRetry,
 }
 
+/// État indépendant de la copie L2 vers le stockage cloud. Il ne modifie pas
+/// le résultat d'une installation locale déjà validée.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CloudBackupStatus {
+    #[default]
+    NotRequested,
+    Pending,
+    Uploading,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl CloudBackupStatus {
+    fn from_legacy(value: Option<&str>) -> Self {
+        match value.unwrap_or_default() {
+            "CACHE_PENDING" => Self::Pending,
+            "CACHE_UPLOADING" => Self::Uploading,
+            "CACHE_READY" => Self::Completed,
+            "CACHE_FAILED" => Self::Failed,
+            "CACHE_CANCELLED" => Self::Cancelled,
+            _ => Self::NotRequested,
+        }
+    }
+
+    fn legacy_alias(self) -> Option<&'static str> {
+        match self {
+            Self::NotRequested => None,
+            Self::Pending => Some("CACHE_PENDING"),
+            Self::Uploading => Some("CACHE_UPLOADING"),
+            Self::Completed => Some("CACHE_READY"),
+            Self::Failed => Some("CACHE_FAILED"),
+            Self::Cancelled => Some("CACHE_CANCELLED"),
+        }
+    }
+}
+
+fn apply_cloud_backup_status(job: &mut Job, status: CloudBackupStatus, error: Option<String>) {
+    job.cloud_backup_status = status;
+    if let Some(alias) = status.legacy_alias() {
+        job.cache_status = Some(alias.into());
+    }
+    job.cache_error = error;
+    job.updated_at = unix_now();
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
     pub id: Uuid,
@@ -469,6 +642,8 @@ pub struct Job {
     pub cache_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_error: Option<String>,
+    #[serde(default)]
+    pub cloud_backup_status: CloudBackupStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -479,6 +654,16 @@ pub struct Job {
     pub result: Option<serde_json::Value>,
     pub created_at: u64,
     pub updated_at: u64,
+}
+
+impl Job {
+    fn effective_cloud_backup_status(&self) -> CloudBackupStatus {
+        if self.cloud_backup_status == CloudBackupStatus::NotRequested {
+            CloudBackupStatus::from_legacy(self.cache_status.as_deref())
+        } else {
+            self.cloud_backup_status
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -562,6 +747,15 @@ pub struct Generation {
     pub prompt: String,
     pub negative_prompt: Option<String>,
     pub model_id: String,
+    /// Contrat d'exécution choisi par le registre Rust au moment de la mise en
+    /// file. Les générations procédurales historiques conservent `None` pour le
+    /// pack et le workflow, sans contourner le statut catalogue strict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_pack_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
     pub input_asset_id: Option<Uuid>,
     #[serde(default)]
     pub mask_asset_id: Option<Uuid>,
@@ -573,6 +767,10 @@ pub struct Generation {
     pub status: GenerationStatus,
     pub progress: u8,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default)]
+    pub error_retryable: bool,
     pub created_at: u64,
     pub updated_at: u64,
     #[serde(default)]
@@ -583,6 +781,10 @@ pub struct Generation {
     pub resolution: Option<String>,
     #[serde(default)]
     pub requested_quality: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_preset: Option<String>,
+    #[serde(default)]
+    pub advanced_parameters: serde_json::Value,
     #[serde(default)]
     pub requested_aspect_ratio: Option<String>,
     #[serde(default)]
@@ -632,6 +834,10 @@ pub struct GenerateImageRequest {
     pub model_id: Option<String>,
     #[serde(default)]
     pub quality: Option<String>,
+    #[serde(default)]
+    pub preset: Option<String>,
+    #[serde(default)]
+    pub advanced_parameters: serde_json::Value,
     pub input_asset_id: Option<Uuid>,
     pub mask_asset_id: Option<Uuid>,
     pub control_asset_id: Option<Uuid>,
@@ -651,6 +857,10 @@ pub struct GenerateVideoRequest {
     pub duration_seconds: Option<u32>,
     #[serde(alias = "resolution")]
     pub quality: Option<String>,
+    #[serde(default)]
+    pub preset: Option<String>,
+    #[serde(default)]
+    pub advanced_parameters: serde_json::Value,
     pub aspect_ratio: Option<String>,
     pub fps: Option<u32>,
     #[serde(default)]
@@ -772,15 +982,57 @@ async fn load_chats(settings: &AppSettings) -> HashMap<Uuid, ChatSession> {
         .collect()
 }
 
+#[derive(Debug, Clone)]
+struct ActiveCloudBackup {
+    model_id: String,
+    token: TransferCancellationToken,
+}
+
+#[derive(Debug, Default)]
+struct BackupCancellationRegistry {
+    active: Mutex<HashMap<Uuid, ActiveCloudBackup>>,
+}
+
+impl BackupCancellationRegistry {
+    async fn register(&self, job_id: Uuid, model_id: String, token: TransferCancellationToken) {
+        self.active
+            .lock()
+            .await
+            .insert(job_id, ActiveCloudBackup { model_id, token });
+    }
+
+    async fn cancel_model(&self, model_id: &str) -> Vec<Uuid> {
+        let active = self.active.lock().await;
+        active
+            .iter()
+            .filter(|(_, backup)| backup.model_id == model_id)
+            .map(|(job_id, backup)| {
+                backup.token.cancel();
+                *job_id
+            })
+            .collect::<Vec<_>>()
+    }
+
+    async fn finish(&self, job_id: Uuid) {
+        self.active.lock().await.remove(&job_id);
+    }
+}
+
 /// État partagé injecté dans tous les handlers Axum.
 pub struct AppState {
     settings: SettingsStore,
     /// Client Hugging Face et cache disque partagés entre toutes les requêtes.
     catalog: HuggingFaceCatalogService,
     compatibility_cache: RwLock<HashMap<String, (u64, WorkerCompatibility)>>,
+    model_packs: RwLock<ModelPackRegistry>,
+    model_lab: ModelLabStore,
+    versioned_model_packs: VersionedPackRegistry,
     jobs: RwLock<HashMap<Uuid, Job>>,
     /// Réservation atomique des restaurations par repository@revision.
     restore_claims: Mutex<HashMap<String, Uuid>>,
+    /// Sauvegardes cloud annulables indépendamment du job local qui les a
+    /// déclenchées.
+    backup_cancellations: BackupCancellationRegistry,
     runtime: RwLock<HashMap<String, RuntimeEntry>>,
     generations: RwLock<HashMap<Uuid, Generation>>,
     projects: RwLock<HashMap<Uuid, Project>>,
@@ -793,7 +1045,7 @@ pub struct AppState {
     /// readiness GPU_PRODUCTION.
     host_agent: Option<HostAgentClient>,
     worker: Option<WorkerClient>,
-    object_storage: Arc<S3Storage>,
+    object_storage: Arc<dyn ObjectStorage>,
     mode: RwLock<ApplicationMode>,
     profile: ApplicationProfile,
 }
@@ -829,6 +1081,50 @@ impl AppState {
         let settings = SettingsStore::initialize().await?;
         let current_settings = settings.get().await;
         let catalog = HuggingFaceCatalogService::initialize(&current_settings.cache_dir).await;
+        let project_path = |name: &str, environment: &str| {
+            std::env::var_os(environment)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    let current = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                    let direct = current.join(name);
+                    if direct.is_dir() {
+                        direct
+                    } else {
+                        current
+                            .parent()
+                            .map(|parent| parent.join(name))
+                            .unwrap_or(direct)
+                    }
+                })
+        };
+        let model_packs_path = project_path("model-packs", "VIDIOAI_MODEL_PACKS_DIR");
+        let workflows_path = project_path("workflows", "VIDIOAI_WORKFLOWS_DIR");
+        let bundled_model_packs =
+            ModelPackRegistry::load_directory(&model_packs_path).map_err(ApiError::internal)?;
+        bundled_model_packs
+            .validate_workflows(&workflows_path)
+            .map_err(ApiError::internal)?;
+        let registry_root = std::env::var_os("VIDIOAI_MODEL_PACK_REGISTRY_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| settings.state_dir().join("model-pack-registry"));
+        let versioned_model_packs = VersionedPackRegistry::open(
+            registry_root,
+            bundled_model_packs.packs().cloned().collect(),
+            Some(&workflows_path),
+            unix_now(),
+        )
+        .await
+        .map_err(ApiError::internal)?;
+        let model_packs = ModelPackRegistry::new(
+            versioned_model_packs
+                .active_packs()
+                .await
+                .map_err(ApiError::internal)?,
+        )
+        .map_err(ApiError::internal)?;
+        let model_lab = ModelLabStore::open(registry_path(&settings.state_dir()))
+            .await
+            .map_err(ApiError::internal)?;
         let generations = load_generations(&current_settings).await;
         let projects = load_projects(&current_settings).await;
         let chats = load_chats(&current_settings).await;
@@ -844,15 +1140,24 @@ impl AppState {
             .await
             .map_err(ApiError::internal)?
             .into_iter()
-            .map(|job| (job.id, job))
+            .map(|mut job| {
+                // Migration transparente des jobs persistés avant l'ajout du
+                // statut cloud canonique.
+                job.cloud_backup_status = job.effective_cloud_backup_status();
+                (job.id, job)
+            })
             .collect();
         let (events, _) = broadcast::channel(256);
         let state = Arc::new(Self {
             settings,
             catalog,
             compatibility_cache: RwLock::new(HashMap::new()),
+            model_packs: RwLock::new(model_packs),
+            model_lab,
+            versioned_model_packs,
             jobs: RwLock::new(jobs),
             restore_claims: Mutex::new(HashMap::new()),
+            backup_cancellations: BackupCancellationRegistry::default(),
             runtime: RwLock::new(HashMap::new()),
             generations: RwLock::new(generations),
             projects: RwLock::new(projects),
@@ -881,6 +1186,8 @@ impl AppState {
                     generation.status = GenerationStatus::Failed;
                     generation.error =
                         Some("Génération interrompue par un redémarrage du backend.".into());
+                    generation.error_code = Some("GENERATION_INTERRUPTED".into());
+                    generation.error_retryable = true;
                     generation.updated_at = unix_now();
                     interrupted.push(generation.clone());
                 }
@@ -1081,17 +1388,25 @@ impl AppState {
         let updated = {
             let mut jobs = self.jobs.write().await;
             let Some(job) = jobs.get_mut(&id) else { return };
-            job.status = JobStatus::Running;
-            job.started_at.get_or_insert_with(unix_now);
-            job.stage = "saving_cache".into();
-            job.progress = overall;
-            job.message = format!(
-                "Sauvegarde dans le cache S3 · {file} · {:.2}% · {} fichier(s) déjà présent(s)",
-                percent, transfer.files_skipped
-            );
+            // Une notification de progression déjà en vol ne doit jamais
+            // ressusciter une sauvegarde annulée.
+            if job.effective_cloud_backup_status() == CloudBackupStatus::Cancelled {
+                return;
+            }
+            if job.kind != JobKind::InstallModel {
+                job.status = JobStatus::Running;
+                job.started_at.get_or_insert_with(unix_now);
+                job.stage = "saving_cache".into();
+                job.progress = overall;
+                job.message = format!(
+                    "Sauvegarde dans le cache S3 · {file} · {:.2}% · {} fichier(s) déjà présent(s)",
+                    percent, transfer.files_skipped
+                );
+            }
             job.transfer = Some(transfer);
             job.cache_status = Some("CACHE_UPLOADING".into());
             job.cache_error = None;
+            job.cloud_backup_status = CloudBackupStatus::Uploading;
             job.updated_at = unix_now();
             job.clone()
         };
@@ -1099,21 +1414,26 @@ impl AppState {
             eprintln!("Persistance du job {} impossible : {error}", updated.id);
         }
         self.emit("model.cache.progress", &updated);
+        self.emit("model.cloud-backup.progress", &updated);
         self.emit("model.install.progress", &updated);
         self.emit("queue.updated", &self.queue().await);
     }
 
-    async fn update_cache_status(&self, id: Uuid, status: &str, error: Option<String>) {
+    async fn update_cloud_backup_status(
+        &self,
+        id: Uuid,
+        status: CloudBackupStatus,
+        error: Option<String>,
+    ) {
         let updated = {
             let mut jobs = self.jobs.write().await;
             let Some(job) = jobs.get_mut(&id) else { return };
-            job.cache_status = Some(status.into());
-            job.cache_error = error;
-            job.updated_at = unix_now();
+            apply_cloud_backup_status(job, status, error);
             job.clone()
         };
         let _ = self.job_store.upsert(&updated).await;
         self.emit("model.cache.progress", &updated);
+        self.emit("model.cloud-backup.updated", &updated);
     }
 
     async fn update_dependency_progress(
@@ -1205,6 +1525,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(get_api_health))
         .route("/system", get(get_system))
         .route("/resources", get(get_resources))
+        .route("/runtime/unload", post(unload_runtime))
         .route("/admin/drain", post(start_drain))
         .route("/admin/resume", post(resume_jobs))
         .route("/admin/stop", post(stop_jobs))
@@ -1218,6 +1539,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/chats/{id}", get(get_chat).delete(delete_chat))
         .route("/chats/{id}/messages", post(send_chat_message))
         .route("/models", get(get_models))
+        .route("/models/lab", get(list_model_lab))
+        .route("/models/lab/analyze", post(analyze_model_lab))
+        .route("/models/lab/install", post(install_model_lab))
+        .route("/models/lab/{id}/promote", post(promote_model_lab))
+        .route("/model-packs/registry", get(get_model_pack_registry))
+        .route("/model-packs/{id}/update", post(update_model_pack))
+        .route("/model-packs/{id}/rollback", post(rollback_model_pack))
+        .route("/model-packs/{id}/publish", post(publish_model_pack))
         .route("/models/catalog/refresh", post(refresh_models))
         .route("/models/installed", get(list_installed_models))
         .route("/models/cloud", get(list_cloud_models))
@@ -1230,6 +1559,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/models/install", post(install_model_from_body))
         .route("/models/cache", post(cache_model_from_body))
+        .route(
+            "/models/cloud-backup/cancel",
+            post(cancel_cloud_backup_from_body),
+        )
         .route("/models/load", post(load_model_from_body))
         .route("/models/unload", post(unload_model_from_body))
         // Compatibilité conservée pour les anciens clients et les IDs locaux
@@ -1238,6 +1571,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/models/{id}/install", post(install_model))
         .route("/models/{id}/load", post(load_model))
         .route("/models/{id}/unload", post(unload_model))
+        .route(
+            "/models/{id}/cloud-backup/cancel",
+            post(cancel_cloud_backup_legacy),
+        )
         .route("/router/classify", post(classify_request))
         .route("/models/route", post(route_model))
         .route("/optimizer", post(optimize_request))
@@ -1664,10 +2001,12 @@ async fn get_ready(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Read
 /// Axum et son ordonnanceur fonctionnent. Les dépendances appartiennent à
 /// `/api/ready`, afin de ne pas provoquer de redémarrages en boucle.
 async fn get_api_health() -> Json<serde_json::Value> {
+    let version =
+        std::env::var("VIDIOAI_VERSION").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_owned());
     Json(json!({
         "status": "ok",
         "service": "vidioai-backend",
-        "version": env!("CARGO_PKG_VERSION")
+        "version": version
     }))
 }
 
@@ -2366,6 +2705,133 @@ fn worker_reports_ready(status: &crate::worker::WorkerModelStatus) -> bool {
         && status.runtime_compatible
 }
 
+fn worker_reports_ready_for_known_pack(
+    status: &crate::worker::WorkerModelStatus,
+    registry: &ModelPackRegistry,
+    descriptor: &ModelDescriptor<'_>,
+) -> bool {
+    worker_reports_ready(status)
+        && status
+            .model_pack_id
+            .as_deref()
+            .and_then(|pack_id| registry.get_matching(pack_id, descriptor))
+            .is_some()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GenerationRuntimeContract {
+    model_pack_id: Option<String>,
+    engine: String,
+    workflow: Option<String>,
+}
+
+fn resolve_generation_runtime_contract(
+    registry: &ModelPackRegistry,
+    entry: &CatalogEntry,
+    pipeline_class: Option<&str>,
+    capability: &ModelCapability,
+) -> Result<GenerationRuntimeContract, ApiError> {
+    if entry.local {
+        return Ok(GenerationRuntimeContract {
+            model_pack_id: None,
+            engine: entry
+                .runtime_name
+                .clone()
+                .unwrap_or_else(|| "procedural".into()),
+            workflow: None,
+        });
+    }
+
+    let architectures = entry
+        .architecture
+        .as_deref()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let capability_name = capability.api_name();
+    let descriptor = ModelDescriptor {
+        architectures: &architectures,
+        pipeline_class,
+        capabilities: &[capability_name],
+    };
+    let pack = registry.resolve(&descriptor).ok_or_else(|| {
+        ApiError::conflict(format!(
+            "MODEL_PACK_MISSING: aucun pack Rust pour {} et {capability_name}",
+            entry.id
+        ))
+    })?;
+    if !matches!(
+        pack.status,
+        CatalogModelStatus::Ready | CatalogModelStatus::Experimental
+    ) {
+        return Err(ApiError::conflict(format!(
+            "MODEL_INCOMPATIBLE: le pack {} n'est pas exécutable",
+            pack.id
+        )));
+    }
+    let workflow = pack
+        .workflow_by_capability
+        .get(capability_name)
+        .filter(|workflow| !workflow.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::conflict(format!(
+                "WORKFLOW_INVALID: le pack {} ne déclare pas {capability_name}",
+                pack.id
+            ))
+        })?;
+    Ok(GenerationRuntimeContract {
+        model_pack_id: Some(pack.id.clone()),
+        engine: pack.engine_name().into(),
+        workflow: Some(workflow),
+    })
+}
+
+fn normalize_generation_preset(
+    preset: Option<String>,
+    legacy_quality: Option<&str>,
+) -> Result<Option<String>, ApiError> {
+    let value = preset.or_else(|| {
+        legacy_quality.and_then(|quality| match quality.to_ascii_uppercase().as_str() {
+            "FAST" => Some("FAST".into()),
+            "BALANCED" => Some("BALANCED".into()),
+            "QUALITY" | "NATIVE" => Some("QUALITY".into()),
+            _ => None,
+        })
+    });
+    let normalized = value.map(|value| value.to_ascii_uppercase());
+    if normalized
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "FAST" | "BALANCED" | "QUALITY"))
+    {
+        return Err(ApiError::bad_request(
+            "Le preset doit être FAST, BALANCED ou QUALITY.",
+        ));
+    }
+    Ok(normalized)
+}
+
+fn validate_advanced_parameters(
+    declared: &[String],
+    requested: &serde_json::Value,
+) -> Result<(), ApiError> {
+    let object = requested
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("advanced_parameters doit être un objet JSON."))?;
+    let unsupported = object
+        .keys()
+        .filter(|key| !declared.iter().any(|value| value == *key))
+        .cloned()
+        .collect::<Vec<_>>();
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(format!(
+            "MODEL_PARAMETER_UNSUPPORTED: {}",
+            unsupported.join(", ")
+        )))
+    }
+}
+
 async fn model_view_with_machine(
     state: &AppState,
     entry: &CatalogEntry,
@@ -2531,7 +2997,72 @@ async fn model_view_with_machine(
                 },
             })
         });
-    let runtime_ready = entry.local || worker_status.as_ref().is_some_and(worker_reports_ready);
+    let descriptor_architectures = entry
+        .architecture
+        .as_deref()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let descriptor_capabilities = entry
+        .capabilities
+        .iter()
+        .map(ModelCapability::api_name)
+        .collect::<Vec<_>>();
+    let descriptor = ModelDescriptor {
+        architectures: &descriptor_architectures,
+        pipeline_class: pipeline_class.as_deref(),
+        capabilities: &descriptor_capabilities,
+    };
+    let worker_pack_id = worker_status
+        .as_ref()
+        .and_then(|status| status.model_pack_id.clone())
+        .or_else(|| {
+            runtime_check
+                .as_ref()
+                .and_then(|check| check.model_pack_id.clone())
+        });
+    let model_packs = state.model_packs.read().await;
+    let reported_pack = worker_pack_id
+        .as_deref()
+        .and_then(|pack_id| model_packs.get_matching(pack_id, &descriptor));
+    let local_pack = if entry.local {
+        None
+    } else {
+        reported_pack.or_else(|| model_packs.resolve(&descriptor))
+    };
+    // READY exige l'attestation du worker pour le pack exact, et ce pack doit
+    // appartenir au registre local. Un ID inconnu ou absent ne peut donc jamais
+    // transformer un modèle IA en READY.
+    let worker_pack_ready = worker_status.as_ref().is_some_and(|status| {
+        worker_reports_ready_for_known_pack(status, &model_packs, &descriptor)
+    });
+    let runtime_ready = entry.local || worker_pack_ready;
+    let model_pack_id = local_pack.map(|pack| pack.id.clone());
+    let lab_status = state
+        .model_lab
+        .effective_status(&entry.repository, &entry.revision)
+        .await;
+    let model_pack_status = lab_status.or_else(|| local_pack.map(|pack| pack.status));
+    let model_status = public_model_status(model_pack_status, installed, runtime_ready);
+    let workflow = local_pack.and_then(|pack| {
+        descriptor_capabilities
+            .iter()
+            .find_map(|capability| pack.workflow_by_capability.get(*capability).cloned())
+    });
+    let advanced_parameters = local_pack.and_then(|pack| {
+        pack.inputs
+            .get("advanced_parameters")
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_owned))
+                    .collect::<Vec<_>>()
+            })
+    });
+    let advanced_parameters = advanced_parameters.unwrap_or_default();
+    let presets = local_pack
+        .and_then(|pack| serde_json::to_value(&pack.presets).ok())
+        .unwrap_or_else(|| json!({}));
     let available_ram = machine.available_ram_bytes;
     let available_vram = machine.available_vram_bytes;
     // Un benchmark attaché à cette révision remplace l'estimation du Hub. Une
@@ -2623,10 +3154,15 @@ async fn model_view_with_machine(
     {
         "FAILED".to_owned()
     } else if installed {
-        worker_status
+        let worker_state = worker_status
             .as_ref()
             .map(|status| status.state.clone())
-            .unwrap_or_else(|| "INSTALLED".into())
+            .unwrap_or_else(|| "INSTALLED".into());
+        if worker_state == "READY" && !worker_pack_ready {
+            "INSTALLED".into()
+        } else {
+            worker_state
+        }
     } else if downloaded {
         "DOWNLOADED".to_owned()
     } else {
@@ -2697,8 +3233,13 @@ async fn model_view_with_machine(
             },
         },
     ];
+    let model_pack_known = !matches!(
+        model_pack_status,
+        None | Some(CatalogModelStatus::Unsupported)
+    );
     let compatible = hardware_compatible
         && runtime_allowed
+        && model_pack_known
         && entry.source_available
         && entry.quality_valid
         && (entry.local || machine.runtime_available);
@@ -2726,6 +3267,12 @@ async fn model_view_with_machine(
         runtime_precision,
         bundle,
         runtime_ready,
+        model_status,
+        model_pack_id,
+        model_pack_status,
+        workflow,
+        advanced_parameters,
+        presets,
         installation_state,
         compatible,
         recommended_variant: recommended.map(|variant| variant.id.clone()),
@@ -2740,18 +3287,24 @@ async fn model_view_with_machine(
             .license
             .clone()
             .unwrap_or_else(|| "Non renseignée".into()),
-        engine: entry
-            .runtime_name
-            .clone()
-            .unwrap_or_else(|| "Non supporté".into()),
+        engine: if entry.local {
+            entry
+                .runtime_name
+                .clone()
+                .unwrap_or_else(|| "procedural".into())
+        } else {
+            local_pack
+                .map(|pack| pack.engine_name().to_owned())
+                .unwrap_or_else(|| "Non supporté".into())
+        },
         engine_type: if entry.local { "procedural" } else { "ai" }.into(),
-        runtime_supported,
+        runtime_supported: runtime_supported && model_pack_known,
         runtime_compatibility: runtime_compatibility.clone(),
         runtime_reason,
         pipeline_class,
         runtime_capabilities: runtime_capabilities.clone(),
         input_profile: model_input_profile(&runtime_capabilities),
-        vidioai_supported: runtime_supported,
+        vidioai_supported: runtime_supported && model_pack_known,
         discovered,
         downloadable,
         source_available: entry.source_available,
@@ -2761,6 +3314,7 @@ async fn model_view_with_machine(
         available_vram_bytes: available_vram,
         installable: downloadable
             && runtime_allowed
+            && model_pack_known
             && !hardware_blocks_install
             && (entry.local || machine.runtime_available),
         compatibility_checks,
@@ -2944,6 +3498,395 @@ async fn refresh_models(State(state): State<Arc<AppState>>) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+#[derive(Debug, Deserialize)]
+struct LabAnalyzeInput {
+    model_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LabInstallInput {
+    model_id: String,
+    revision: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LabListResponse {
+    items: Vec<LabModel>,
+}
+
+fn is_commit_revision(revision: &str) -> bool {
+    matches!(revision.len(), 40 | 64) && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+async fn list_model_lab(State(state): State<Arc<AppState>>) -> Json<LabListResponse> {
+    // Rafraîchissement léger et best-effort: il ne modifie jamais la révision
+    // épinglée ni le statut validé, seulement le signal de comparaison.
+    let repositories = state
+        .model_lab
+        .list()
+        .await
+        .into_iter()
+        .filter(|item| {
+            matches!(
+                item.lifecycle,
+                LabLifecycle::Validated | LabLifecycle::Ready
+            )
+        })
+        .map(|item| item.repository)
+        .collect::<HashSet<_>>();
+    for repository in repositories {
+        if let Ok(result) = state.catalog.model(&repository, false).await
+            && let Some(latest) = result.models.first()
+        {
+            let _ = state
+                .model_lab
+                .note_available_revision(&repository, &latest.revision, unix_now())
+                .await;
+        }
+    }
+    Json(LabListResponse {
+        items: state.model_lab.list().await,
+    })
+}
+
+async fn analyze_model_lab(
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<LabAnalyzeInput>,
+) -> Result<Json<LabAnalysisResponse>, ApiError> {
+    let model_id = input.model_id.trim();
+    if model_id.is_empty() {
+        return Err(ApiError::bad_request("model_id est obligatoire."));
+    }
+    // Force la lecture dynamique de l'API HF. Le client catalogue ne charge ni
+    // module Python ni code de repository (`trust_remote_code=false`).
+    let model = state
+        .catalog
+        .model(model_id, true)
+        .await
+        .map_err(ApiError::unavailable)?
+        .models
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::not_found("Modèle Hugging Face inconnu."))?;
+    if model.local {
+        return Err(ApiError::conflict(
+            "MODEL_LAB_INVALID: un moteur procédural local ne peut pas entrer dans le Lab.",
+        ));
+    }
+    if !is_commit_revision(&model.revision) {
+        return Err(ApiError::conflict(
+            "MODEL_REVISION_NOT_PINNED: Hugging Face n'a pas fourni de SHA commit immuable.",
+        ));
+    }
+    let closest = {
+        let model_packs = state.model_packs.read().await;
+        closest_pack(&model, model_packs.packs()).cloned()
+    };
+    let (pack_version, workflow_version) = if let Some(pack) = closest.as_ref() {
+        state
+            .versioned_model_packs
+            .active_version(&pack.id)
+            .await
+            .map(|record| (record.version, record.workflow_version))
+            .unwrap_or_else(|| (pack.schema_version.to_string(), "1".into()))
+    } else {
+        ("0.1.0-lab".into(), "1".into())
+    };
+    let analysis = state
+        .model_lab
+        .analyzed(
+            &model,
+            closest.as_ref(),
+            &pack_version,
+            &workflow_version,
+            unix_now(),
+        )
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(analysis.into()))
+}
+
+async fn install_model_lab(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(input): Json<LabInstallInput>,
+) -> Result<(StatusCode, Json<Job>), ApiError> {
+    authorize_admin(&state, &headers)?;
+    let model_id = input.model_id.trim();
+    let revision = input.revision.trim();
+    if model_id.is_empty() || revision.is_empty() {
+        return Err(ApiError::bad_request(
+            "model_id et revision commit sont obligatoires.",
+        ));
+    }
+    if !is_commit_revision(revision) {
+        return Err(ApiError::bad_request(
+            "MODEL_REVISION_NOT_PINNED: revision doit être un SHA commit Hugging Face.",
+        ));
+    }
+    let lab = state
+        .model_lab
+        .find_revision(model_id, revision)
+        .await
+        .or_else(|| None)
+        .ok_or_else(|| {
+            ApiError::conflict(
+                "MODEL_LAB_ANALYSIS_REQUIRED: analysez cette révision avant installation.",
+            )
+        })?;
+    if lab.lifecycle != LabLifecycle::Analyzed {
+        return Err(ApiError::conflict(
+            "MODEL_LAB_TRANSITION_INVALID: statut ANALYZED requis.",
+        ));
+    }
+    let resolved = state
+        .catalog
+        .model(model_id, true)
+        .await
+        .map_err(ApiError::unavailable)?
+        .models
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::not_found("Modèle Hugging Face inconnu."))?;
+    if resolved.revision != revision {
+        return Err(ApiError::conflict(format!(
+            "MODEL_REVISION_MOVED: la révision analysée {revision} diffère du commit courant {}",
+            resolved.revision
+        )));
+    }
+    let lab_storage_id = format!(
+        "lab-{}-{}",
+        storage_id(model_id),
+        &revision[..revision.len().min(12)]
+    );
+    let mut candidate =
+        serde_json::to_value(&lab.model_pack_candidate).map_err(ApiError::internal)?;
+    candidate["lab_storage_id"] = json!(lab_storage_id);
+    let response = start_model_install_with_contract(
+        state.clone(),
+        model_id.into(),
+        Some(revision.into()),
+        None,
+        None,
+        Some(candidate),
+    )
+    .await?;
+    state
+        .model_lab
+        .attach_install_job(lab.id, response.1.0.id, lab_storage_id, unix_now())
+        .await
+        .map_err(ApiError::conflict)?;
+    let monitor_state = state.clone();
+    let lab_id = lab.id;
+    let job_id = response.1.0.id;
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_millis(500)).await;
+            let status = monitor_state
+                .jobs
+                .read()
+                .await
+                .get(&job_id)
+                .map(|job| job.status.clone());
+            match status {
+                Some(JobStatus::Completed) => {
+                    let _ = monitor_state
+                        .model_lab
+                        .mark_experimental(lab_id, unix_now())
+                        .await;
+                    break;
+                }
+                Some(JobStatus::Failed | JobStatus::Cancelled | JobStatus::Interrupted) | None => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+    Ok(response)
+}
+
+async fn promote_model_lab(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<LabModel>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let lab = state
+        .model_lab
+        .list()
+        .await
+        .into_iter()
+        .find(|item| item.id == id)
+        .ok_or_else(|| ApiError::not_found("Entrée Model Lab inconnue."))?;
+    let pack_id = lab
+        .model_pack_candidate
+        .based_on_pack
+        .as_deref()
+        .ok_or_else(|| {
+            ApiError::conflict(
+                "MODEL_LAB_PROMOTION_INVALID: aucun ModelPack actif compatible n'est associé.",
+            )
+        })?;
+    let active = state
+        .versioned_model_packs
+        .active_version(pack_id)
+        .await
+        .ok_or_else(|| {
+            ApiError::conflict("MODEL_PACK_NOT_ACTIVE: le ModelPack de validation n'est pas actif.")
+        })?;
+    if active.family != lab.model_pack_candidate.family {
+        return Err(ApiError::conflict(
+            "MODEL_PACK_IDENTITY_MISMATCH: famille candidate différente du pack actif.",
+        ));
+    }
+    let validated = state
+        .model_lab
+        .validate_for_promotion(id, unix_now())
+        .await
+        .map_err(ApiError::conflict)?;
+    let worker = state
+        .worker
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("WORKER_UNAVAILABLE: worker GPU absent"))?;
+    let installed_storage_id = validated
+        .installed_storage_id
+        .as_deref()
+        .ok_or_else(|| ApiError::conflict("MODEL_LAB_INSTALL_REQUIRED: snapshot Lab absent."))?;
+    let capability =
+        validated.fingerprint.capabilities.first().ok_or_else(|| {
+            ApiError::conflict("MODEL_INCOMPATIBLE: capability analysée absente.")
+        })?;
+    let status = worker
+        .promote_lab_model(
+            installed_storage_id,
+            &validated.repository,
+            &validated.revision,
+            pack_id,
+            capability,
+        )
+        .await
+        .map_err(ApiError::unavailable)?;
+    let attested = status.model_id == installed_storage_id
+        && status.revision.as_deref() == Some(validated.revision.as_str())
+        && status.model_pack_id.as_deref() == Some(pack_id)
+        && status.state == "INSTALLED"
+        && status.installed
+        && !status.ready
+        && !status.loaded
+        && status.weights_valid
+        && status.runtime_compatible
+        && !status.experimental
+        && status.load_allowed
+        && !status.generation_allowed;
+    if !attested {
+        return Err(ApiError::conflict(
+            "MODEL_LAB_PREFLIGHT_FAILED: validation conservée, mais le worker n'atteste pas le contrat INSTALLED/load_allowed exact.",
+        ));
+    }
+    let ready = state
+        .model_lab
+        .mark_ready(id, unix_now())
+        .await
+        .map_err(ApiError::conflict)?;
+    Ok(Json(ready))
+}
+
+#[derive(Debug, Deserialize)]
+struct PackVersionInput {
+    #[serde(default)]
+    version: Option<String>,
+}
+
+async fn get_model_pack_registry(State(state): State<Arc<AppState>>) -> Json<PackRegistryResponse> {
+    if let Err(error) = state
+        .versioned_model_packs
+        .synchronize_from_storage(state.object_storage.as_ref())
+        .await
+    {
+        eprintln!("Synchronisation registre ModelPack S3 impossible: {error}");
+    }
+    Json(state.versioned_model_packs.list().await)
+}
+
+async fn reload_active_model_packs(state: &AppState) -> Result<(), ApiError> {
+    let packs = state
+        .versioned_model_packs
+        .active_packs()
+        .await
+        .map_err(ApiError::internal)?;
+    let registry = ModelPackRegistry::new(packs).map_err(ApiError::internal)?;
+    *state.model_packs.write().await = registry;
+    state.compatibility_cache.write().await.clear();
+    Ok(())
+}
+
+fn current_vidioai_version() -> String {
+    std::env::var("VIDIOAI_VERSION").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").into())
+}
+
+async fn update_model_pack(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<PackVersionInput>,
+) -> Result<Json<PackVersionRecord>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    state
+        .versioned_model_packs
+        .synchronize_from_storage(state.object_storage.as_ref())
+        .await
+        .map_err(ApiError::unavailable)?;
+    let version = input
+        .version
+        .as_deref()
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .ok_or_else(|| ApiError::bad_request("version est obligatoire."))?;
+    state
+        .versioned_model_packs
+        .ensure_local_from_storage(&id, version, state.object_storage.as_ref())
+        .await
+        .map_err(ApiError::unavailable)?;
+    let result = state
+        .versioned_model_packs
+        .activate(&id, version, &current_vidioai_version())
+        .await
+        .map_err(ApiError::conflict)?;
+    reload_active_model_packs(&state).await?;
+    Ok(Json(result))
+}
+
+async fn rollback_model_pack(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<PackVersionInput>,
+) -> Result<Json<PackVersionRecord>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let result = state
+        .versioned_model_packs
+        .rollback(&id, input.version.as_deref(), &current_vidioai_version())
+        .await
+        .map_err(ApiError::conflict)?;
+    reload_active_model_packs(&state).await?;
+    Ok(Json(result))
+}
+
+async fn publish_model_pack(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<PackVersionRecord>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let result = state
+        .versioned_model_packs
+        .publish(&id, None, state.object_storage.as_ref(), unix_now())
+        .await
+        .map_err(ApiError::unavailable)?;
+    Ok(Json(result))
+}
+
 async fn get_model(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -3022,8 +3965,35 @@ async fn start_model_install(
     loras: Option<Vec<serde_json::Value>>,
     recipe: Option<serde_json::Value>,
 ) -> Result<(StatusCode, Json<Job>), ApiError> {
+    start_model_install_with_contract(state, id, requested_revision, loras, recipe, None).await
+}
+
+async fn start_model_install_with_contract(
+    state: Arc<AppState>,
+    id: String,
+    requested_revision: Option<String>,
+    loras: Option<Vec<serde_json::Value>>,
+    recipe: Option<serde_json::Value>,
+    experimental_candidate: Option<serde_json::Value>,
+) -> Result<(StatusCode, Json<Job>), ApiError> {
     state.ensure_accepting_jobs().await?;
     let mut entry = resolve_model(&state, &id).await?;
+    if let Some(storage_id) = experimental_candidate
+        .as_ref()
+        .and_then(|candidate| candidate.get("lab_storage_id"))
+        .and_then(serde_json::Value::as_str)
+    {
+        if !storage_id.starts_with("lab-")
+            || !storage_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(ApiError::bad_request(
+                "MODEL_LAB_STORAGE_INVALID: identifiant de stockage invalide.",
+            ));
+        }
+        entry.storage_id = storage_id.into();
+    }
     let bundle_configuration_requested = loras.is_some() || recipe.is_some();
     if let Some(revision) = requested_revision {
         let matches_installed = if bundle_configuration_requested {
@@ -3064,12 +4034,14 @@ async fn start_model_install(
             "Ce modèle nécessite un accès Hugging Face autorisé via HF_TOKEN.",
         ));
     }
-    if view.runtime_compatibility == "UNSUPPORTED" || !entry.quality_valid {
+    if experimental_candidate.is_none()
+        && (view.runtime_compatibility == "UNSUPPORTED" || !entry.quality_valid)
+    {
         return Err(ApiError::conflict(
             "Le modèle ne possède pas les fichiers requis par un runtime VidioAI validé.",
         ));
     }
-    if !view.compatible {
+    if experimental_candidate.is_none() && !view.compatible {
         return Err(ApiError::conflict(
             "Ce modèle n'est pas installable ; consultez compatibility_checks pour la cause précise.",
         ));
@@ -3095,6 +4067,11 @@ async fn start_model_install(
             None
         },
         cache_error: None,
+        cloud_backup_status: if state.object_storage.enabled() && auto_cache_models_enabled() {
+            CloudBackupStatus::Pending
+        } else {
+            CloudBackupStatus::NotRequested
+        },
         started_at: None,
         completed_at: None,
         error: None,
@@ -3103,10 +4080,29 @@ async fn start_model_install(
         updated_at: unix_now(),
     };
     state.insert_job(job.clone()).await?;
+    let backup_token = if job.cloud_backup_status == CloudBackupStatus::Pending {
+        let token = TransferCancellationToken::new();
+        state
+            .backup_cancellations
+            .register(job.id, entry.id.clone(), token.clone())
+            .await;
+        Some(token)
+    } else {
+        None
+    };
     let worker_state = state.clone();
     let worker_job = job.clone();
     tokio::spawn(async move {
-        run_install(worker_state, worker_job, entry, loras, recipe).await;
+        run_install(
+            worker_state,
+            worker_job,
+            entry,
+            loras,
+            recipe,
+            backup_token,
+            experimental_candidate,
+        )
+        .await;
     });
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
@@ -3168,6 +4164,7 @@ async fn cache_model_from_body(
         dependency: None,
         cache_status: Some("CACHE_PENDING".into()),
         cache_error: None,
+        cloud_backup_status: CloudBackupStatus::Pending,
         started_at: None,
         completed_at: None,
         error: None,
@@ -3176,6 +4173,11 @@ async fn cache_model_from_body(
         updated_at: unix_now(),
     };
     state.insert_job(job.clone()).await?;
+    let backup_token = TransferCancellationToken::new();
+    state
+        .backup_cancellations
+        .register(job.id, entry.id.clone(), backup_token.clone())
+        .await;
     let task_state = state.clone();
     let task_job = job.clone();
     tokio::spawn(async move {
@@ -3185,26 +4187,60 @@ async fn cache_model_from_body(
             &entry.repository,
             &revision,
             &snapshot_root,
+            backup_token.clone(),
         )
         .await
         {
             Ok(()) => {
+                if backup_token.is_cancelled() {
+                    task_state
+                        .update_cloud_backup_status(task_job.id, CloudBackupStatus::Cancelled, None)
+                        .await;
+                    task_state
+                        .update_job(
+                            task_job.id,
+                            JobStatus::Cancelled,
+                            "cloud_backup_cancelled",
+                            100,
+                            "Sauvegarde cloud annulée; le snapshot local reste valide",
+                        )
+                        .await;
+                } else {
+                    task_state
+                        .update_cloud_backup_status(task_job.id, CloudBackupStatus::Completed, None)
+                        .await;
+                    task_state
+                        .update_job(
+                            task_job.id,
+                            JobStatus::Completed,
+                            "installed",
+                            100,
+                            "Cache S3 validé; aucun téléchargement Hugging Face n'a été relancé",
+                        )
+                        .await;
+                }
+            }
+            Err(error) if is_cloud_backup_cancelled(&error) => {
                 task_state
-                    .update_cache_status(task_job.id, "CACHE_READY", None)
+                    .update_cloud_backup_status(task_job.id, CloudBackupStatus::Cancelled, None)
                     .await;
                 task_state
                     .update_job(
                         task_job.id,
-                        JobStatus::Completed,
-                        "installed",
+                        JobStatus::Cancelled,
+                        "cloud_backup_cancelled",
                         100,
-                        "Cache S3 validé; aucun téléchargement Hugging Face n'a été relancé",
+                        "Sauvegarde cloud annulée; le snapshot local reste valide",
                     )
                     .await;
             }
             Err(error) => {
                 task_state
-                    .update_cache_status(task_job.id, "CACHE_FAILED", Some(error.clone()))
+                    .update_cloud_backup_status(
+                        task_job.id,
+                        CloudBackupStatus::Failed,
+                        Some(error.clone()),
+                    )
                     .await;
                 let progress = task_state
                     .jobs
@@ -3225,8 +4261,74 @@ async fn cache_model_from_body(
                     .await;
             }
         }
+        task_state.backup_cancellations.finish(task_job.id).await;
     });
     Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+#[derive(Debug, Serialize)]
+struct CloudBackupCancelResponse {
+    success: bool,
+    model_id: String,
+    jobs_cancelled: Vec<Uuid>,
+    cloud_backup_status: CloudBackupStatus,
+    message: String,
+}
+
+async fn cancel_cloud_backup_from_body(
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<ModelActionInput>,
+) -> Result<Json<CloudBackupCancelResponse>, ApiError> {
+    cancel_cloud_backup_by_model(&state, &input.model_id).await
+}
+
+async fn cancel_cloud_backup_legacy(
+    State(state): State<Arc<AppState>>,
+    Path(model_id): Path<String>,
+) -> Result<Json<CloudBackupCancelResponse>, ApiError> {
+    cancel_cloud_backup_by_model(&state, &model_id).await
+}
+
+async fn cancel_cloud_backup_by_model(
+    state: &AppState,
+    model_id: &str,
+) -> Result<Json<CloudBackupCancelResponse>, ApiError> {
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return Err(ApiError::bad_request("model_id est obligatoire."));
+    }
+    let jobs_cancelled = state.backup_cancellations.cancel_model(model_id).await;
+    if jobs_cancelled.is_empty() {
+        let already_cancelled = state.jobs.read().await.values().any(|job| {
+            (job.target_id == model_id || job.model_id.as_deref() == Some(model_id))
+                && job.effective_cloud_backup_status() == CloudBackupStatus::Cancelled
+        });
+        if already_cancelled {
+            return Ok(Json(CloudBackupCancelResponse {
+                success: true,
+                model_id: model_id.into(),
+                jobs_cancelled,
+                cloud_backup_status: CloudBackupStatus::Cancelled,
+                message: "La sauvegarde cloud est déjà annulée.".into(),
+            }));
+        }
+        return Err(ApiError::conflict(
+            "CLOUD_BACKUP_NOT_ACTIVE: aucune sauvegarde cloud annulable pour ce modèle.",
+        ));
+    }
+    for job_id in &jobs_cancelled {
+        state
+            .update_cloud_backup_status(*job_id, CloudBackupStatus::Cancelled, None)
+            .await;
+    }
+    Ok(Json(CloudBackupCancelResponse {
+        success: true,
+        model_id: model_id.into(),
+        jobs_cancelled,
+        cloud_backup_status: CloudBackupStatus::Cancelled,
+        message: "Annulation de la sauvegarde cloud demandée; l'installation locale reste valide."
+            .into(),
+    }))
 }
 
 #[derive(Debug, Serialize)]
@@ -3259,6 +4361,15 @@ struct InstalledModelView {
     precision: String,
     precision_plan: Option<serde_json::Value>,
     pipeline_class: Option<String>,
+    /// Valeurs exposées uniquement si le worker les a écrites dans son statut
+    /// ou dans `vidioai-model.json`.
+    model_pack: Option<serde_json::Value>,
+    model_pack_id: Option<String>,
+    model_pack_status: Option<CatalogModelStatus>,
+    engine: Option<String>,
+    workflow: Option<String>,
+    cloud_backup_status: CloudBackupStatus,
+    cloud_backup_error: Option<String>,
     size_bytes: u64,
     device: Option<String>,
     memory_strategy: Option<String>,
@@ -3277,6 +4388,7 @@ struct InstalledModelsResponse {
     loaded: usize,
     gpu: Option<serde_json::Value>,
     memory: Option<serde_json::Value>,
+    telemetry: Option<serde_json::Value>,
 }
 
 async fn directory_size(root: &FilePath) -> u64 {
@@ -3370,6 +4482,16 @@ async fn list_installed_models(
                     .filter_map(|value| value.as_str().map(str::to_owned))
                     .collect()
             });
+        let pipeline_class = status
+            .as_ref()
+            .and_then(|status| status.pipeline_class.clone())
+            .or_else(|| {
+                manifest
+                    .get("pipeline_class")
+                    .or_else(|| manifest.get("class_name"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
         let precision_plan = status
             .as_ref()
             .and_then(|status| status.precision_plan.clone());
@@ -3383,6 +4505,76 @@ async fn list_installed_models(
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned);
         let disk_offload = memory_strategy.as_deref() == Some("DISK_OFFLOAD");
+        let reported_model_pack = status
+            .as_ref()
+            .and_then(|status| status.model_pack.clone())
+            .or_else(|| manifest.get("model_pack").cloned());
+        let reported_model_pack_id = status
+            .as_ref()
+            .and_then(|status| status.model_pack_id.clone())
+            .or_else(|| {
+                manifest
+                    .get("model_pack_id")
+                    .or_else(|| manifest.get("pack_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                reported_model_pack
+                    .as_ref()
+                    .and_then(|pack| pack.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                reported_model_pack
+                    .as_ref()
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        let architecture = manifest
+            .get("architecture")
+            .or_else(|| manifest.get("class_name"))
+            .and_then(serde_json::Value::as_str)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let descriptor_capabilities = capabilities.iter().map(String::as_str).collect::<Vec<_>>();
+        let descriptor = ModelDescriptor {
+            architectures: &architecture,
+            pipeline_class: pipeline_class.as_deref(),
+            capabilities: &descriptor_capabilities,
+        };
+        let model_packs = state.model_packs.read().await;
+        let canonical_pack = reported_model_pack_id
+            .as_deref()
+            .and_then(|pack_id| model_packs.get_matching(pack_id, &descriptor))
+            .or_else(|| model_packs.resolve(&descriptor));
+        let model_pack = canonical_pack.and_then(|pack| serde_json::to_value(pack).ok());
+        let model_pack_id = canonical_pack.map(|pack| pack.id.clone());
+        let model_pack_status = canonical_pack.map(|pack| pack.status);
+        let engine = canonical_pack.map(|pack| pack.engine_name().to_owned());
+        let workflow = canonical_pack.and_then(|pack| {
+            descriptor_capabilities
+                .iter()
+                .find_map(|capability| pack.workflow_by_capability.get(*capability).cloned())
+        });
+        let cloud_job = state
+            .jobs
+            .read()
+            .await
+            .values()
+            .filter(|job| {
+                job.target_id == repository
+                    || job.target_id == storage_id
+                    || job.model_id.as_deref() == Some(repository.as_str())
+            })
+            .max_by_key(|job| job.updated_at)
+            .cloned();
+        let cloud_backup_status = cloud_job
+            .as_ref()
+            .map(Job::effective_cloud_backup_status)
+            .unwrap_or(CloudBackupStatus::NotRequested);
+        let cloud_backup_error = cloud_job.and_then(|job| job.cache_error);
         let manifest_size = manifest
             .get("files")
             .and_then(serde_json::Value::as_array)
@@ -3401,9 +4593,10 @@ async fn list_installed_models(
             state: status
                 .as_ref()
                 .map(|status| status.state.clone())
+                .filter(|state| state != "READY" || canonical_pack.is_some())
                 .unwrap_or_else(|| "INSTALLED".into()),
             stage: status.as_ref().and_then(|status| status.stage.clone()),
-            loaded: status.as_ref().is_some_and(|status| status.ready),
+            loaded: canonical_pack.is_some() && status.as_ref().is_some_and(|status| status.ready),
             capabilities,
             precision: precision_plan
                 .as_ref()
@@ -3412,16 +4605,14 @@ async fn list_installed_models(
                 .unwrap_or("AUTO")
                 .to_owned(),
             precision_plan,
-            pipeline_class: status
-                .as_ref()
-                .and_then(|status| status.pipeline_class.clone())
-                .or_else(|| {
-                    manifest
-                        .get("pipeline_class")
-                        .or_else(|| manifest.get("class_name"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                }),
+            pipeline_class,
+            model_pack,
+            model_pack_id,
+            model_pack_status,
+            engine,
+            workflow,
+            cloud_backup_status,
+            cloud_backup_error,
             size_bytes: if manifest_size > 0 {
                 manifest_size
             } else {
@@ -3449,7 +4640,10 @@ async fn list_installed_models(
             .as_ref()
             .and_then(|resources| serde_json::to_value(&resources.gpu).ok())
             .filter(|value| !value.is_null()),
-        memory: resources.and_then(|resources| resources.memory),
+        memory: resources
+            .as_ref()
+            .and_then(|resources| resources.memory.clone()),
+        telemetry: resources.and_then(|resources| resources.hardware.or(resources.diagnostics)),
     }))
 }
 
@@ -3648,6 +4842,7 @@ async fn restore_cloud_models(
                 dependency: None,
                 cache_status: Some("CLOUD_AVAILABLE".into()),
                 cache_error: None,
+                cloud_backup_status: CloudBackupStatus::NotRequested,
                 started_at: None,
                 completed_at: None,
                 error: None,
@@ -3913,8 +5108,7 @@ async fn run_cloud_restore(
                 &manifest.repository,
                 &manifest.revision,
                 &manifest.capabilities,
-                None,
-                None,
+                WorkerInstallOptions::default(),
             )
             .await;
         let _installed = match installed_result {
@@ -4060,6 +5254,7 @@ async fn upload_model_cache(
     repository: &str,
     revision: &str,
     snapshot_root: &FilePath,
+    cancellation: TransferCancellationToken,
 ) -> Result<(), String> {
     // Valide l'identité avant de démarrer le moindre transfert.
     model_s3_prefix(repository, revision)?;
@@ -4072,6 +5267,7 @@ async fn upload_model_cache(
         revision,
         snapshot_root,
         Some(callback),
+        Some(cancellation),
     ));
     let result = loop {
         tokio::select! {
@@ -4091,14 +5287,23 @@ async fn upload_model_cache(
 
 /// Worker d'installation : téléchargement en flux, progression mesurée sur le
 /// staging, vérification par SHA-256, installation atomique et état READY.
+enum InstallCloudBackupOutcome {
+    NotRequested,
+    Completed,
+    Failed(String),
+    Cancelled,
+}
+
 async fn run_install(
     state: Arc<AppState>,
     job: Job,
     entry: CatalogEntry,
     loras: Option<Vec<serde_json::Value>>,
     recipe: Option<serde_json::Value>,
+    backup_token: Option<TransferCancellationToken>,
+    experimental_candidate: Option<serde_json::Value>,
 ) {
-    let result: Result<Option<String>, String> = async {
+    let result: Result<InstallCloudBackupOutcome, String> = async {
         let worker = state.worker.as_ref().ok_or_else(|| {
             "VIDIOAI_WORKER_URL est obligatoire pour installer des poids IA.".to_owned()
         })?;
@@ -4144,8 +5349,12 @@ async fn run_install(
             &entry.repository,
             &entry.revision,
             &install_capabilities,
-            loras.as_deref(),
-            recipe.as_ref(),
+            WorkerInstallOptions {
+                loras: loras.as_deref(),
+                recipe: recipe.as_ref(),
+                experimental: experimental_candidate.is_some(),
+                model_pack_candidate: experimental_candidate.as_ref(),
+            },
         ));
         let installed = loop {
             tokio::select! {
@@ -4231,15 +5440,15 @@ async fn run_install(
             .unwrap_or(&entry.revision)
             .to_owned();
         let snapshot_root = model_root.join(&resolved_revision);
-        let mut cache_error = None;
-        if state.object_storage.enabled() && auto_cache_models_enabled() {
+        let mut cloud_backup = InstallCloudBackupOutcome::NotRequested;
+        if let Some(cancellation) = backup_token.clone() {
             state
                 .update_job(
                     job.id,
-                    JobStatus::Running,
-                    "saving_cache",
-                    90,
-                    "Sauvegarde dans le cache S3",
+                    JobStatus::Completed,
+                    "installed",
+                    100,
+                    "Modèle installé localement; sauvegarde cloud en cours",
                 )
                 .await;
             match upload_model_cache(
@@ -4248,39 +5457,94 @@ async fn run_install(
                 &entry.repository,
                 &resolved_revision,
                 &snapshot_root,
+                cancellation.clone(),
             )
             .await
             {
-                Ok(()) => state
-                    .update_cache_status(job.id, "CACHE_READY", None)
-                    .await,
+                Ok(()) if cancellation.is_cancelled() => {
+                    state
+                        .update_cloud_backup_status(
+                            job.id,
+                            CloudBackupStatus::Cancelled,
+                            None,
+                        )
+                        .await;
+                    cloud_backup = InstallCloudBackupOutcome::Cancelled;
+                }
+                Ok(()) => {
+                    state
+                        .update_cloud_backup_status(
+                            job.id,
+                            CloudBackupStatus::Completed,
+                            None,
+                        )
+                        .await;
+                    cloud_backup = InstallCloudBackupOutcome::Completed;
+                }
+                Err(error) if is_cloud_backup_cancelled(&error) => {
+                    state
+                        .update_cloud_backup_status(
+                            job.id,
+                            CloudBackupStatus::Cancelled,
+                            None,
+                        )
+                        .await;
+                    cloud_backup = InstallCloudBackupOutcome::Cancelled;
+                }
                 Err(error) => {
                     state
-                        .update_cache_status(job.id, "CACHE_FAILED", Some(error.clone()))
+                        .update_cloud_backup_status(
+                            job.id,
+                            CloudBackupStatus::Failed,
+                            Some(error.clone()),
+                        )
                         .await;
-                    cache_error = Some(error);
+                    cloud_backup = InstallCloudBackupOutcome::Failed(error);
                 }
             }
         }
-        Ok(cache_error)
+        Ok(cloud_backup)
     }
     .await;
 
     match result {
-        Ok(cache_error) => {
-            let message = cache_error.map_or_else(
-                || "Modèle installé; chargement runtime disponible séparément".to_owned(),
-                |error| {
-                    format!(
-                        "Modèle installé localement; CACHE_FAILED retryable: {error}. La sauvegarde S3 peut être relancée séparément"
-                    )
-                },
-            );
+        Ok(cloud_backup) => {
+            let message = match cloud_backup {
+                InstallCloudBackupOutcome::NotRequested => {
+                    "Modèle installé; chargement runtime disponible séparément".to_owned()
+                }
+                InstallCloudBackupOutcome::Completed => {
+                    "Modèle installé localement et sauvegarde cloud terminée".to_owned()
+                }
+                InstallCloudBackupOutcome::Cancelled => {
+                    "Modèle installé localement; sauvegarde cloud annulée indépendamment".to_owned()
+                }
+                InstallCloudBackupOutcome::Failed(error) => format!(
+                    "Modèle installé localement; CLOUD_BACKUP_FAILED retryable: {error}. La sauvegarde S3 peut être relancée séparément"
+                ),
+            };
             state
                 .update_job(job.id, JobStatus::Completed, "installed", 100, &message)
                 .await
         }
         Err(error) => {
+            if let Some(cancellation) = &backup_token {
+                if cancellation.is_cancelled() {
+                    state
+                        .update_cloud_backup_status(job.id, CloudBackupStatus::Cancelled, None)
+                        .await;
+                } else {
+                    state
+                        .update_cloud_backup_status(
+                            job.id,
+                            CloudBackupStatus::Failed,
+                            Some(format!(
+                                "CLOUD_BACKUP_FAILED: installation locale incomplète: {error}"
+                            )),
+                        )
+                        .await;
+                }
+            }
             let last_progress = state
                 .jobs
                 .read()
@@ -4294,6 +5558,9 @@ async fn run_install(
                 .update_job(job.id, JobStatus::Failed, "failed", last_progress, &message)
                 .await
         }
+    }
+    if backup_token.is_some() {
+        state.backup_cancellations.finish(job.id).await;
     }
 }
 
@@ -4554,6 +5821,101 @@ async fn unload_model_by_id(state: &AppState, id: &str) -> Result<StatusCode, Ap
         &json!({ "model_id": id, "state": "unloaded" }),
     );
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn tracked_runtime_memory(
+    runtime: &HashMap<String, RuntimeEntry>,
+    cuda_available: Option<bool>,
+) -> serde_json::Value {
+    json!({
+        "source": "backend_runtime_registry",
+        "cuda_available": cuda_available,
+        "loaded_models": runtime.len(),
+        "tracked_ram_bytes": runtime.values().map(|entry| entry.ram_bytes).sum::<u64>(),
+        "tracked_vram_bytes": runtime.values().map(|entry| entry.vram_bytes).sum::<u64>(),
+    })
+}
+
+async fn perform_runtime_unload(
+    runtime: &RwLock<HashMap<String, RuntimeEntry>>,
+    worker: Option<&WorkerClient>,
+) -> Result<WorkerUnloadAllResponse, String> {
+    let local_before = runtime.read().await.clone();
+    let worker_response = if let Some(worker) = worker {
+        Some(worker.unload_all().await)
+    } else {
+        None
+    };
+    // Même si un worker configuré est momentanément indisponible, le registre
+    // backend ne doit pas conserver de faux états `loaded`. La route d'urgence
+    // reste donc sûre et idempotente sur Mac/CPU comme pendant une panne worker.
+    runtime.write().await.clear();
+
+    let mut response = match worker_response {
+        Some(response) => validate_worker_unload_response(response)?,
+        None => WorkerUnloadAllResponse {
+            success: true,
+            models_unloaded: Vec::new(),
+            before_memory: Some(tracked_runtime_memory(
+                &local_before,
+                worker.is_none().then_some(false),
+            )),
+            after_memory: Some(tracked_runtime_memory(
+                &HashMap::new(),
+                worker.is_none().then_some(false),
+            )),
+            message: "Runtime local purgé; aucun worker CUDA n'est configuré sur cette machine."
+                .into(),
+            comfyui_error: None,
+        },
+    };
+    response
+        .models_unloaded
+        .extend(local_before.keys().cloned());
+    response.models_unloaded.sort();
+    response.models_unloaded.dedup();
+    let cuda_available = worker.is_none().then_some(false);
+    response
+        .before_memory
+        .get_or_insert_with(|| tracked_runtime_memory(&local_before, cuda_available));
+    response
+        .after_memory
+        .get_or_insert_with(|| tracked_runtime_memory(&HashMap::new(), cuda_available));
+    Ok(response)
+}
+
+fn validate_worker_unload_response(
+    response: Result<WorkerUnloadAllResponse, String>,
+) -> Result<WorkerUnloadAllResponse, String> {
+    match response {
+        Ok(response) if response.success && response.comfyui_error.is_none() => Ok(response),
+        Ok(response) => Err(format!(
+            "WORKER_UNLOAD_FAILED: {}",
+            response
+                .comfyui_error
+                .as_deref()
+                .filter(|message| !message.is_empty())
+                .unwrap_or(&response.message)
+        )),
+        Err(error) => Err(format!("WORKER_UNLOAD_FAILED: {error}")),
+    }
+}
+
+async fn unload_runtime(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<WorkerUnloadAllResponse>, ApiError> {
+    let response = perform_runtime_unload(&state.runtime, state.worker.as_ref())
+        .await
+        .map_err(ApiError::unavailable)?;
+    state.emit(
+        "resources.updated",
+        &json!({
+            "state": "unloaded",
+            "models_unloaded": &response.models_unloaded,
+            "after_memory": &response.after_memory,
+        }),
+    );
+    Ok(Json(response))
 }
 
 async fn events_upgrade(
@@ -5175,6 +6537,17 @@ async fn generate_image(
             "Le modèle IA est installé mais son runtime n'est pas READY. Chargez-le avant de générer.",
         ));
     }
+    let runtime_contract = {
+        let model_packs = state.model_packs.read().await;
+        resolve_generation_runtime_contract(
+            &model_packs,
+            &entry,
+            view.pipeline_class.as_deref(),
+            &requested_capability,
+        )?
+    };
+    let requested_preset = normalize_generation_preset(request.preset, request.quality.as_deref())?;
+    validate_advanced_parameters(&view.advanced_parameters, &request.advanced_parameters)?;
 
     let job_id = Uuid::new_v4();
     let generation = Generation {
@@ -5186,6 +6559,9 @@ async fn generate_image(
         prompt: prompt.to_string(),
         negative_prompt: request.negative_prompt,
         model_id,
+        model_pack_id: runtime_contract.model_pack_id,
+        engine: Some(runtime_contract.engine),
+        workflow: runtime_contract.workflow,
         input_asset_id: request.input_asset_id,
         mask_asset_id: request.mask_asset_id,
         control_asset_id: request.control_asset_id,
@@ -5194,12 +6570,16 @@ async fn generate_image(
         status: GenerationStatus::Queued,
         progress: 0,
         error: None,
+        error_code: None,
+        error_retryable: false,
         created_at: unix_now(),
         updated_at: unix_now(),
         duration_seconds: None,
         requested_duration_seconds: None,
         resolution: None,
         requested_quality: request.quality,
+        requested_preset,
+        advanced_parameters: request.advanced_parameters,
         requested_aspect_ratio: None,
         requested_fps: None,
         requested_frames: None,
@@ -5237,6 +6617,7 @@ async fn generate_image(
         dependency: None,
         cache_status: None,
         cache_error: None,
+        cloud_backup_status: CloudBackupStatus::NotRequested,
         started_at: None,
         completed_at: None,
         error: None,
@@ -5338,6 +6719,93 @@ where
     }
 }
 
+fn generation_preflight_payload(
+    generation: &Generation,
+    output_relative_path: &FilePath,
+    input_path: Option<&str>,
+    input_images: Option<serde_json::Value>,
+) -> serde_json::Value {
+    json!({
+        "model_id": storage_id(&generation.model_id),
+        "model_pack_id": generation.model_pack_id,
+        "engine": generation.engine,
+        "workflow": generation.workflow,
+        "capability": generation.capability.as_ref().map(ModelCapability::api_name),
+        "quality": generation.requested_quality,
+        "preset": generation.requested_preset,
+        "advanced_parameters": generation.advanced_parameters,
+        "frames": generation.requested_frames,
+        "fps": generation.requested_fps,
+        "duration_seconds": generation.requested_duration_seconds,
+        "batch": 1,
+        "input_path": input_path,
+        "input_images": input_images,
+        "audio": generation.audio,
+        "output_relative_path": output_relative_path,
+    })
+}
+
+fn validate_preflight_contract(
+    preflight: &PreflightResult,
+    generation: &Generation,
+) -> Result<(), StructuredRuntimeError> {
+    preflight.validate_ready()?;
+    let expected_model_id = storage_id(&generation.model_id);
+    let expected_pack_id =
+        generation
+            .model_pack_id
+            .as_deref()
+            .ok_or_else(|| StructuredRuntimeError {
+                code: "MODEL_PACK_MISSING".into(),
+                message: "La génération IA ne possède pas de ModelPack Rust persisté.".into(),
+                retryable: false,
+            })?;
+    let expected_engine = generation
+        .engine
+        .as_deref()
+        .ok_or_else(|| StructuredRuntimeError {
+            code: "ENGINE_UNAVAILABLE".into(),
+            message: "La génération IA ne possède pas de moteur Rust persisté.".into(),
+            retryable: false,
+        })?;
+    let expected_workflow =
+        generation
+            .workflow
+            .as_deref()
+            .ok_or_else(|| StructuredRuntimeError {
+                code: "WORKFLOW_INVALID".into(),
+                message: "La génération IA ne possède pas de workflow Rust persisté.".into(),
+                retryable: false,
+            })?;
+
+    let matches = preflight.model_id == expected_model_id
+        && preflight.model_pack_id.as_deref() == Some(expected_pack_id)
+        && preflight.engine.as_deref() == Some(expected_engine)
+        && preflight.workflow.as_deref() == Some(expected_workflow);
+    if matches {
+        Ok(())
+    } else {
+        Err(StructuredRuntimeError {
+            code: "PREFLIGHT_IDENTITY_MISMATCH".into(),
+            message: format!(
+                "Contrat worker différent du choix Rust: model={} pack={:?} engine={:?} workflow={:?}",
+                preflight.model_id, preflight.model_pack_id, preflight.engine, preflight.workflow,
+            ),
+            retryable: false,
+        })
+    }
+}
+
+async fn require_worker_preflight(
+    worker: &WorkerClient,
+    payload: &serde_json::Value,
+    generation: &Generation,
+) -> Result<(), String> {
+    let preflight = worker.preflight(payload).await?;
+    validate_preflight_contract(&preflight, generation)
+        .map_err(|error| format!("{}: {}", error.code, error.message))
+}
+
 /// Pipeline commun T2I/I2I : charge le runtime, exécute le moteur, transforme le
 /// résultat en Asset persistant puis clôt la Generation et son Job.
 async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id: Uuid) {
@@ -5397,6 +6865,12 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
                     .capability
                     .clone()
                     .unwrap_or(ModelCapability::TextToImage);
+                require_worker_preflight(
+                    worker,
+                    &generation_preflight_payload(&generation, &relative, None, None),
+                    &generation,
+                )
+                .await?;
                 let worker_result = await_worker_generation(
                     &state,
                     job_id,
@@ -5412,6 +6886,8 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
                         None,
                         None,
                         Some(capability.api_name()),
+                        generation.requested_preset.as_deref(),
+                        Some(&generation.advanced_parameters),
                     ),
                 )
                 .await?;
@@ -5519,6 +6995,17 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
                     .capability
                     .clone()
                     .unwrap_or(ModelCapability::ImageToImage);
+                require_worker_preflight(
+                    worker,
+                    &generation_preflight_payload(
+                        &generation,
+                        &relative,
+                        Some(&input_path.to_string_lossy()),
+                        None,
+                    ),
+                    &generation,
+                )
+                .await?;
                 let worker_result = await_worker_generation(
                     &state,
                     job_id,
@@ -5540,6 +7027,8 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
                             .map(|path| path.to_string_lossy())
                             .as_deref(),
                         Some(capability.api_name()),
+                        generation.requested_preset.as_deref(),
+                        Some(&generation.advanced_parameters),
                     ),
                 )
                 .await?;
@@ -5658,6 +7147,8 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
             let _ = CanvasEngine.cancel().await;
             generation.status = GenerationStatus::Cancelled;
             generation.error = None;
+            generation.error_code = None;
+            generation.error_retryable = false;
             generation.updated_at = unix_now();
             update_generation(&state, generation.clone()).await;
             state
@@ -5677,9 +7168,12 @@ async fn run_generation(state: Arc<AppState>, mut generation: Generation, job_id
             generation.status = GenerationStatus::Failed;
             generation.progress = 100;
             generation.error = Some(error.clone());
+            let job_error = state.classify_generation_error(job_id, false, &error).await;
+            let (error_code, error_retryable) = structured_runtime_fields(&job_error);
+            generation.error_code = Some(error_code);
+            generation.error_retryable = error_retryable;
             generation.updated_at = unix_now();
             update_generation(&state, generation.clone()).await;
-            let job_error = state.classify_generation_error(job_id, false, &error).await;
             state
                 .update_job(job_id, JobStatus::Failed, "failed", 100, &job_error)
                 .await;
@@ -5711,7 +7205,15 @@ async fn generate_video(
         ));
     }
     let duration = request.duration_seconds.unwrap_or(6).clamp(2, 15);
-    let quality = request.quality.unwrap_or_else(|| "480p".into());
+    let requested_preset = normalize_generation_preset(request.preset, request.quality.as_deref())?
+        .unwrap_or_else(|| "BALANCED".into());
+    let quality = request
+        .quality
+        .unwrap_or_else(|| match requested_preset.as_str() {
+            "FAST" => "480p".into(),
+            "QUALITY" => "1080p".into(),
+            _ => "720p".into(),
+        });
     if !matches!(quality.as_str(), "480p" | "720p" | "1080p") {
         return Err(ApiError::bad_request(
             "La qualité doit être 480p, 720p ou 1080p.",
@@ -5767,6 +7269,16 @@ async fn generate_video(
             "MODEL_NOT_READY: le modèle est installé mais son runtime worker n'est pas READY.",
         ));
     }
+    let runtime_contract = {
+        let model_packs = state.model_packs.read().await;
+        resolve_generation_runtime_contract(
+            &model_packs,
+            &entry,
+            view.pipeline_class.as_deref(),
+            &requested_capability,
+        )?
+    };
+    validate_advanced_parameters(&view.advanced_parameters, &request.advanced_parameters)?;
     let mut input_images = request.input_images.clone();
     if mode != GenerationMode::TextToVideo {
         if mode == GenerationMode::ImageToVideo {
@@ -5827,6 +7339,9 @@ async fn generate_video(
         prompt: prompt.to_string(),
         negative_prompt: request.negative_prompt,
         model_id,
+        model_pack_id: runtime_contract.model_pack_id,
+        engine: Some(runtime_contract.engine),
+        workflow: runtime_contract.workflow,
         input_asset_id: request.input_asset_id,
         mask_asset_id: None,
         control_asset_id: None,
@@ -5835,12 +7350,16 @@ async fn generate_video(
         status: GenerationStatus::Queued,
         progress: 0,
         error: None,
+        error_code: None,
+        error_retryable: false,
         created_at: unix_now(),
         updated_at: unix_now(),
         duration_seconds: Some(duration),
         requested_duration_seconds: Some(f64::from(duration)),
         resolution: Some(quality.clone()),
         requested_quality: Some(quality),
+        requested_preset: Some(requested_preset),
+        advanced_parameters: request.advanced_parameters,
         requested_aspect_ratio: Some(aspect_ratio),
         requested_fps: Some(requested_fps),
         requested_frames: Some(duration.saturating_mul(requested_fps)),
@@ -5874,6 +7393,7 @@ async fn generate_video(
         dependency: None,
         cache_status: None,
         cache_error: None,
+        cloud_backup_status: CloudBackupStatus::NotRequested,
         started_at: None,
         completed_at: None,
         error: None,
@@ -6038,6 +7558,23 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
                 )
                 .await;
 
+            let input_images_value = if input_images_payload.is_empty() {
+                None
+            } else {
+                Some(serde_json::Value::Array(input_images_payload.clone()))
+            };
+            require_worker_preflight(
+                worker,
+                &generation_preflight_payload(
+                    &generation,
+                    &relative,
+                    video_input_path.as_deref(),
+                    input_images_value.clone(),
+                ),
+                &generation,
+            )
+            .await?;
+
             let worker_result = await_worker_generation(
                 &state,
                 job_id,
@@ -6049,11 +7586,7 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
                     generation.negative_prompt.as_deref(),
                     &relative,
                     video_input_path.as_deref(),
-                    if input_images_payload.is_empty() {
-                        None
-                    } else {
-                        Some(serde_json::Value::Array(input_images_payload))
-                    },
+                    input_images_value,
                     None,
                     Some(capability.api_name()),
                     &quality,
@@ -6061,6 +7594,8 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
                     duration,
                     requested_fps,
                     generation.audio,
+                    generation.requested_preset.as_deref(),
+                    Some(&generation.advanced_parameters),
                 ),
             )
             .await?;
@@ -6168,6 +7703,8 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
                     duration,
                     requested_fps,
                     generation.audio,
+                    generation.requested_preset.as_deref(),
+                    Some(&generation.advanced_parameters),
                 ),
             )
             .await?;
@@ -6364,6 +7901,8 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
         Err(error) if error == "__cancelled__" => {
             generation.status = GenerationStatus::Cancelled;
             generation.error = None;
+            generation.error_code = None;
+            generation.error_retryable = false;
             generation.updated_at = unix_now();
             update_generation(&state, generation.clone()).await;
             state
@@ -6379,9 +7918,12 @@ async fn run_video_generation(state: Arc<AppState>, mut generation: Generation, 
         Err(error) => {
             generation.status = GenerationStatus::Failed;
             generation.error = Some(error.clone());
+            let job_error = state.classify_generation_error(job_id, true, &error).await;
+            let (error_code, error_retryable) = structured_runtime_fields(&job_error);
+            generation.error_code = Some(error_code);
+            generation.error_retryable = error_retryable;
             generation.updated_at = unix_now();
             update_generation(&state, generation.clone()).await;
-            let job_error = state.classify_generation_error(job_id, true, &error).await;
             state
                 .update_job(
                     job_id,
@@ -6478,16 +8020,228 @@ async fn get_generation(
 #[cfg(test)]
 mod tests {
     use super::{
-        AppSettings, CanvasEngine, CloudModelView, CloudRestoreSelection, GenerateVideoRequest,
-        GenerationMode, ModelCapability, ModelIdQuery, image_endpoint,
+        AppSettings, BackupCancellationRegistry, CanvasEngine, CloudBackupStatus, CloudModelView,
+        CloudRestoreSelection, GenerateVideoRequest, Generation, GenerationMode, ModelCapability,
+        ModelIdQuery, RuntimeEntry, apply_cloud_backup_status, image_endpoint,
         is_valid_image_capability_for_mode, is_valid_video_capability_for_mode,
-        local_runtime_models, procedural_video_dimensions, promote_restored_snapshot,
-        restore_identity, seed_restore_staging, select_cloud_manifests, video_endpoint,
-        worker_runtime_flags,
+        local_runtime_models, perform_runtime_unload, procedural_video_dimensions,
+        promote_restored_snapshot, restore_identity, seed_restore_staging, select_cloud_manifests,
+        structured_error_body, validate_preflight_contract, validate_worker_unload_response,
+        video_endpoint, worker_reports_ready_for_known_pack, worker_runtime_flags,
     };
-    use crate::object_storage::{SnapshotFile, SnapshotManifest};
-    use crate::worker::{WorkerModelStatus, WorkerReady};
+    use crate::execution_plan::PreflightResult;
+    use crate::model_pack::{
+        CatalogModelStatus, ModelDescriptor, ModelPackRegistry, public_model_status,
+    };
+    use crate::object_storage::{
+        ObjectStorage, SnapshotFile, SnapshotManifest, TransferCancellationToken,
+        TransferProgressCallback, UploadOutcome, UploadProgressCallback,
+    };
+    use crate::worker::{WorkerModelStatus, WorkerReady, WorkerUnloadAllResponse};
+    use async_trait::async_trait;
+    use axum::http::StatusCode;
     use serde_json::json;
+    use std::{collections::HashMap, path::Path, sync::Arc};
+    use tokio::sync::RwLock;
+
+    #[derive(Debug)]
+    struct CancellableObjectStorage;
+
+    fn generation_contract_fixture() -> Generation {
+        serde_json::from_value(json!({
+            "id": uuid::Uuid::nil(),
+            "kind": "IMAGE",
+            "mode": "TEXT_TO_IMAGE",
+            "capability": "TEXT_TO_IMAGE",
+            "prompt": "fixture",
+            "negative_prompt": null,
+            "model_id": "fixture",
+            "model_pack_id": "flux-t2i-v1",
+            "engine": "comfyui",
+            "workflow": "flux_t2i.json",
+            "input_asset_id": null,
+            "output_asset_id": null,
+            "status": "queued",
+            "progress": 0,
+            "error": null,
+            "created_at": 1,
+            "updated_at": 1,
+            "advanced_parameters": {},
+            "audio": false,
+            "actual_audio": false
+        }))
+        .unwrap()
+    }
+
+    fn ready_preflight_fixture() -> PreflightResult {
+        serde_json::from_value(json!({
+            "status": "READY_TO_RUN",
+            "ready": true,
+            "model_id": "fixture",
+            "model_pack_id": "flux-t2i-v1",
+            "engine": "comfyui",
+            "workflow": "flux_t2i.json",
+            "execution_plan": {
+                "strategy": "FULL_GPU",
+                "feasible": true,
+                "dtype": "BF16",
+                "vae_tiling": false,
+                "vae_slicing": false,
+                "model_cpu_offload": false,
+                "sequential_cpu_offload": false,
+                "component_placement": {"transformer": "cuda"},
+                "resolution": {"width": 512, "height": 512},
+                "frames": 1,
+                "batch": 1,
+                "weights_memory_bytes": 1,
+                "runtime_memory_bytes": 1,
+                "latent_memory_bytes": 1,
+                "reserved_memory_bytes": 0,
+                "safety_reserve_bytes": 1,
+                "estimated_peak_vram_bytes": 3,
+                "vram_total_bytes": 16,
+                "vram_free_bytes": 16,
+                "ram_required_bytes": 1,
+                "scratch_required_bytes": 1,
+                "fallbacks": [],
+                "reason": "fixture"
+            },
+            "checks": [],
+            "errors": [],
+            "diagnostics": {}
+        }))
+        .unwrap()
+    }
+
+    #[async_trait]
+    impl ObjectStorage for CancellableObjectStorage {
+        fn enabled(&self) -> bool {
+            true
+        }
+
+        fn snapshot_uri(&self, repository: &str, revision: &str) -> Result<String, String> {
+            Ok(format!("s3://fixture/{repository}/{revision}"))
+        }
+
+        async fn health(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn upload_file(&self, _local: &Path, _key: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn restore_snapshot(
+            &self,
+            _repository: &str,
+            _revision: &str,
+            _local: &Path,
+            _progress: Option<TransferProgressCallback>,
+        ) -> Result<bool, String> {
+            Ok(false)
+        }
+
+        async fn list_snapshots(&self) -> Result<Vec<SnapshotManifest>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn upload_snapshot(
+            &self,
+            _repository: &str,
+            _revision: &str,
+            _local: &Path,
+            _progress: Option<UploadProgressCallback>,
+            cancellation: Option<TransferCancellationToken>,
+        ) -> Result<UploadOutcome, String> {
+            let cancellation = cancellation.expect("cancellation token");
+            cancellation.cancelled().await;
+            Err("CLOUD_BACKUP_CANCELLED: transfert de test interrompu".into())
+        }
+    }
+
+    #[test]
+    fn api_errors_keep_legacy_error_and_add_structured_fields() {
+        let body = structured_error_body(
+            StatusCode::CONFLICT,
+            "MODEL_NOT_READY: modèle non chargé".into(),
+        );
+        assert_eq!(body.error, "MODEL_NOT_READY: modèle non chargé");
+        assert_eq!(body.message, body.error);
+        assert_eq!(body.code, "MODEL_NOT_READY");
+        assert!(!body.retryable);
+
+        let unknown = structured_error_body(
+            StatusCode::CONFLICT,
+            "FAKE_PREFIX: ne doit pas devenir un code public".into(),
+        );
+        assert_eq!(unknown.code, "CONFLICT");
+
+        let unavailable = structured_error_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Worker momentanément absent".into(),
+        );
+        assert_eq!(unavailable.code, "SERVICE_UNAVAILABLE");
+        assert!(unavailable.retryable);
+    }
+
+    #[test]
+    fn legacy_generation_json_defaults_new_contract_and_error_fields() {
+        let generation: Generation = serde_json::from_value(json!({
+            "id": uuid::Uuid::nil(),
+            "kind": "IMAGE",
+            "mode": "TEXT_TO_IMAGE",
+            "capability": "TEXT_TO_IMAGE",
+            "prompt": "fixture",
+            "negative_prompt": null,
+            "model_id": "fixture",
+            "input_asset_id": null,
+            "input_images": [],
+            "output_asset_id": null,
+            "status": "failed",
+            "progress": 100,
+            "error": "ancienne erreur",
+            "created_at": 1,
+            "updated_at": 2,
+            "advanced_parameters": {},
+            "audio": false,
+            "actual_audio": false
+        }))
+        .unwrap();
+        assert_eq!(generation.model_pack_id, None);
+        assert_eq!(generation.engine, None);
+        assert_eq!(generation.workflow, None);
+        assert_eq!(generation.error_code, None);
+        assert!(!generation.error_retryable);
+    }
+
+    #[test]
+    fn preflight_must_match_the_persisted_rust_execution_contract() {
+        let generation = generation_contract_fixture();
+        let valid = ready_preflight_fixture();
+        validate_preflight_contract(&valid, &generation).unwrap();
+
+        let mut wrong_pack = valid.clone();
+        wrong_pack.model_pack_id = Some("worker-invented-pack".into());
+        let error = validate_preflight_contract(&wrong_pack, &generation).unwrap_err();
+        assert_eq!(error.code, "PREFLIGHT_IDENTITY_MISMATCH");
+
+        let mut wrong_engine = valid.clone();
+        wrong_engine.engine = Some("diffusers".into());
+        assert_eq!(
+            validate_preflight_contract(&wrong_engine, &generation)
+                .unwrap_err()
+                .code,
+            "PREFLIGHT_IDENTITY_MISMATCH"
+        );
+    }
+
+    #[test]
+    fn a_local_model_without_an_explicit_pack_is_never_catalogued_ready() {
+        assert_eq!(
+            public_model_status(None, true, true),
+            CatalogModelStatus::Unsupported
+        );
+    }
 
     #[test]
     fn cloud_catalog_exposes_valid_manifest_and_restores_only_selection() {
@@ -6546,6 +8300,182 @@ mod tests {
             restore_identity("owner/model", "revision-1"),
             restore_identity("owner/model", "revision-2")
         );
+    }
+
+    #[test]
+    fn cloud_backup_status_contract_uses_the_canonical_vocabulary() {
+        let statuses = [
+            CloudBackupStatus::NotRequested,
+            CloudBackupStatus::Pending,
+            CloudBackupStatus::Uploading,
+            CloudBackupStatus::Completed,
+            CloudBackupStatus::Failed,
+            CloudBackupStatus::Cancelled,
+        ];
+        let values = statuses
+            .into_iter()
+            .map(|status| serde_json::to_value(status).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            [
+                "NOT_REQUESTED",
+                "PENDING",
+                "UPLOADING",
+                "COMPLETED",
+                "FAILED",
+                "CANCELLED",
+            ]
+            .map(serde_json::Value::from)
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_registry_cancels_only_the_requested_model() {
+        let registry = BackupCancellationRegistry::default();
+        let target_job = uuid::Uuid::new_v4();
+        let other_job = uuid::Uuid::new_v4();
+        let target = TransferCancellationToken::new();
+        let other = TransferCancellationToken::new();
+        registry
+            .register(target_job, "owner/model".into(), target.clone())
+            .await;
+        registry
+            .register(other_job, "owner/other".into(), other.clone())
+            .await;
+
+        assert_eq!(registry.cancel_model("owner/model").await, [target_job]);
+        assert!(target.is_cancelled());
+        assert!(!other.is_cancelled());
+        registry.finish(target_job).await;
+        assert!(registry.cancel_model("owner/model").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellable_storage_keeps_local_install_completed_when_backup_is_cancelled() {
+        let storage: Arc<dyn ObjectStorage> = Arc::new(CancellableObjectStorage);
+        let registry = Arc::new(BackupCancellationRegistry::default());
+        let job_id = uuid::Uuid::new_v4();
+        let token = TransferCancellationToken::new();
+        registry
+            .register(job_id, "owner/model".into(), token.clone())
+            .await;
+
+        let uploader = tokio::spawn(async move {
+            storage
+                .upload_snapshot(
+                    "owner/model",
+                    "revision",
+                    Path::new("fixture"),
+                    None,
+                    Some(token),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(registry.cancel_model("owner/model").await, [job_id]);
+        let error = uploader.await.unwrap().unwrap_err();
+        assert!(crate::object_storage::is_cloud_backup_cancelled(&error));
+
+        let mut job = super::Job {
+            id: job_id,
+            kind: super::JobKind::InstallModel,
+            target_id: "owner/model".into(),
+            model_id: Some("owner/model".into()),
+            capability: None,
+            status: super::JobStatus::Completed,
+            stage: "installed".into(),
+            progress: 100,
+            message: "Modèle installé; sauvegarde cloud en cours".into(),
+            transfer: None,
+            dependency: None,
+            cache_status: Some("CACHE_UPLOADING".into()),
+            cache_error: None,
+            cloud_backup_status: CloudBackupStatus::Uploading,
+            started_at: Some(1),
+            completed_at: Some(2),
+            error: None,
+            result: None,
+            created_at: 1,
+            updated_at: 2,
+        };
+        apply_cloud_backup_status(&mut job, CloudBackupStatus::Cancelled, None);
+        assert_eq!(job.status, super::JobStatus::Completed);
+        assert_eq!(job.cloud_backup_status, CloudBackupStatus::Cancelled);
+        assert_ne!(job.status, super::JobStatus::Failed);
+    }
+
+    #[test]
+    fn completed_install_remains_completed_when_cloud_backup_is_cancelled() {
+        let mut job = super::Job {
+            id: uuid::Uuid::new_v4(),
+            kind: super::JobKind::InstallModel,
+            target_id: "owner/model".into(),
+            model_id: Some("owner/model".into()),
+            capability: None,
+            status: super::JobStatus::Completed,
+            stage: "installed".into(),
+            progress: 100,
+            message: "Modèle installé localement; sauvegarde cloud en cours".into(),
+            transfer: None,
+            dependency: None,
+            cache_status: Some("CACHE_UPLOADING".into()),
+            cache_error: None,
+            cloud_backup_status: CloudBackupStatus::Uploading,
+            started_at: Some(1),
+            completed_at: Some(2),
+            error: None,
+            result: None,
+            created_at: 1,
+            updated_at: 2,
+        };
+        apply_cloud_backup_status(&mut job, CloudBackupStatus::Cancelled, None);
+        assert_eq!(job.status, super::JobStatus::Completed);
+        assert_eq!(job.stage, "installed");
+        assert_eq!(job.progress, 100);
+        assert_eq!(job.cloud_backup_status, CloudBackupStatus::Cancelled);
+        assert_eq!(job.cache_status.as_deref(), Some("CACHE_CANCELLED"));
+    }
+
+    #[tokio::test]
+    async fn global_unload_succeeds_without_worker_or_cuda_and_purges_runtime() {
+        let mut entries = HashMap::new();
+        entries.insert(
+            "procedural/model".into(),
+            RuntimeEntry {
+                model_id: "procedural/model".into(),
+                state: "ready".into(),
+                device: "CPU".into(),
+                ram_bytes: 1024,
+                vram_bytes: 0,
+                last_used_at: 1,
+            },
+        );
+        let runtime = RwLock::new(entries);
+        let response = perform_runtime_unload(&runtime, None).await.unwrap();
+        assert!(response.success);
+        assert_eq!(response.models_unloaded, ["procedural/model"]);
+        assert_eq!(response.before_memory.unwrap()["cuda_available"], false);
+        assert_eq!(response.after_memory.unwrap()["loaded_models"], 0);
+        assert!(runtime.read().await.is_empty());
+    }
+
+    #[test]
+    fn global_unload_rejects_worker_and_comfyui_cleanup_failures() {
+        let unavailable = validate_worker_unload_response(Err("connexion refusée".into()))
+            .expect_err("configured worker failure must be visible");
+        assert!(unavailable.starts_with("WORKER_UNLOAD_FAILED:"));
+
+        let comfy_failure = validate_worker_unload_response(Ok(WorkerUnloadAllResponse {
+            success: true,
+            models_unloaded: vec!["fixture".into()],
+            before_memory: None,
+            after_memory: None,
+            message: "nettoyage partiel".into(),
+            comfyui_error: Some("free endpoint indisponible".into()),
+        }))
+        .expect_err("ComfyUI cleanup failure must be visible");
+        assert!(comfy_failure.contains("free endpoint indisponible"));
     }
 
     #[tokio::test]
@@ -6858,13 +8788,23 @@ mod tests {
             pipeline_class: None,
             device: None,
             stage: None,
+            model_pack: None,
+            model_pack_id: None,
+            engine: None,
+            model_pack_status: None,
+            workflow: None,
+            advanced_parameters: vec![],
+            presets: json!({}),
+            experimental: false,
+            load_allowed: false,
+            generation_allowed: false,
         };
         assert!(!super::worker_reports_ready(&status));
     }
 
     #[test]
     fn backend_ready_is_true_only_when_worker_confirms_ready() {
-        let status = WorkerModelStatus {
+        let mut status = WorkerModelStatus {
             model_id: "wan".into(),
             state: "READY".into(),
             repository: Some("Wan-AI/Wan2.2-TI2V-5B-Diffusers".into()),
@@ -6887,8 +8827,40 @@ mod tests {
             pipeline_class: None,
             device: None,
             stage: None,
+            model_pack: None,
+            model_pack_id: None,
+            engine: None,
+            model_pack_status: None,
+            workflow: None,
+            advanced_parameters: vec![],
+            presets: json!({}),
+            experimental: false,
+            load_allowed: true,
+            generation_allowed: true,
         };
         assert!(super::worker_reports_ready(&status));
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("project root");
+        let registry = ModelPackRegistry::load_directory(&root.join("model-packs")).unwrap();
+        let descriptor = ModelDescriptor {
+            architectures: &["FluxTransformer2DModel"],
+            pipeline_class: Some("FluxPipeline"),
+            capabilities: &["TEXT_TO_IMAGE"],
+        };
+        status.model_pack_id = Some("worker-invented-pack".into());
+        assert!(!worker_reports_ready_for_known_pack(
+            &status,
+            &registry,
+            &descriptor
+        ));
+        status.model_pack_id = Some("flux-t2i-v1".into());
+        assert!(worker_reports_ready_for_known_pack(
+            &status,
+            &registry,
+            &descriptor
+        ));
     }
 
     #[test]
@@ -6916,6 +8888,16 @@ mod tests {
             pipeline_class: None,
             device: None,
             stage: None,
+            model_pack: None,
+            model_pack_id: None,
+            engine: None,
+            model_pack_status: None,
+            workflow: None,
+            advanced_parameters: vec![],
+            presets: json!({}),
+            experimental: false,
+            load_allowed: true,
+            generation_allowed: true,
         };
         assert!(super::worker_reports_ready(&status));
     }

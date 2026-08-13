@@ -389,11 +389,22 @@ impl HardwareEstimator {
         } else if machine.vram_bytes >= minimum || (estimate.supports_cpu_offload && ram_ok) {
             ("OPTIMIZATION_REQUIRED", true, true)
         } else {
-            ("UNSUPPORTED", false, false)
+            // Une fourchette issue des métadonnées du repository n'est pas un
+            // plan d'allocation. Elle peut ignorer quantification, tiling et
+            // placement CPU. L'installation reste donc autorisée afin que le
+            // MemoryPlanner construise ensuite l'ExecutionPlan réel au
+            // préflight; seul ce plan peut refuser l'inférence.
+            ("PREFLIGHT_REQUIRED", true, true)
         };
         estimate.compatible_with_current_machine = Some(compatible);
         estimate.optimization_required = optimization;
         estimate.compatibility_level = level.into();
+        if level == "PREFLIGHT_REQUIRED" {
+            estimate.notes.push(
+                "Estimation pré-installation non bloquante; la décision runtime appartient au préflight ExecutionPlan."
+                    .into(),
+            );
+        }
         estimate
     }
 }
@@ -912,5 +923,36 @@ mod tests {
             }),
         );
         assert_eq!(compatible.compatibility_level, "COMPATIBLE");
+    }
+
+    #[test]
+    fn repository_weight_estimate_never_blocks_h100_install_before_preflight() {
+        let estimate = HardwareEstimate {
+            source: HardwareSource::Partial,
+            weights_memory: Some(MemoryRange {
+                min_bytes: 64 * GIB,
+                max_bytes: 64 * GIB,
+            }),
+            estimated_vram_min: Some(90 * GIB),
+            estimated_vram_recommended: Some(120 * GIB),
+            estimated_ram: Some(MemoryRange {
+                min_bytes: 104 * GIB,
+                max_bytes: 144 * GIB,
+            }),
+            recommended_backend: Some("CUDA".into()),
+            supports_cpu_offload: true,
+            ..HardwareEstimate::default()
+        };
+        let result = HardwareEstimator::with_machine(
+            estimate,
+            Some(CurrentMachine {
+                ram_bytes: 64 * GIB,
+                vram_bytes: 80 * GIB,
+                cuda_available: true,
+            }),
+        );
+        assert_eq!(result.compatible_with_current_machine, Some(true));
+        assert_eq!(result.compatibility_level, "PREFLIGHT_REQUIRED");
+        assert!(result.optimization_required);
     }
 }

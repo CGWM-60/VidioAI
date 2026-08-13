@@ -153,7 +153,7 @@ impl JobStore {
 #[cfg(test)]
 mod tests {
     use super::JobStore;
-    use crate::platform::{Job, JobKind, JobStatus};
+    use crate::platform::{CloudBackupStatus, Job, JobKind, JobStatus};
     use uuid::Uuid;
 
     #[tokio::test]
@@ -174,6 +174,7 @@ mod tests {
             dependency: None,
             cache_status: None,
             cache_error: None,
+            cloud_backup_status: CloudBackupStatus::NotRequested,
             started_at: Some(1),
             completed_at: None,
             error: None,
@@ -213,6 +214,7 @@ mod tests {
             dependency: None,
             cache_status: None,
             cache_error: None,
+            cloud_backup_status: CloudBackupStatus::NotRequested,
             started_at: None,
             completed_at: None,
             error: None,
@@ -251,6 +253,7 @@ mod tests {
             dependency: None,
             cache_status: None,
             cache_error: None,
+            cloud_backup_status: CloudBackupStatus::NotRequested,
             started_at: None,
             completed_at: None,
             error: None,

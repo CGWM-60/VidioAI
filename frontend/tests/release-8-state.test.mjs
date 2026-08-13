@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { cloudJobPresentation, cloudRestorePayload, restoredModelHref } from "../app/models/cloud/cloud-state.mjs";
-import { applyInstalledAction, installedModelAction } from "../app/models/installed/installed-state.mjs";
+import {
+  applyInstalledAction,
+  installedModelAction,
+  installedModelMetadata,
+  runtimeUnloadPresentation,
+} from "../app/models/installed/installed-state.mjs";
 
 test("cloud selection posts repository and revision only", () => {
   assert.deepEqual(cloudRestorePayload([{ repository: "owner/model", revision: "abc", manifest_uri: "s3://secret" }]), {
@@ -39,3 +44,31 @@ test("completed cloud restoration links to the installed inventory", () => {
   assert.equal(restoredModelHref({ status: "completed", model_id: "owner/model" }), "/models/installed?model=owner%2Fmodel");
 });
 
+test("global runtime unload accepts zero loaded models and memory diagnostics", () => {
+  assert.deepEqual(runtimeUnloadPresentation({
+    success: true,
+    models_unloaded: 0,
+    before_memory: { nvml_gpu_used_bytes: 12 },
+    after_memory: { nvml_gpu_used_bytes: 0 },
+    message: "Aucun modèle déclaré; caches nettoyés.",
+  }), {
+    success: true,
+    unloaded: 0,
+    before: { nvml_gpu_used_bytes: 12 },
+    after: { nvml_gpu_used_bytes: 0 },
+    message: "Aucun modèle déclaré; caches nettoyés.",
+  });
+});
+
+test("installed inventory renders optional ModelPack, engine and cloud state", () => {
+  assert.deepEqual(installedModelMetadata({
+    model_pack: { id: "wan22-i2v", engine: "COMFYUI" },
+    cloud_backup_status: "COMPLETED",
+    telemetry: { model_resident_bytes: 64 },
+  }), {
+    modelPack: "wan22-i2v",
+    engine: "COMFYUI",
+    cloudBackup: "COMPLETED",
+    residentBytes: 64,
+  });
+});

@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ModelState(StrEnum):
@@ -62,6 +62,20 @@ class InferenceRecipe(BaseModel):
     inference_fps: int | None = Field(default=None, ge=1, le=60)
 
 
+class ModelPackCandidate(BaseModel):
+    """Non-executable metadata retained for a Model Lab installation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    family: str = Field(min_length=1, max_length=128)
+    version: str = Field(min_length=1, max_length=128)
+    status: Literal["EXPERIMENTAL"] = "EXPERIMENTAL"
+    engine: Literal["diffusers", "comfyui"] | None = None
+    workflow_version: str | None = Field(default=None, min_length=1, max_length=128)
+    based_on_pack: str | None = Field(default=None, min_length=1, max_length=128)
+
+
 class InstallModelRequest(BaseModel):
     model_id: str = Field(min_length=2, max_length=128)
     repository: str = Field(min_length=3, max_length=256)
@@ -71,6 +85,22 @@ class InstallModelRequest(BaseModel):
     # [] = retirer tous les LoRA.
     loras: list[LoraSpec] | None = None
     recipe: InferenceRecipe | None = None
+    experimental: bool = False
+    model_pack_candidate: ModelPackCandidate | None = None
+
+
+class PromoteLabModelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model_id: str = Field(min_length=2, max_length=128)
+    repository: str = Field(min_length=3, max_length=256)
+    revision: str = Field(min_length=7, max_length=128)
+    model_pack_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+    )
+    capability: str = Field(min_length=3, max_length=64)
 
 
 class ModelRequest(BaseModel):
@@ -107,6 +137,8 @@ class GenerateImageRequest(BaseModel):
     input_path: str | None = Field(default=None, max_length=2048)
     mask_path: str | None = Field(default=None, max_length=2048)
     control_path: str | None = Field(default=None, max_length=2048)
+    preset: Literal["FAST", "BALANCED", "QUALITY"] | None = None
+    advanced_parameters: dict[str, Any] = Field(default_factory=dict)
 
 
 class GenerateVideoRequest(BaseModel):
@@ -133,6 +165,28 @@ class GenerateVideoRequest(BaseModel):
     mask_path: str | None = Field(default=None, max_length=2048)
     input_images: list[dict[str, Any]] = Field(default_factory=list)
     audio: bool = False
+    preset: Literal["FAST", "BALANCED", "QUALITY"] | None = None
+    advanced_parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+class PreflightRequest(BaseModel):
+    model_id: str = Field(min_length=2, max_length=128)
+    capability: str | None = Field(default=None, max_length=32)
+    quality: str | None = Field(default=None, max_length=32)
+    preset: Literal["FAST", "BALANCED", "QUALITY"] | None = None
+    width: int | None = Field(default=None, ge=64, le=4096)
+    height: int | None = Field(default=None, ge=64, le=4096)
+    frames: int | None = Field(default=None, ge=1, le=1000)
+    fps: int | None = Field(default=None, ge=1, le=120)
+    duration_seconds: float | None = Field(default=None, gt=0, le=120)
+    batch: int = Field(default=1, ge=1, le=16)
+    input_path: str | None = Field(default=None, max_length=2048)
+    mask_path: str | None = Field(default=None, max_length=2048)
+    control_path: str | None = Field(default=None, max_length=2048)
+    input_images: list[dict[str, Any]] = Field(default_factory=list)
+    audio: bool = False
+    output_relative_path: str | None = Field(default=None, max_length=512)
+    advanced_parameters: dict[str, Any] = Field(default_factory=dict)
 
 
 class UnsupportedGenerationRequest(BaseModel):

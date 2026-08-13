@@ -8,6 +8,12 @@ import {
   BsImage, BsInfoCircle, BsStars,
 } from "react-icons/bs";
 import { apiFetch, assetUrl, closeWebSocketSafely, eventsUrl } from "../lib/api";
+import {
+  advancedParameterDescriptors,
+  GENERATION_PRESETS,
+  generationAdvancedPayload,
+  IMAGE_PRESET_FALLBACKS,
+} from "../lib/generation-controls-state.mjs";
 import { generationFromJob, TERMINAL_JOB_STATUSES } from "../lib/generation-job-state.mjs";
 import styles from "../studio.module.css";
 
@@ -46,7 +52,8 @@ export default function ImagesPage() {
   const [modelId, setModelId] = useState("");
   const [prompt, setPrompt] = useState("Une voiture volante traverse une ville futuriste au coucher du soleil, ambiance cinématographique.");
   const [negativePrompt, setNegativePrompt] = useState("");
-  const [imageQuality, setImageQuality] = useState("quality");
+  const [imagePreset, setImagePreset] = useState("QUALITY");
+  const [advancedValues, setAdvancedValues] = useState({});
   const [sourceAsset, setSourceAsset] = useState(null);
   const [sourcePreview, setSourcePreview] = useState("");
   const [generation, setGeneration] = useState(null);
@@ -88,6 +95,14 @@ export default function ImagesPage() {
   const selectedModelId = availableModels.some((model) => model.id === modelId)
     ? modelId
     : availableModels[0]?.id || "";
+  const selectedModel = useMemo(
+    () => availableModels.find((model) => model.id === selectedModelId),
+    [availableModels, selectedModelId],
+  );
+  const advancedDescriptors = useMemo(
+    () => advancedParameterDescriptors(selectedModel),
+    [selectedModel],
+  );
 
   // Un seul WebSocket reçoit la progression de toutes les générations. L'UUID
   // permet d'ignorer proprement les événements appartenant à une autre page.
@@ -157,6 +172,7 @@ export default function ImagesPage() {
     if (activeMode.needsSource && !sourceAsset) { setError("Ajoutez d’abord une image source valide."); return; }
     setBusy(true); setError(""); setGeneration(null);
     try {
+      const advancedParameters = generationAdvancedPayload(advancedDescriptors, advancedValues);
       const created = await apiFetch("/api/images/generate", {
         method: "POST",
         body: JSON.stringify({
@@ -165,7 +181,9 @@ export default function ImagesPage() {
           prompt,
           negative_prompt: negativePrompt || null,
           model_id: selectedModelId,
-          quality: imageQuality,
+          preset: imagePreset,
+          quality: IMAGE_PRESET_FALLBACKS[imagePreset],
+          advanced_parameters: advancedParameters,
           input_asset_id: activeMode.needsSource ? sourceAsset.id : null,
           mask_asset_id: ["INPAINTING", "OUTPAINTING"].includes(mode) ? maskAsset?.id || null : null,
           control_asset_id: mode === "CONTROLLED_IMAGE_GENERATION" ? controlAsset?.id || null : null,
@@ -232,13 +250,26 @@ export default function ImagesPage() {
           <label className={styles.formGroup}><span>Prompt <small>{prompt.length} / 1000</small></span><textarea maxLength={1000} rows={5} value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
           <label className={styles.formGroup}><span>Prompt négatif <small>(optionnel)</small></span><textarea maxLength={1000} rows={2} value={negativePrompt} onChange={(event) => setNegativePrompt(event.target.value)} placeholder="flou, texte, watermark…" /></label>
           <label className={styles.formGroup}><span>Modèle</span><select value={selectedModelId} onChange={(event) => setModelId(event.target.value)}>{availableModels.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.engine}</option>)}</select></label>
-          <label className={styles.formGroup}><span>Qualité</span><select value={imageQuality} onChange={(event) => setImageQuality(event.target.value)}><option value="quality">Quality</option><option value="balanced">Balanced</option><option value="fast">Fast</option><option value="native">Native pipeline</option></select></label>
+          <fieldset className={styles.presetSelector}>
+            <legend>Preset automatique</legend>
+            {GENERATION_PRESETS.map((value) => <button type="button" key={value} aria-pressed={imagePreset === value} className={imagePreset === value ? styles.presetActive : ""} onClick={() => setImagePreset(value)}>{value}</button>)}
+          </fieldset>
+          {!!advancedDescriptors.length && <details className={styles.advancedPanel}>
+            <summary>Mode avancé · paramètres pris en charge par {selectedModel?.model_pack_id || selectedModel?.model_pack?.id || selectedModel?.name}</summary>
+            <div className={styles.videoSettingsRow}>
+              {advancedDescriptors.map((parameter) => <label className={styles.formGroup} key={parameter.key}>
+                <span>{parameter.label}</span>
+                {parameter.options ? <select value={advancedValues[parameter.key] ?? parameter.defaultValue} onChange={(event) => setAdvancedValues((current) => ({ ...current, [parameter.key]: event.target.value }))}>{parameter.options.map((option) => <option value={typeof option === "object" ? option.value : option} key={typeof option === "object" ? option.value : option}>{typeof option === "object" ? option.label || option.value : option}</option>)}</select>
+                  : <input type={parameter.type === "number" ? "number" : "text"} min={parameter.min} max={parameter.max} step={parameter.step} value={advancedValues[parameter.key] ?? parameter.defaultValue} onChange={(event) => setAdvancedValues((current) => ({ ...current, [parameter.key]: event.target.value }))} />}
+              </label>)}
+            </div>
+          </details>}
           {!availableModels.length && <div className={styles.warningBanner}>Aucun modèle {CAPABILITY_LABELS[mode] || mode} installé et READY. Le pipeline n’est pas remplacé par une génération factice.</div>}
 
           <div className={styles.presetGrid}>
             <div className={styles.selectedPreset}><BsCheckCircleFill /><strong>Réaliste</strong><small>Style</small></div>
             <div><strong>1:1</strong><small>Ratio</small></div>
-            <div><strong>{imageQuality === "quality" ? "Quality" : imageQuality}</strong><small>Recette</small></div>
+            <div><strong>{imagePreset}</strong><small>Recette</small></div>
           </div>
           <button className={styles.generateButton} disabled={busy || uploading || !selectedModelId || prompt.trim().length < 3}><BsStars /> {busy ? "Génération en cours…" : `Lancer ${CAPABILITY_LABELS[mode] || "la génération"}`}</button>
           <p className={styles.costNote}>Exécution locale · aucun crédit externe utilisé</p>

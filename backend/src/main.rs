@@ -1,9 +1,13 @@
 mod engine_ia;
+mod execution_plan;
 mod hardware_benchmark_store;
 mod hardware_estimator;
 mod host_agent;
 mod huggingface_catalog;
 mod job_store;
+mod model_lab;
+mod model_pack;
+mod model_pack_registry;
 mod object_storage;
 mod platform;
 mod utils;

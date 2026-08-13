@@ -73,12 +73,15 @@ if [[ -n "${AWS_S3_BUCKET:-}" ]]; then
 fi
 
 cd "${PROJECT_DIR}"
+for manifest in model-packs/*.json workflows/*.json; do
+  jq -e 'type == "object"' "${manifest}" >/dev/null
+done
 cargo fmt --manifest-path backend/Cargo.toml --all -- --check
-cargo clippy --manifest-path backend/Cargo.toml --locked --all-targets -- -D warnings
-cargo test --manifest-path backend/Cargo.toml --locked
+cargo clippy --manifest-path backend/Cargo.toml --locked --all-targets --all-features -- -D warnings
+cargo test --manifest-path backend/Cargo.toml --locked --all-features
 cargo fmt --manifest-path host-agent/Cargo.toml --all -- --check
-cargo clippy --manifest-path host-agent/Cargo.toml --locked --all-targets -- -D warnings
-cargo test --manifest-path host-agent/Cargo.toml --locked
+cargo clippy --manifest-path host-agent/Cargo.toml --locked --all-targets --all-features -- -D warnings
+cargo test --manifest-path host-agent/Cargo.toml --locked --all-features
 npm --prefix frontend ci
 npm --prefix frontend test
 npm --prefix frontend run lint
@@ -86,17 +89,27 @@ npm --prefix frontend run build
 bash deploy/scripts/test-worker.sh
 bash deploy/tests/test-s3-paths.sh
 bash deploy/tests/test-build-release-immutability.sh
+bash deploy/tests/test-release-install.sh
 bash deploy/tests/test-production-compose-contract.sh
 if [[ "${VIDIOAI_RUN_COMPOSE_TESTS:-true}" == "true" ]]; then
   bash deploy/tests/test-compose-orchestration.sh
 fi
 
 for service in backend frontend worker; do
+  CONTEXT="${service}"
+  if [[ "${service}" == "backend" || "${service}" == "worker" ]]; then
+    CONTEXT="."
+  fi
+  BUILD_ARGS=(--build-arg "VIDIOAI_VERSION=${VERSION}")
+  if [[ "${service}" == "frontend" ]]; then
+    BUILD_ARGS+=(--build-arg "NEXT_PUBLIC_VIDIOAI_VERSION=${VERSION}")
+  fi
   docker buildx build \
     --platform "${PLATFORM}" \
     --file "${service}/Dockerfile" \
     --tag "${REGISTRY}/${service}:${VERSION}" \
-    --load "${service}"
+    "${BUILD_ARGS[@]}" \
+    --load "${CONTEXT}"
 done
 
 bash deploy/scripts/test-worker-image.sh "${REGISTRY}/worker:${VERSION}"
@@ -104,9 +117,13 @@ bash deploy/scripts/test-worker-image.sh "${REGISTRY}/worker:${VERSION}"
 # Préparer tout le bundle Linux avant le premier push réduit la fenêtre où une
 # release de registre existerait sans artefact de déploiement correspondant.
 mkdir -p "${RELEASE_DIR}/deploy/bin" "${RELEASE_DIR}/deploy/nginx" \
-  "${RELEASE_DIR}/deploy/scripts/lib" "${RELEASE_DIR}/deploy/systemd"
+  "${RELEASE_DIR}/deploy/scripts/lib" "${RELEASE_DIR}/deploy/systemd" \
+  "${RELEASE_DIR}/model-packs" "${RELEASE_DIR}/workflows"
 cp compose.production.yml .env.production.example "${RELEASE_DIR}/"
+cp model-packs/*.json "${RELEASE_DIR}/model-packs/"
+cp workflows/*.json "${RELEASE_DIR}/workflows/"
 cp deploy/nginx/default.conf "${RELEASE_DIR}/deploy/nginx/"
+cp deploy/release-install.sh "${RELEASE_DIR}/deploy/"
 # Le Host Agent doit correspondre à Linux, même lorsque le bundle est préparé
 # depuis un Mac. Le build isolé emploie donc exactement la plateforme Docker de
 # la release et ne réutilise jamais un binaire Mach-O local.
@@ -137,8 +154,19 @@ jq -n --arg version "${VERSION}" --arg registry "${REGISTRY}" \
   --arg worker "$(docker buildx imagetools inspect "${REGISTRY}/worker:${VERSION}" --format '{{json .Manifest.Digest}}' | tr -d '"')" \
   '{version:$version, registry:$registry, images:{backend:$backend,frontend:$frontend,worker:$worker}}' \
   > "${RELEASE_DIR}/release.json"
-(cd "${RELEASE_DIR}" && sha256sum release.json compose.production.yml .env.production.example \
-  deploy/bin/vidioai-host-agent deploy/systemd/vidioai-host-agent.service > SHA256SUMS)
+# Le manifeste d'intégrité couvre chaque fichier réellement livré, y compris les
+# scripts appelés après extraction. `SHA256SUMS` est le seul fichier exclu afin
+# d'éviter une somme récursive de lui-même. La liste triée rend le bundle stable
+# et vérifiable indépendamment de l'ordre retourné par le système de fichiers.
+(
+  cd "${RELEASE_DIR}"
+  find . -type f ! -path './SHA256SUMS' -print \
+    | sed 's#^\./##' \
+    | LC_ALL=C sort \
+    | while IFS= read -r bundle_file; do
+        sha256sum "${bundle_file}"
+      done > SHA256SUMS
+)
 tar -C "${PROJECT_DIR}/output" -czf "${RELEASE_ARCHIVE}" "release-${VERSION}"
 if [[ -n "${AWS_S3_BUCKET:-}" ]]; then
   vidioai_validate_s3_bucket "${AWS_S3_BUCKET}"

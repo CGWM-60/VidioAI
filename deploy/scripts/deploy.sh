@@ -45,7 +45,10 @@ service_state() {
 dump_diagnostics() {
   echo "=== Diagnostic Compose ===" >&2
   compose ps -a >&2 || true
-  for service in worker backend frontend proxy; do
+  for service in comfyui worker backend frontend proxy; do
+    if ! has_service "${service}"; then
+      continue
+    fi
     IFS='|' read -r status health cid <<<"$(service_state "${service}")"
     if [[ "${status}" != "running" || ( "${health}" != "healthy" && "${health}" != "none" ) ]]; then
       echo "--- ${service}: status=${status} health=${health} ---" >&2
@@ -80,7 +83,7 @@ wait_for_service() {
 
 verify_stack_healthy() {
   local failed=0
-  for service in worker backend frontend proxy; do
+  for service in comfyui worker backend frontend proxy; do
     if ! has_service "${service}"; then
       continue
     fi
@@ -190,6 +193,28 @@ prepare_scratch_permissions() {
 }
 
 prepare_scratch_permissions
+
+prepare_model_pack_registry_permissions() {
+  if [[ -n "${VIDIOAI_TEST_STATE_DIR:-}" ]]; then
+    return 0
+  fi
+  [[ "${EUID}" -eq 0 ]] || {
+    echo "Le déploiement doit préparer le registre ModelPack persistant en root." >&2
+    return 1
+  }
+  command -v setfacl >/dev/null 2>&1 || {
+    echo "setfacl est requis pour partager le registre ModelPack avec le worker." >&2
+    return 1
+  }
+  local registry_dir="${VIDIOAI_STATE_DIR:-/var/lib/vidioai/state}/model-pack-registry"
+  install -d -m 0770 -o root -g docker "${registry_dir}"
+  # Le backend publie atomiquement; le worker ne reçoit qu'un bind mount RO,
+  # mais a besoin de traverser et lire les versions actives.
+  setfacl -Rm u:10001:rwx,u:10002:rx "${registry_dir}"
+  setfacl -Rdm u:10001:rwx,u:10002:rx "${registry_dir}"
+}
+
+prepare_model_pack_registry_permissions
 mkdir -p "${BACKUP_DIR}"
 cp "${ENV_FILE}" "${BACKUP_DIR}/env-$(date +%Y%m%d-%H%M%S)"
 
@@ -221,7 +246,7 @@ export VIDIOAI_VERSION="${VERSION}"
 compose pull
 
 # Démarrage explicite ordonné pour éviter les états intermédiaires silencieux.
-for service in worker backend frontend proxy; do
+for service in comfyui worker backend frontend proxy; do
   if has_service "${service}"; then
     compose up -d --remove-orphans "${service}"
     wait_for_service "${service}"

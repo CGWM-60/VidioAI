@@ -149,6 +149,10 @@ pub struct CatalogModel {
     pub tags: Vec<String>,
     pub library: Option<String>,
     pub architecture: Option<String>,
+    /// Configuration structurée retournée par l'API Hugging Face. Elle n'est
+    /// jamais importée ni exécutée et sert uniquement aux comparaisons du Lab.
+    #[serde(default)]
+    pub config: Value,
     pub license: Option<String>,
     pub files: Vec<RepositoryFile>,
     pub estimated_size_bytes: Option<u64>,
@@ -935,6 +939,7 @@ fn normalize_model(raw: HfRawModel) -> CatalogModel {
         tags: raw.tags,
         library: raw.library_name,
         architecture: architecture.clone(),
+        config: raw.config,
         license,
         files,
         estimated_size_bytes,
@@ -978,6 +983,7 @@ fn access_required_placeholder(repository: &str) -> CatalogModel {
         tags: Vec::new(),
         library: None,
         architecture: None,
+        config: Value::Object(Default::default()),
         license: None,
         files: Vec::new(),
         estimated_size_bytes: None,
@@ -1538,6 +1544,7 @@ pub fn local_runtime_models() -> Vec<CatalogModel> {
             tags: vec!["local".into()],
             library: None,
             architecture: Some("CanvasEngine".into()),
+            config: Value::Object(Default::default()),
             license: Some("Projet local".into()),
             files: Vec::new(),
             estimated_size_bytes: Some(0),
@@ -1626,6 +1633,7 @@ pub fn local_runtime_models() -> Vec<CatalogModel> {
             tags: vec!["local".into()],
             library: None,
             architecture: Some("FfmpegMotionEngine".into()),
+            config: Value::Object(Default::default()),
             license: Some("Projet local".into()),
             files: Vec::new(),
             estimated_size_bytes: Some(0),

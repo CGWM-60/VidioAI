@@ -61,7 +61,23 @@ class PipelineResolver:
 
     @staticmethod
     def is_modular(metadata: dict[str, Any]) -> bool:
-        return ModularManifestResolver.is_modular(metadata)
+        if metadata.get("is_modular") is True:
+            return True
+        modular_index = metadata.get("modular_model_index")
+        if isinstance(modular_index, dict) and bool(modular_index):
+            return True
+        if isinstance(metadata.get("modular_manifest"), dict):
+            return True
+        if str(metadata.get("manifest_type") or "").strip().lower() == "modular":
+            return True
+        if str(metadata.get("model_index_kind") or "").strip().lower() == "modular":
+            return True
+        return any(
+            str(value).replace("\\", "/").lower().endswith(
+                "modular_model_index.json"
+            )
+            for value in metadata.get("files") or []
+        )
 
     def class_candidates(
         self,
@@ -210,10 +226,8 @@ class PipelineResolver:
                     ),
                 )
 
-            # Si le manifest déclare une architecture Modular spécifique, la
-            # présence du conteneur générique ModularPipeline ne suffit pas.
-            # Les blocks/classes de cette architecture doivent réellement être
-            # livrés par la version Diffusers du Worker.
+            # H3 exige sa classe exacte. Les autres manifests modular restent
+            # chargeables par le conteneur ModularPipeline générique.
             exact_modular_cls = None
             if class_name != "ModularPipeline":
                 exact_modular_cls = getattr(
@@ -221,7 +235,10 @@ class PipelineResolver:
                     class_name,
                     None,
                 )
-                if exact_modular_cls is None:
+                if (
+                    exact_modular_cls is None
+                    and class_name == "MiniMaxH3ModularPipeline"
+                ):
                     return PipelineResolution(
                         class_name=class_name,
                         pipeline_cls=None,
@@ -245,6 +262,11 @@ class PipelineResolver:
             )
 
         candidates = self.class_candidates(metadata)
+        explicit_class = self._clean_class_name(
+            metadata.get("pipeline_class") or metadata.get("class_name")
+        )
+        if explicit_class and explicit_class not in candidates:
+            candidates.insert(0, explicit_class)
         for class_name in candidates:
             try:
                 pipeline_cls = getattr(
@@ -485,219 +507,3 @@ class PipelineResolver:
             code=code,
             attempts=attempts,
         )
-
-# VIDIOAI_FULLVERIFY_WORKER_HOTFIX_V3_RESOLVER
-#
-# Régression couverte:
-# - une classe Diffusers réellement installée (ex: WanPipeline) ne doit pas
-#   devenir UNSUPPORTED;
-# - un manifest modular peut utiliser le runtime générique ModularPipeline
-#   même si son _class_name spécifique n'est pas exporté par diffusers.
-#
-# Ce fallback ne contourne jamais trust_remote_code / bibliothèque externe.
-_VIDIOAI_V3_ORIGINAL_RESOLVE_CLASS = PipelineResolver.resolve_class
-
-
-def _vidioai_v3_class_name(metadata, resolution):
-    if isinstance(metadata, dict):
-        for key in ("pipeline_class", "class_name", "_class_name"):
-            value = metadata.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    value = getattr(resolution, "class_name", None)
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
-
-
-def _vidioai_v3_is_modular(metadata, class_name):
-    if not isinstance(metadata, dict):
-        metadata = {}
-
-    if metadata.get("is_modular") is True:
-        return True
-    if isinstance(metadata.get("modular_model_index"), dict):
-        return True
-    if isinstance(metadata.get("modular_manifest"), dict):
-        return True
-    if str(metadata.get("manifest_type") or "").strip().lower() == "modular":
-        return True
-    if str(metadata.get("model_index_kind") or "").strip().lower() == "modular":
-        return True
-
-    files = metadata.get("files") or []
-    for item in files:
-        normalized = str(item).replace("\\", "/").lower()
-        if normalized.endswith("modular_model_index.json"):
-            return True
-
-    return bool(
-        isinstance(class_name, str)
-        and class_name.strip().lower().endswith("modularpipeline")
-    )
-
-
-def _vidioai_v3_resolve_class(self, metadata, *args, **kwargs):
-    resolution = _VIDIOAI_V3_ORIGINAL_RESOLVE_CLASS(
-        self,
-        metadata,
-        *args,
-        **kwargs,
-    )
-    if getattr(resolution, "runtime_supported", False):
-        return resolution
-
-    reason = str(getattr(resolution, "runtime_reason", "") or "").upper()
-    if any(
-        blocker in reason
-        for blocker in (
-            "REMOTE_CODE",
-            "TRUST_REMOTE_CODE",
-            "UNSUPPORTED_LIBRARY",
-            "BIBLIOTHEQUE RUNTIME NON PRISE EN CHARGE",
-        )
-    ):
-        return resolution
-
-    class_name = _vidioai_v3_class_name(metadata, resolution)
-
-    diffusers_module = kwargs.get("diffusers_module")
-    if diffusers_module is None:
-        for candidate in args:
-            if candidate is None:
-                continue
-            if (
-                (class_name and hasattr(candidate, class_name))
-                or hasattr(candidate, "ModularPipeline")
-            ):
-                diffusers_module = candidate
-                break
-
-    if diffusers_module is None:
-        try:
-            import diffusers as diffusers_module
-        except (ImportError, ModuleNotFoundError):
-            return resolution
-
-    # 1. Une classe exacte installée reste prioritaire.
-    if class_name:
-        exact_class = getattr(diffusers_module, class_name, None)
-        if exact_class is not None:
-            from dataclasses import replace
-
-            return replace(
-                resolution,
-                pipeline_cls=exact_class,
-                runtime_supported=True,
-                strategy="exact-installed-class",
-                runtime_reason=None,
-            )
-
-    # 2. Un repository explicitement modular peut utiliser le runtime générique.
-    if _vidioai_v3_is_modular(metadata, class_name):
-        modular_class = getattr(diffusers_module, "ModularPipeline", None)
-        if modular_class is not None:
-            from dataclasses import replace
-
-            return replace(
-                resolution,
-                pipeline_cls=modular_class,
-                runtime_supported=True,
-                strategy="modular-pipeline",
-                runtime_reason=None,
-            )
-
-    return resolution
-
-
-PipelineResolver.resolve_class = _vidioai_v3_resolve_class
-
-# VIDIOAI_H3_EXACT_CLASS_HOTFIX_V5
-#
-# H3 déclare explicitement MiniMaxH3ModularPipeline.
-# Contrairement aux modular repositories génériques, H3 ne doit pas être
-# déclaré READY en remplaçant silencieusement sa classe exacte par le
-# diffusers.ModularPipeline générique.
-#
-# Important : cette garde est limitée à l'architecture H3 et ne retire pas le
-# fallback ModularPipeline pour les autres repositories modulaires.
-_VIDIOAI_V5_PREVIOUS_RESOLVE_CLASS = PipelineResolver.resolve_class
-
-
-def _vidioai_v5_requested_class(metadata, resolution):
-    if isinstance(metadata, dict):
-        for key in ("pipeline_class", "class_name", "_class_name"):
-            value = metadata.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-
-    value = getattr(resolution, "class_name", None)
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-
-    return None
-
-
-def _vidioai_v5_diffusers_module(args, kwargs):
-    module = kwargs.get("diffusers_module")
-    if module is not None:
-        return module
-
-    for candidate in args:
-        if candidate is not None and (
-            hasattr(candidate, "ModularPipeline")
-            or hasattr(candidate, "MiniMaxH3ModularPipeline")
-        ):
-            return candidate
-
-    try:
-        import diffusers
-    except (ImportError, ModuleNotFoundError):
-        return None
-
-    return diffusers
-
-
-def _vidioai_v5_resolve_class(self, metadata, *args, **kwargs):
-    resolution = _VIDIOAI_V5_PREVIOUS_RESOLVE_CLASS(
-        self,
-        metadata,
-        *args,
-        **kwargs,
-    )
-
-    class_name = _vidioai_v5_requested_class(metadata, resolution)
-    if class_name != "MiniMaxH3ModularPipeline":
-        return resolution
-
-    diffusers_module = _vidioai_v5_diffusers_module(args, kwargs)
-    exact_class = (
-        getattr(diffusers_module, class_name, None)
-        if diffusers_module is not None
-        else None
-    )
-
-    # Si la classe H3 exacte existe, le comportement précédent reste intact.
-    # On évite ainsi de modifier les 8 tests H3/audio déjà verts.
-    if exact_class is not None:
-        return resolution
-
-    # Le v4 peut avoir validé H3 grâce au fallback générique ModularPipeline.
-    # Pour H3, ce fallback serait un faux READY : on restaure donc un résultat
-    # non supporté tant que la classe exacte n'est pas fournie par Diffusers.
-    from dataclasses import replace
-
-    return replace(
-        resolution,
-        class_name=class_name,
-        pipeline_cls=None,
-        runtime_supported=False,
-        strategy="exact-modular-class-required",
-        runtime_reason=(
-            "DIFFUSERS_VERSION_TOO_OLD: architecture modular "
-            f"{class_name} absente de Diffusers."
-        ),
-    )
-
-
-PipelineResolver.resolve_class = _vidioai_v5_resolve_class

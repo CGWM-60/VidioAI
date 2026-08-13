@@ -8,6 +8,8 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::{path::Path, time::Duration};
 
+use crate::execution_plan::PreflightResult;
+
 #[derive(Clone)]
 pub struct WorkerClient {
     base_url: String,
@@ -83,6 +85,28 @@ pub struct WorkerModelStatus {
     pub device: Option<String>,
     #[serde(default)]
     pub stage: Option<String>,
+    /// Contrats optionnels de workers plus récents. Ils restent absents lorsque
+    /// le manifeste installé ne les déclare pas.
+    #[serde(default)]
+    pub model_pack: Option<serde_json::Value>,
+    #[serde(default, alias = "pack_id")]
+    pub model_pack_id: Option<String>,
+    #[serde(default)]
+    pub engine: Option<String>,
+    #[serde(default)]
+    pub model_pack_status: Option<String>,
+    #[serde(default)]
+    pub workflow: Option<String>,
+    #[serde(default)]
+    pub advanced_parameters: Vec<String>,
+    #[serde(default)]
+    pub presets: serde_json::Value,
+    #[serde(default)]
+    pub experimental: bool,
+    #[serde(default)]
+    pub load_allowed: bool,
+    #[serde(default)]
+    pub generation_allowed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +121,18 @@ pub struct WorkerCompatibility {
     pub error_code: Option<String>,
     #[serde(default)]
     pub dependency: Option<String>,
+    #[serde(default)]
+    pub model_pack_id: Option<String>,
+    #[serde(default)]
+    pub model_pack_status: Option<String>,
+    #[serde(default)]
+    pub engine: Option<String>,
+    #[serde(default)]
+    pub workflow: Option<String>,
+    #[serde(default)]
+    pub advanced_parameters: Vec<String>,
+    #[serde(default)]
+    pub presets: serde_json::Value,
 }
 
 fn default_compatibility_status() -> String {
@@ -153,12 +189,54 @@ pub struct WorkerResources {
     pub loaded_models: Vec<serde_json::Value>,
     #[serde(default)]
     pub memory: Option<serde_json::Value>,
+    #[serde(default)]
+    pub hardware: Option<serde_json::Value>,
+    #[serde(default)]
+    pub diagnostics: Option<serde_json::Value>,
     pub active_jobs: usize,
+}
+
+/// Réponse normalisée de l'opération d'urgence. Le worker historique ne
+/// renvoie que `{ "unloaded": [...] }`; les valeurs mémoire sont alors
+/// enrichies par deux lectures best-effort de `/v1/resources`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkerUnloadAllResponse {
+    #[serde(default = "default_true")]
+    pub success: bool,
+    #[serde(default, alias = "unloaded")]
+    pub models_unloaded: Vec<String>,
+    #[serde(default)]
+    pub before_memory: Option<serde_json::Value>,
+    #[serde(default)]
+    pub after_memory: Option<serde_json::Value>,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub comfyui_error: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn resource_memory(resources: WorkerResources) -> Option<serde_json::Value> {
+    resources
+        .memory
+        .or_else(|| resources.gpu.and_then(|gpu| serde_json::to_value(gpu).ok()))
 }
 
 #[derive(Debug, Serialize)]
 struct ModelRequest<'a> {
     model_id: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct LabPromotionRequest<'a> {
+    model_id: &'a str,
+    repository: &'a str,
+    revision: &'a str,
+    model_pack_id: &'a str,
+    capability: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -171,6 +249,18 @@ struct InstallModelRequest<'a> {
     loras: Option<&'a [serde_json::Value]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recipe: Option<&'a serde_json::Value>,
+    #[serde(default)]
+    experimental: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_pack_candidate: Option<&'a serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WorkerInstallOptions<'a> {
+    pub loras: Option<&'a [serde_json::Value]>,
+    pub recipe: Option<&'a serde_json::Value>,
+    pub experimental: bool,
+    pub model_pack_candidate: Option<&'a serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -337,8 +427,7 @@ impl WorkerClient {
         repository: &str,
         revision: &str,
         capabilities: &[String],
-        loras: Option<&[serde_json::Value]>,
-        recipe: Option<&serde_json::Value>,
+        options: WorkerInstallOptions<'_>,
     ) -> Result<WorkerModelStatus, String> {
         self.json(
             self.request(reqwest::Method::POST, "/v1/models/install")
@@ -348,8 +437,10 @@ impl WorkerClient {
                     repository,
                     revision,
                     capabilities: capabilities.iter().map(String::as_str).collect(),
-                    loras,
-                    recipe,
+                    loras: options.loras,
+                    recipe: options.recipe,
+                    experimental: options.experimental,
+                    model_pack_candidate: options.model_pack_candidate,
                 }),
         )
         .await
@@ -401,6 +492,68 @@ impl WorkerClient {
         .await
     }
 
+    pub async fn promote_lab_model(
+        &self,
+        model_id: &str,
+        repository: &str,
+        revision: &str,
+        model_pack_id: &str,
+        capability: &str,
+    ) -> Result<WorkerModelStatus, String> {
+        self.json(
+            self.request(reqwest::Method::POST, "/v1/models/lab/promote")
+                .timeout(Duration::from_secs(5 * 60))
+                .json(&LabPromotionRequest {
+                    model_id,
+                    repository,
+                    revision,
+                    model_pack_id,
+                    capability,
+                }),
+        )
+        .await
+    }
+
+    pub async fn unload_all(&self) -> Result<WorkerUnloadAllResponse, String> {
+        let before_memory = self.resources().await.ok().and_then(resource_memory);
+        let mut response: WorkerUnloadAllResponse = self
+            .json(
+                self.request(reqwest::Method::POST, "/v1/models/unload-all")
+                    .timeout(Duration::from_secs(5 * 60)),
+            )
+            .await?;
+        let after_memory = self.resources().await.ok().and_then(resource_memory);
+        if response.before_memory.is_none() {
+            response.before_memory = before_memory;
+        }
+        if response.after_memory.is_none() {
+            response.after_memory = after_memory;
+        }
+        if response.message.is_empty() {
+            response.message = if response.models_unloaded.is_empty() {
+                "Aucun modèle worker n'était chargé; le nettoyage runtime a été demandé.".into()
+            } else {
+                format!(
+                    "{} modèle(s) déchargé(s) par le worker.",
+                    response.models_unloaded.len()
+                )
+            };
+        }
+        if response.comfyui_error.is_some() {
+            response.success = false;
+        }
+        Ok(response)
+    }
+
+    pub async fn preflight(&self, payload: &serde_json::Value) -> Result<PreflightResult, String> {
+        self.json(
+            self.request(reqwest::Method::POST, "/v1/models/preflight")
+                .timeout(Duration::from_secs(60))
+                .json(payload),
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn generate_image(
         &self,
@@ -415,6 +568,8 @@ impl WorkerClient {
         mask_path: Option<&str>,
         control_path: Option<&str>,
         capability: Option<&str>,
+        preset: Option<&str>,
+        advanced_parameters: Option<&serde_json::Value>,
     ) -> Result<GenerateResponse, String> {
         let relative = output_path
             .to_str()
@@ -425,6 +580,8 @@ impl WorkerClient {
             "prompt": prompt,
             "negative_prompt": negative_prompt,
             "quality": quality,
+            "preset": preset,
+            "advanced_parameters": advanced_parameters,
             "seed": null,
             "output_relative_path": relative,
         });
@@ -466,6 +623,8 @@ impl WorkerClient {
         duration_seconds: u32,
         fps: u32,
         audio: bool,
+        preset: Option<&str>,
+        advanced_parameters: Option<&serde_json::Value>,
     ) -> Result<GenerateResponse, String> {
         let relative = output_path
             .to_str()
@@ -481,6 +640,8 @@ impl WorkerClient {
             "duration_seconds": duration_seconds,
             "fps": fps,
             "audio": audio,
+            "preset": preset,
+            "advanced_parameters": advanced_parameters,
             "seed": null,
             "output_relative_path": relative,
         });
@@ -541,7 +702,11 @@ mod tests {
     use super::{WorkerClient, WorkerCompatibility, decode_ready};
     use reqwest::StatusCode;
     use std::time::Duration;
-    use tokio::{io::AsyncReadExt, net::TcpListener, time::sleep};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        time::sleep,
+    };
 
     const READY: &str = r#"{
         "ready":true,
@@ -633,6 +798,47 @@ mod tests {
         };
         let error = client.ready().await.unwrap_err();
         assert!(error.contains("WORKER_READY_REQUEST_FAILED"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unload_all_normalizes_the_legacy_worker_contract_with_memory_snapshots() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut resource_calls = 0;
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = vec![0_u8; 4096];
+                let read = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let body = if request.starts_with("POST /v1/models/unload-all ") {
+                    r#"{"unloaded":["owner-model"]}"#.to_owned()
+                } else {
+                    resource_calls += 1;
+                    format!(
+                        r#"{{"gpu":null,"gpu_status":"UNAVAILABLE","worker_status":"READY","loaded_models":[],"memory":{{"reserved_bytes":{}}},"active_jobs":0}}"#,
+                        if resource_calls == 1 { 42 } else { 0 }
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client = WorkerClient {
+            base_url: format!("http://{address}"),
+            token: None,
+            http: reqwest::Client::builder().build().unwrap(),
+        };
+        let response = client.unload_all().await.unwrap();
+        assert!(response.success);
+        assert_eq!(response.models_unloaded, ["owner-model"]);
+        assert_eq!(response.before_memory.unwrap()["reserved_bytes"], 42);
+        assert_eq!(response.after_memory.unwrap()["reserved_bytes"], 0);
         server.await.unwrap();
     }
 }

@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   BsBox,
+  BsBeaker,
   BsCardImage,
   BsChatDots,
   BsCloudArrowDown,
@@ -24,6 +25,7 @@ const navigation = [
   { href: "/models", label: "Modèles", icon: BsBox },
   { href: "/models/installed", label: "Modèles installés", icon: BsHddStack },
   { href: "/models/cloud", label: "Sauvegardes cloud", icon: BsCloudArrowDown },
+  { href: "/models/lab", label: "VidioAI Lab", icon: BsBeaker },
   { href: "/projects", label: "Projets", icon: BsFolder },
   { href: "/generations", label: "Générations", icon: BsRobot },
   { href: "/images", label: "Images", icon: BsCardImage },
@@ -35,6 +37,7 @@ const navigation = [
 
 export default function Sidebar() {
   const pathname = usePathname();
+  const version = process.env.NEXT_PUBLIC_VIDIOAI_VERSION;
   const activeHref = navigation
     .filter(({ href }) => href === "/" ? pathname === "/" : pathname === href || pathname.startsWith(`${href}/`))
     .sort((left, right) => right.href.length - left.href.length)[0]?.href;
@@ -43,7 +46,7 @@ export default function Sidebar() {
     <aside className="sidebar">
       <Link className="sidebar-brand" href="/" aria-label="VidioAI — Accueil">
         <span className="sidebar-brand-mark"><BsStars /></span>
-        <span>VidioAI</span>
+        <span className="sidebar-brand-copy"><span>VidioAI</span>{version && <small>v{version}</small>}</span>
       </Link>
 
       <nav className="sidebar-nav" aria-label="Navigation principale">

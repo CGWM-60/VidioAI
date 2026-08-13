@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
@@ -17,6 +18,8 @@ from .schemas import (
     GenerateVideoRequest,
     InstallModelRequest,
     ModelRequest,
+    PreflightRequest,
+    PromoteLabModelRequest,
 )
 
 
@@ -29,7 +32,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     manager.log_runtime_versions()
     application = FastAPI(
         title="VidioAI GPU Worker",
-        version="0.1.0",
+        version=os.getenv("VIDIOAI_VERSION", "0.1.0"),
         docs_url=None if worker_settings.app_env == "GPU_PRODUCTION" else "/docs",
         redoc_url=None,
     )
@@ -62,7 +65,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.get("/health")
     async def health() -> dict[str, object]:
-        return {"status": "ok", "service": "vidioai-gpu-worker"}
+        return {
+            "status": "ok",
+            "service": "vidioai-gpu-worker",
+            "version": os.getenv("VIDIOAI_VERSION", "dev"),
+        }
 
     @application.get("/ready")
     async def ready(
@@ -169,6 +176,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if request.recipe is not None
                 else None
             ),
+            experimental=request.experimental,
+            model_pack_candidate=(
+                request.model_pack_candidate.model_dump(exclude_none=True)
+                if request.model_pack_candidate is not None
+                else None
+            ),
+        )
+
+    @application.post("/v1/models/lab/promote")
+    async def promote_lab_model(
+        request: PromoteLabModelRequest, _auth: None = Depends(authorize)
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            manager.promote_lab_model,
+            request.model_dump(),
         )
 
     @application.post("/v1/models/load")
@@ -176,6 +198,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: ModelRequest, _auth: None = Depends(authorize)
     ) -> dict[str, object]:
         return await asyncio.to_thread(manager.load_model, request.model_id)
+
+    @application.post("/v1/models/preflight")
+    async def preflight_model(
+        request: PreflightRequest, _auth: None = Depends(authorize)
+    ) -> dict[str, object]:
+        result = await asyncio.to_thread(
+            manager.preflight_model,
+            request.model_dump(exclude_none=True),
+        )
+        return result.as_dict()
 
     @application.post("/v1/models/unload")
     async def unload_model(

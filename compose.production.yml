@@ -8,12 +8,16 @@ services:
     restart: unless-stopped
     environment:
       APP_ENV: GPU_PRODUCTION
+      VIDIOAI_VERSION: ${VIDIOAI_VERSION:?VIDIOAI_VERSION requis}
       RUST_LOG: ${RUST_LOG:-info}
       VIDIOAI_STATE_DIR: /state
       VIDIOAI_MODELS_DIR: /models
       VIDIOAI_OUTPUTS_DIR: /outputs
       VIDIOAI_CACHE_DIR: /cache
       VIDIOAI_WORK_DIR: /work
+      VIDIOAI_MODEL_PACKS_DIR: /opt/vidioai/model-packs
+      VIDIOAI_WORKFLOWS_DIR: /opt/vidioai/workflows
+      VIDIOAI_MODEL_PACK_REGISTRY_DIR: /registry
       VIDIOAI_WORKER_URL: http://worker:8000
       HOST_AGENT_URL: ${HOST_AGENT_URL:-http://host.docker.internal:8091}
       HOST_AGENT_TOKEN: ${HOST_AGENT_TOKEN:?host agent token requis}
@@ -37,13 +41,16 @@ services:
       - ${VIDIOAI_OUTPUTS_DIR:-/var/lib/vidioai/outputs}:/outputs
       - ${VIDIOAI_SCRATCH_DIR:?VIDIOAI_SCRATCH_DIR=/scratch/vidioai requis}/cache:/cache
       - ${VIDIOAI_SCRATCH_DIR:?VIDIOAI_SCRATCH_DIR=/scratch/vidioai requis}/work:/work
+      - ${VIDIOAI_STATE_DIR:-/var/lib/vidioai/state}/model-pack-registry:/registry
+    labels:
+      org.opencontainers.image.version: ${VIDIOAI_VERSION:?VIDIOAI_VERSION requis}
     expose: ["8080"]
     # Docker Engine Linux ne crée pas ce DNS par défaut. `host-gateway` pointe
     # vers la passerelle de l'hôte sans donner de privilèges au conteneur.
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8080/api/ready"]
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8080/api/health"]
       interval: 15s
       timeout: 8s
       retries: 12
@@ -58,12 +65,18 @@ services:
     restart: unless-stopped
     environment:
       APP_ENV: GPU_PRODUCTION
+      VIDIOAI_VERSION: ${VIDIOAI_VERSION:?VIDIOAI_VERSION requis}
       GPU_REQUIRED: "true"
       PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
       VIDIOAI_WORKER_TOKEN: ${VIDIOAI_WORKER_TOKEN:?worker token requis}
       VIDIOAI_MODELS_DIR: /models
       VIDIOAI_WORK_DIR: /worker-work
       VIDIOAI_OUTPUTS_DIR: /work
+      VIDIOAI_MODEL_PACKS_DIR: /opt/vidioai/model-packs
+      VIDIOAI_WORKFLOWS_DIR: /opt/vidioai/workflows
+      VIDIOAI_MODEL_PACK_REGISTRY_DIR: /registry
+      COMFYUI_URL: ${COMFYUI_URL:-http://comfyui:8188}
+      VIDIOAI_COMFYUI_URL: ${COMFYUI_URL:-http://comfyui:8188}
       # Tous les caches et temporaires lourds pointent vers le Scratch hôte.
       # `/models` ne contient que les snapshots atomiques activés par VidioAI.
       HF_HOME: /cache/huggingface
@@ -83,6 +96,9 @@ services:
       - ${VIDIOAI_SCRATCH_DIR:?VIDIOAI_SCRATCH_DIR=/scratch/vidioai requis}/cache:/cache
       - ${VIDIOAI_SCRATCH_DIR:?VIDIOAI_SCRATCH_DIR=/scratch/vidioai requis}/worker-work:/worker-work
       - ${VIDIOAI_SCRATCH_DIR:?VIDIOAI_SCRATCH_DIR=/scratch/vidioai requis}/work:/work
+      - ${VIDIOAI_STATE_DIR:-/var/lib/vidioai/state}/model-pack-registry:/registry:ro
+    labels:
+      org.opencontainers.image.version: ${VIDIOAI_VERSION:?VIDIOAI_VERSION requis}
     expose: ["8000"]
     gpus: all
     healthcheck:
@@ -98,6 +114,10 @@ services:
     restart: unless-stopped
     environment:
       VIDIOAI_BACKEND_URL: http://backend:8080
+      VIDIOAI_VERSION: ${VIDIOAI_VERSION:?VIDIOAI_VERSION requis}
+      NEXT_PUBLIC_VIDIOAI_VERSION: ${VIDIOAI_VERSION:?VIDIOAI_VERSION requis}
+    labels:
+      org.opencontainers.image.version: ${VIDIOAI_VERSION:?VIDIOAI_VERSION requis}
     expose: ["3000"]
     healthcheck:
       test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1:3000/"]
@@ -108,6 +128,31 @@ services:
     depends_on:
       backend:
         condition: service_healthy
+
+  # Moteur interne optionnel. Le profil explicite évite d'imposer ComfyUI aux
+  # déploiements Diffusers existants; le worker conserve la même URL stable.
+  comfyui:
+    image: ${VIDIOAI_COMFYUI_IMAGE:-ghcr.io/lecode-official/comfyui-docker@sha256:e27739fc19d577d694ea99846a6c602e06dac963bebb2f056e22d97d19c392dd}
+    profiles: ["comfyui"]
+    restart: unless-stopped
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    command: ["--output-directory", "/work"]
+    volumes:
+      - ${VIDIOAI_SCRATCH_DIR:?VIDIOAI_SCRATCH_DIR=/scratch/vidioai requis}/models:/models
+      # Alias attendu par l'image ComfyUI; il pointe vers le même stockage hôte.
+      - ${VIDIOAI_SCRATCH_DIR:?VIDIOAI_SCRATCH_DIR=/scratch/vidioai requis}/models:/opt/comfyui/models
+      - ${VIDIOAI_SCRATCH_DIR:?VIDIOAI_SCRATCH_DIR=/scratch/vidioai requis}/work:/work
+      - ./workflows:/data/workflows:ro
+    expose: ["8188"]
+    gpus: all
+    healthcheck:
+      test: ["CMD", "/opt/conda/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8188/system_stats', timeout=5).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 90s
+    stop_grace_period: 90s
 
   proxy:
     image: nginx:1.27.5-alpine

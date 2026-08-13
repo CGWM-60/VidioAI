@@ -4,12 +4,18 @@ import Image from "next/image";
 import { useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  BsArrowClockwise, BsCameraVideo, BsCheckCircle, BsClock, BsDownload,
+  BsArrowClockwise, BsCameraVideo, BsCheckCircle, BsDownload,
   BsFilm, BsImage, BsInfoCircle, BsPlayCircle, BsStars, BsUpload, BsXCircle,
 } from "react-icons/bs";
 import { FaArrowsAlt } from "react-icons/fa";
 import { apiFetch, assetUrl, closeWebSocketSafely, eventsUrl } from "../lib/api";
 import { generationFromJob } from "../lib/generation-job-state.mjs";
+import {
+  advancedParameterDescriptors,
+  GENERATION_PRESETS,
+  generationAdvancedPayload,
+  VIDEO_PRESET_FALLBACKS,
+} from "../lib/generation-controls-state.mjs";
 import styles from "../studio.module.css";
 
 const MODES = [
@@ -55,9 +61,9 @@ function GenerationsContent() {
   const [modelId, setModelId] = useState("vidio-motion-local");
   const [prompt, setPrompt] = useState("Une voiture volante traverse une ville futuriste au coucher du soleil, mouvement de caméra cinématographique.");
   const [duration, setDuration] = useState(6);
-  const [quality, setQuality] = useState("480p");
+  const [preset, setPreset] = useState("BALANCED");
   const [aspectRatio, setAspectRatio] = useState("16:9");
-  const [fps, setFps] = useState(24);
+  const [advancedValues, setAdvancedValues] = useState({});
   const [audio, setAudio] = useState(false);
   const [generation, setGeneration] = useState(null);
   const [activeJobId, setActiveJobId] = useState(() => typeof window === "undefined" ? "" : window.localStorage.getItem("vidioai.videos.activeJob") || "");
@@ -71,6 +77,8 @@ function GenerationsContent() {
   const compatibleModels = useMemo(() => models.filter((model) => (
     model.runtime_capabilities?.includes(activeMode.capability)
   )), [activeMode.capability, models]);
+  const selectedModel = useMemo(() => models.find((model) => model.id === modelId), [modelId, models]);
+  const advancedDescriptors = useMemo(() => advancedParameterDescriptors(selectedModel), [selectedModel]);
   const effectiveInputProfile = useMemo(() => {
     if (activeMode.inputKind !== "image") {
       return DEFAULT_INPUT_PROFILE;
@@ -195,6 +203,9 @@ function GenerationsContent() {
       return;
     }
     try {
+      const advancedParameters = generationAdvancedPayload(advancedDescriptors, advancedValues);
+      const requestedFps = Number(advancedParameters.fps);
+      const requestedResolution = advancedParameters.resolution;
       const payload = {
         mode: activeMode.mode,
         capability: activeMode.capability,
@@ -204,10 +215,12 @@ function GenerationsContent() {
         input_asset_id: activeMode.inputKind === "image" && visibleInputImages.length ? visibleInputImages[0].asset_id : inputAsset?.id,
         input_images: activeMode.inputKind === "image" ? visibleInputImages : [],
         duration_seconds: Number(duration),
-        quality,
+        preset,
+        quality: requestedResolution || VIDEO_PRESET_FALLBACKS[preset],
         aspect_ratio: aspectRatio,
-        fps: Number(fps),
+        fps: Number.isFinite(requestedFps) && requestedFps > 0 ? requestedFps : undefined,
         audio,
+        advanced_parameters: advancedParameters,
       };
       const created = await apiFetch("/api/videos/generate", {
         method: "POST",
@@ -250,8 +263,6 @@ function GenerationsContent() {
   const sourceIsVideo = inputAsset?.kind === "VIDEO";
   const outputId = generation?.output_asset_id;
   const isRunning = generation && !TERMINAL_STATUSES.has(generation.status);
-  const selectedModel = models.find((model) => model.id === modelId);
-
   return (
     <div className={styles.page}>
       <header className={styles.pageHeading}>
@@ -330,16 +341,28 @@ function GenerationsContent() {
 
           <div className={styles.videoSettingsRow}>
             <label className={styles.formGroup}><span>Durée</span><select value={duration} onChange={(event) => setDuration(event.target.value)}><option value="4">4 secondes</option><option value="5">5 secondes</option><option value="6">6 secondes</option><option value="10">10 secondes</option><option value="15">15 secondes</option></select></label>
-            <label className={styles.formGroup}><span>Qualité</span><select value={quality} onChange={(event) => setQuality(event.target.value)}><option value="480p">Rapide 480p</option><option value="720p">HD 720p</option><option value="1080p">Full HD 1080p</option></select></label>
-            <label className={styles.formGroup}><span>Ratio</span><select value={aspectRatio} onChange={(event) => setAspectRatio(event.target.value)}><option value="16:9">16:9 paysage</option><option value="9:16">9:16 portrait</option><option value="1:1">1:1 carré</option></select></label>
-            <label className={styles.formGroup}><span>Cadence</span><select value={fps} onChange={(event) => setFps(event.target.value)}><option value="12">12 fps</option><option value="24">24 fps</option><option value="30">30 fps</option></select></label>
+            <label className={styles.formGroup}><span>Format</span><select value={aspectRatio} onChange={(event) => setAspectRatio(event.target.value)}><option value="16:9">16:9 paysage</option><option value="9:16">9:16 portrait</option><option value="1:1">1:1 carré</option></select></label>
           </div>
+          <fieldset className={styles.presetSelector}>
+            <legend>Preset automatique</legend>
+            {GENERATION_PRESETS.map((value) => <button type="button" key={value} aria-pressed={preset === value} className={preset === value ? styles.presetActive : ""} onClick={() => setPreset(value)}>{value}</button>)}
+          </fieldset>
+          {!!advancedDescriptors.length && <details className={styles.advancedPanel}>
+            <summary>Mode avancé · paramètres pris en charge par {selectedModel?.model_pack_id || selectedModel?.model_pack?.id || selectedModel?.name}</summary>
+            <div className={styles.videoSettingsRow}>
+              {advancedDescriptors.map((parameter) => <label className={styles.formGroup} key={parameter.key}>
+                <span>{parameter.label}</span>
+                {parameter.options ? <select value={advancedValues[parameter.key] ?? parameter.defaultValue} onChange={(event) => setAdvancedValues((current) => ({ ...current, [parameter.key]: event.target.value }))}>{parameter.options.map((option) => <option value={typeof option === "object" ? option.value : option} key={typeof option === "object" ? option.value : option}>{typeof option === "object" ? option.label || option.value : option}</option>)}</select>
+                  : <input type={parameter.type === "number" ? "number" : "text"} min={parameter.min} max={parameter.max} step={parameter.step} value={advancedValues[parameter.key] ?? parameter.defaultValue} onChange={(event) => setAdvancedValues((current) => ({ ...current, [parameter.key]: event.target.value }))} />}
+              </label>)}
+            </div>
+          </details>}
           <div className={styles.audioSetting}><span><strong>Audio natif du modèle</strong><small>Pour un modèle IA, aucune piste silencieuse n’est substituée : la génération échoue si le runtime ne livre pas une vraie piste audio muxée en AAC.</small></span><button type="button" role="switch" aria-checked={audio} onClick={() => setAudio((value) => !value)} className={`${styles.toggle} ${audio ? styles.toggleOn : ""}`}><span /></button></div>
           <button type="button" className={styles.generateButton} disabled={isRunning || !modelId || !selectedModel?.runtime_ready || prompt.trim().length < 3} onClick={submitGeneration}><BsStars /> {isRunning ? "Génération en cours…" : "Générer la vidéo"}</button>
         </div>
 
         <div className={styles.videoResultPanel}>
-          <div className={styles.resultTopline}><div><span>Modèle</span><strong>{models.find((model) => model.id === modelId)?.name || "—"}</strong></div><div><span>Temps estimé</span><strong><BsClock /> ~ {duration}s</strong></div><div><span>Statut</span><strong className={generation?.status === "completed" ? styles.statusReady : ""}>{generation?.status || "prêt"}</strong></div></div>
+          <div className={styles.resultTopline}><div><span>Modèle</span><strong>{models.find((model) => model.id === modelId)?.name || "—"}</strong></div><div><span>Preset</span><strong>{preset}</strong></div><div><span>Statut</span><strong className={generation?.status === "completed" ? styles.statusReady : ""}>{generation?.status || "prêt"}</strong></div></div>
           <div className={styles.videoStage}>
             {outputId ? <video src={assetUrl(outputId)} controls autoPlay loop /> : inputAsset ? (sourceIsVideo ? <video src={assetUrl(inputAsset.id)} controls /> : <Image unoptimized width={1280} height={720} src={assetUrl(inputAsset.id)} alt="Aperçu de la génération" />) : <div className={styles.videoPlaceholder}><BsCameraVideo /><h2>Votre vidéo apparaîtra ici</h2><p>Choisissez un mode et décrivez le mouvement souhaité.</p></div>}
             {isRunning && <div className={styles.videoProgressOverlay}><strong>{generation.progress}%</strong><div><span style={{ width: `${generation.progress}%` }} /></div><p>Encodage et optimisation du résultat…</p></div>}

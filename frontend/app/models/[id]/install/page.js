@@ -3,10 +3,15 @@
 import Link from "next/link";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
-import { BsArrowLeft, BsCheck2, BsCircle, BsInfoCircle } from "react-icons/bs";
+import { BsArrowLeft, BsCheck2, BsCircle, BsInfoCircle, BsXCircle } from "react-icons/bs";
 import { apiFetch, closeWebSocketSafely, eventsUrl } from "../../../lib/api";
 import { ProgressBar } from "../../../components/ui";
-import { dependencyView, INSTALL_STEPS, installationView, transferView } from "../../install/state.mjs";
+import {
+  cancelCloudBackupPayload,
+  dependencyView,
+  installationView,
+  transferView,
+} from "../../install/state.mjs";
 import styles from "../../../studio.module.css";
 
 /** Suit le job par WebSocket après un unique GET d'amorçage. */
@@ -21,6 +26,7 @@ function InstallContent() {
   const [job, setJob] = useState(null);
   const [error, setError] = useState("");
   const [retrying, setRetrying] = useState(false);
+  const [cancellingCloud, setCancellingCloud] = useState(false);
   const hasJob = Boolean(job);
   const view = installationView(job);
   const { terminal, failureCode, complete } = view;
@@ -90,6 +96,32 @@ function InstallContent() {
     }
   }
 
+  async function cancelCloudBackup() {
+    if (!modelId || cancellingCloud) return;
+    setCancellingCloud(true);
+    setError("");
+    try {
+      const response = await apiFetch("/api/models/cloud-backup/cancel", {
+        method: "POST",
+        body: JSON.stringify(cancelCloudBackupPayload(modelId)),
+      });
+      setJob((current) => ({
+        ...current,
+        ...(response?.job || (response?.id ? response : {})),
+        local_installation_status: response?.local_installation_status || current?.local_installation_status || "COMPLETED",
+        cloud_backup_status: response?.cloud_backup_status || "CANCELLED",
+        cache_status: response?.cache_status || "CACHE_CANCELLED",
+        status: response?.status || "completed",
+        stage: response?.stage || "installed",
+        message: response?.message || "Modèle installé localement · sauvegarde cloud annulée.",
+      }));
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setCancellingCloud(false);
+    }
+  }
+
   return (
     <div className={styles.page}>
       <header className={styles.pageHeading}><div className={styles.headingWithBack}><Link href="/models"><BsArrowLeft /></Link><div><h1>Installation automatique</h1><p>Téléchargement et installation simplifiés et automatisés.</p></div></div></header>
@@ -98,18 +130,20 @@ function InstallContent() {
         <div className={styles.installIntro}><h2>Installation de {model?.name || fallbackModelName}</h2><p>{model?.repository || modelId} · Vous pouvez suivre la progression réelle sans actualiser la page.</p></div>
         <div className={styles.installGrid}>
           <div className={styles.timeline}>
-            {INSTALL_STEPS.map(([stage, label, help], index) => {
-              const done = complete || index < currentIndex;
-              const active = !complete && index === currentIndex;
-              return <div className={`${styles.timelineStep} ${active ? styles.timelineActive : ""}`} key={`${stage}-${index}`}>
-                <span>{done ? <BsCheck2 /> : <BsCircle />}</span><div><strong>{label}</strong><small>{active ? job?.message : help}</small></div>
+            {view.phases.map((phase, index) => {
+              const done = ["COMPLETED", "SKIPPED"].includes(phase.status);
+              const active = ["UPLOADING", "RUNNING"].includes(phase.status) || index === currentIndex && !view.terminal;
+              return <div className={`${styles.timelineStep} ${active ? styles.timelineActive : ""}`} key={phase.id}>
+                <span>{done ? <BsCheck2 /> : phase.status === "FAILED" ? <BsXCircle /> : <BsCircle />}</span>
+                <div><strong>{phase.label}</strong><small>{active ? job?.message : phase.status === "CANCELLED" ? "Sauvegarde cloud annulée; installation locale conservée" : phase.help}</small></div>
               </div>;
             })}
           </div>
           <div className={styles.progressPanel}>
             <div className={styles.progressRing} style={{ "--progress": `${(job?.progress || 0) * 3.6}deg` }}><strong>{job?.progress || 0}<small>%</small></strong></div>
-            <h2>{complete ? "Installation terminée" : job?.status === "failed" ? `Installation échouée à ${job?.progress || 0}%` : "Installation en cours…"}</h2>
+            <h2>{view.cloudCancelled ? "Modèle installé localement" : complete ? "Installation terminée" : view.failed ? `Installation échouée à ${job?.progress || 0}%` : "Installation en cours…"}</h2>
             <p>{job?.message || "Préparation du worker…"}</p>
+            {view.cloudCancelled && <div className={styles.successBanner}><BsCheck2 /><span>Sauvegarde cloud annulée. Le modèle local reste installé et utilisable.</span></div>}
             {dependency && (
               <div className={styles.dependencyProgress}>
                 <strong>{dependency.package || dependency.import_name}</strong>
@@ -124,14 +158,16 @@ function InstallContent() {
                 <span>Débit : {transfer.rateLabel}</span>
                 <span>Restant estimé : {transfer.etaLabel}</span>
                 {transfer.files_skipped > 0 && <span>{transfer.files_skipped} fichier(s) déjà présent(s) dans le cache S3</span>}
+                {view.cloudUploading && <button className={styles.dangerButton} disabled={cancellingCloud} onClick={() => void cancelCloudBackup()}><BsXCircle /> {cancellingCloud ? "Annulation…" : "Annuler la sauvegarde cloud"}</button>}
               </div>
             )}
+            {view.cloudUploading && !transfer && <button className={styles.dangerButton} disabled={cancellingCloud} onClick={() => void cancelCloudBackup()}><BsXCircle /> {cancellingCloud ? "Annulation…" : "Annuler la sauvegarde cloud"}</button>}
             {job?.status === "failed" && failureCode && (
               <p className={styles.failureCode}>Code: {failureCode}</p>
             )}
             {complete && <Link className={styles.primaryButton} href={`/models/detail?model_id=${encodeURIComponent(modelId)}`}>Ouvrir et charger le modèle</Link>}
             {complete && view.canRetryCache && <button className={styles.secondaryButton} disabled={retrying} onClick={retryCache}>{retrying ? "Relance…" : "Réessayer la sauvegarde S3"}</button>}
-            {job?.status === "failed" && (
+            {view.failed && (
               <div className={styles.installFailureActions}>
                 <button className={styles.primaryButton} disabled={retrying} onClick={retryInstall}>
                   {retrying ? "Relance…" : "Réessayer"}

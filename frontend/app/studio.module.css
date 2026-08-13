@@ -109,6 +109,10 @@
 .installedDetails { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .neutralPill { display: inline-flex; padding: 5px 9px; color: #c4ccda; background: rgba(113, 128, 153, .15); border-radius: 6px; font-size: 11px; }
 .inlineRuntimeError { padding: 10px 12px; color: #ffd2da; border: 1px solid rgba(251, 113, 133, .25); border-radius: 8px; background: rgba(115, 29, 48, .18); font-size: 12px; }
+.runtimeTelemetry { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin: -8px 0 20px; }
+.runtimeTelemetry > div { display: grid; gap: 5px; padding: 12px 14px; border: 1px solid rgba(151, 166, 192, .16); border-radius: 9px; background: rgba(8, 18, 33, .75); }
+.runtimeTelemetry span { color: #8190a6; font-size: 10px; }
+.runtimeTelemetry strong { color: #dce2eb; font-size: 13px; }
 
 /* Catalogue ---------------------------------------------------------------- */
 
@@ -316,6 +320,13 @@
 .imageStackActions button { display: grid; place-items: center; min-width: 34px; min-height: 34px; color: #f7f8fc; border: 1px solid rgba(255,255,255,.16); border-radius: 8px; background: rgba(3,8,17,.74); }
 .imageStackActions button:disabled { cursor: not-allowed; opacity: .45; }
 .videoSettingsRow { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
+.presetSelector { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 0 0 18px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; }
+.presetSelector legend { grid-column: 1 / -1; width: auto; margin: 0; padding: 0 4px; color: #929fb2; font-size: 11px; }
+.presetSelector button { min-height: 40px; color: #b9c2d0; border: 1px solid rgba(151, 166, 192, .18); border-radius: 8px; background: rgba(5, 14, 28, .58); }
+.presetSelector .presetActive { color: #fff; border-color: rgba(164, 118, 255, .55); background: linear-gradient(135deg, rgba(111, 65, 219, .66), rgba(68, 43, 127, .54)); }
+.advancedPanel { margin: 0 0 18px; padding: 14px; border: 1px solid rgba(151, 166, 192, .18); border-radius: 10px; background: rgba(7, 16, 30, .62); }
+.advancedPanel summary { cursor: pointer; color: #c8d0dd; font-size: 12px; font-weight: 650; }
+.advancedPanel[open] summary { margin-bottom: 15px; }
 .audioSetting { display: flex; align-items: center; justify-content: space-between; gap: 20px; min-height: 68px; margin: -4px 0 18px; padding: 12px 2px; }
 .audioSetting > span { display: grid; gap: 4px; }
 .audioSetting small { color: #8290a5; font-size: 11px; }
@@ -402,6 +413,118 @@
 .compatibilityOk strong { color: #61df99; }
 .compatibilityKo strong { color: #f2a5b0; }
 
+/* Model Registry et Lab ---------------------------------------------------- */
+
+.labAdminBar,
+.labAnalyzePanel,
+.labModelCard,
+.labPackCard {
+  border: 1px solid rgba(151, 166, 192, .19);
+  border-radius: 14px;
+  background: linear-gradient(145deg, rgba(16, 28, 47, .94), rgba(8, 18, 33, .93));
+}
+
+.labAdminBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 22px;
+  margin-bottom: 18px;
+  padding: 15px 18px;
+}
+
+.labAdminBar > div,
+.labAdminBar > div span,
+.labAdminBar label { display: flex; align-items: center; gap: 10px; }
+.labAdminBar > div svg { width: 22px; height: 22px; color: #aa7dff; }
+.labAdminBar > div span { align-items: flex-start; flex-direction: column; gap: 2px; }
+.labAdminBar small { color: #8190a6; font-size: 11px; font-weight: 400; }
+.labAdminBar label > span { color: #8f9bad; font-size: 11px; }
+.labAdminBar input { width: min(320px, 32vw); min-height: 40px; padding: 0 12px; border-radius: 8px; }
+
+.labAnalyzePanel { margin-bottom: 30px; padding: 24px; }
+.labRegistrySection { margin-top: 30px; }
+.labSectionHeading { display: flex; align-items: flex-start; justify-content: space-between; gap: 22px; margin-bottom: 20px; }
+.labSectionHeading h2 { margin: 4px 0 5px; font-size: 22px; }
+.labSectionHeading p { margin: 0; color: #929fb2; font-size: 12px; }
+.labSectionHeading > svg { width: 32px; height: 32px; color: #a674ff; }
+
+.labAnalyzeForm,
+.labInstallBar { display: grid; grid-template-columns: minmax(280px, 1fr) auto; align-items: end; gap: 12px; }
+.labAnalyzeForm label,
+.labInstallBar label,
+.labVersionSelect { display: grid; gap: 7px; color: #aeb8c7; font-size: 11px; }
+.labAnalyzeForm input,
+.labInstallBar input,
+.labVersionSelect select { width: 100%; min-height: 43px; padding: 0 13px; border-radius: 9px; }
+.labAnalysisResult { display: grid; gap: 18px; margin-top: 24px; padding-top: 22px; border-top: 1px solid var(--border); }
+.labAnalysisSummary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.labAnalysisSummary > div { display: flex; align-items: flex-start; flex-direction: column; gap: 6px; min-width: 0; min-height: 105px; padding: 14px; border: 1px solid rgba(151, 166, 192, .15); border-radius: 10px; background: rgba(5, 14, 28, .54); }
+.labAnalysisSummary span,
+.labAnalysisSummary small { color: #8290a5; font-size: 10px; }
+.labAnalysisSummary strong { overflow-wrap: anywhere; font-size: 13px; }
+
+.labTableScroll { max-width: 100%; overflow-x: auto; border: 1px solid rgba(151, 166, 192, .16); border-radius: 11px; }
+.labComparisonTable { width: 100%; min-width: 780px; border-collapse: collapse; background: rgba(5, 14, 28, .48); }
+.labComparisonTable th,
+.labComparisonTable td { padding: 11px 13px; border-bottom: 1px solid rgba(151, 166, 192, .12); text-align: left; vertical-align: top; font-size: 11px; overflow-wrap: anywhere; }
+.labComparisonTable thead th { color: #8290a5; background: rgba(20, 34, 55, .86); font-size: 10px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; }
+.labComparisonTable tbody th { width: 145px; color: #d8dde6; }
+.labComparisonTable td { max-width: 340px; color: #aeb8c7; }
+.labComparisonTable tr:last-child th,
+.labComparisonTable tr:last-child td { border-bottom: 0; }
+
+.labDifferenceBadge,
+.labRegistryBadge { display: inline-flex; width: fit-content; align-items: center; padding: 4px 8px; border: 1px solid transparent; border-radius: 999px; font-size: 9px; font-weight: 750; letter-spacing: .04em; }
+.labDiffIdentical,
+.labStatusReady { color: #6ee7a3; border-color: rgba(52, 211, 153, .25); background: rgba(32, 151, 87, .13); }
+.labDiffModified,
+.labStatusExperimental { color: #f3c96d; border-color: rgba(243, 201, 109, .28); background: rgba(130, 91, 16, .13); }
+.labDiffAdded,
+.labStatusNew { color: #86b7ff; border-color: rgba(96, 165, 250, .27); background: rgba(38, 97, 174, .15); }
+.labDiffRemoved,
+.labStatusUnsupported { color: #ff9cab; border-color: rgba(251, 113, 133, .25); background: rgba(119, 27, 49, .15); }
+.labDiffUnknown,
+.labStatusUnknown { color: #bdc5d2; border-color: rgba(151, 166, 192, .18); background: rgba(113, 128, 153, .11); }
+.labManifest { max-height: 280px; margin: 0; overflow: auto; padding: 13px; color: #bfc8d6; border-radius: 9px; background: #050d19; font-size: 10px; line-height: 1.55; }
+
+.labCounters { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
+.labCounters span { display: flex; gap: 7px; padding: 6px 9px; color: #8f9bad; border: 1px solid var(--border); border-radius: 999px; font-size: 9px; }
+.labCounters strong { color: #e5e9ef; }
+.labModelGrid,
+.labPackGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.labModelCard,
+.labPackCard { display: grid; align-content: start; gap: 15px; min-width: 0; padding: 18px; }
+.labCardHeading { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
+.labCardHeading h3 { margin: 0 0 5px; overflow-wrap: anywhere; font-size: 16px; }
+.labCardHeading small { color: #967bd4; }
+
+.labLifecycle { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); margin: 2px 0 0; padding: 0; list-style: none; }
+.labLifecycle li { position: relative; display: grid; justify-items: center; gap: 5px; min-width: 0; color: #647187; text-align: center; }
+.labLifecycle li::before { position: absolute; top: 11px; right: 50%; left: -50%; height: 2px; background: #29364a; content: ""; }
+.labLifecycle li:first-child::before { display: none; }
+.labLifecycle li > span { display: grid; place-items: center; width: 23px; height: 23px; z-index: 1; border-radius: 50%; background: #202c3e; font-size: 9px; }
+.labLifecycle small { max-width: 100%; overflow: hidden; font-size: 8px; text-overflow: ellipsis; }
+.labLifecycleDone::before,
+.labLifecycleCurrent::before { background: #7742df !important; }
+.labLifecycleDone > span { color: #cdb6ff; background: #513298 !important; }
+.labLifecycleCurrent > span { color: #fff; background: #8950f7 !important; box-shadow: 0 0 13px rgba(137, 80, 247, .7); }
+.labLifecycleCurrent small { color: #c8b1fb; }
+
+.labRevisionNotice { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 11px 12px; color: #f3c96d; border: 1px solid rgba(243, 201, 109, .24); border-radius: 9px; background: rgba(130, 91, 16, .1); }
+.labRevisionNotice > div { display: grid; gap: 3px; }
+.labRevisionNotice span { color: #a99670; font-size: 10px; }
+.labRevisionNotice button { flex: 0 0 auto; }
+.labVersionSelect select { min-height: 40px; }
+.labPackActions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+.labPackActions button { padding: 0 10px; font-size: 11px; }
+.labPackDiffs { display: grid; gap: 8px; max-height: 260px; overflow: auto; padding: 12px; border: 1px solid rgba(151, 166, 192, .14); border-radius: 9px; background: rgba(5, 14, 28, .55); }
+.labPackDiffs > div { display: grid; grid-template-columns: minmax(110px, .65fr) minmax(160px, 1fr) auto; align-items: center; gap: 10px; padding-bottom: 8px; border-bottom: 1px solid rgba(151, 166, 192, .1); }
+.labPackDiffs > div:last-child { padding-bottom: 0; border-bottom: 0; }
+.labPackDiffs span { color: #bfc7d4; font-size: 10px; overflow-wrap: anywhere; }
+.labPackDiffs code { color: #8290a5; font-size: 9px; overflow-wrap: anywhere; }
+.labPackDiffs p { margin: 0; color: #8290a5; font-size: 11px; }
+
 /* La sidebar consomme 252 px : dès 1400 px de viewport, le contenu restant est
    trop étroit pour quatre colonnes. On replie alors les actions afin d'éviter
    toute barre de défilement horizontale. */
@@ -420,6 +543,9 @@
   .progressPanel { min-height: auto; }
   .settingsGrid { grid-template-columns: 1fr; }
   .dashboardStats { grid-template-columns: 1fr 1fr; }
+  .labAnalysisSummary { grid-template-columns: 1fr 1fr; }
+  .labModelGrid,
+  .labPackGrid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 720px) {
@@ -467,4 +593,18 @@
   .dashboardRecent article { grid-template-columns: 1fr auto; }
   .dashboardRecent article small { display: none; }
   .compatibilityChecks > div { grid-template-columns: 1fr; gap: 5px; }
+  .labAdminBar,
+  .labAdminBar > div,
+  .labAdminBar label,
+  .labSectionHeading,
+  .labRevisionNotice { align-items: stretch; flex-direction: column; }
+  .labAdminBar input { width: 100%; }
+  .labAnalyzePanel { padding: 17px; }
+  .labAnalyzeForm,
+  .labInstallBar,
+  .labAnalysisSummary,
+  .labPackActions { grid-template-columns: 1fr; }
+  .labCounters { justify-content: flex-start; }
+  .labLifecycle small { display: none; }
+  .labPackDiffs > div { grid-template-columns: 1fr; }
 }

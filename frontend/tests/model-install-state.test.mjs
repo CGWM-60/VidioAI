@@ -2,20 +2,23 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  cancelCloudBackupPayload,
+  cloudBackupStatus,
   dependencyView,
-  INSTALL_STEPS,
+  INSTALL_PHASES,
   installationView,
   transferView,
 } from "../app/models/install/state.mjs";
 
 test("the installation timeline never claims CUDA load or inference", () => {
-  const serialized = JSON.stringify(INSTALL_STEPS).toLowerCase();
+  const serialized = JSON.stringify(INSTALL_PHASES).toLowerCase();
   assert.equal(serialized.includes("cuda"), false);
   assert.equal(serialized.includes("inférence"), false);
-  assert.deepEqual(INSTALL_STEPS.at(-1), [
-    "installed",
-    "Installé",
-    "Le chargement runtime reste une action séparée",
+  assert.deepEqual(INSTALL_PHASES.map(([id]) => id), [
+    "hugging_face",
+    "installation",
+    "validation",
+    "cloud_backup",
   ]);
 });
 
@@ -75,8 +78,24 @@ test("a completed installation is installed but does not imply READY", () => {
     message: "Modèle installé",
   });
   assert.equal(view.complete, true);
-  assert.equal(view.currentIndex, INSTALL_STEPS.length - 1);
-  assert.equal(INSTALL_STEPS[view.currentIndex][0], "installed");
+  assert.equal(view.localInstalled, true);
+  assert.equal(view.phases[2].status, "COMPLETED");
+});
+
+test("cloud backup cancellation preserves completed local installation", () => {
+  const view = installationView({
+    status: "completed",
+    stage: "installed",
+    local_installation_status: "COMPLETED",
+    cloud_backup_status: "CANCELLED",
+  });
+  assert.equal(view.localInstalled, true);
+  assert.equal(view.complete, true);
+  assert.equal(view.failed, false);
+  assert.equal(view.cloudCancelled, true);
+  assert.equal(view.phases.at(-1).status, "CANCELLED");
+  assert.equal(cloudBackupStatus({ cache_status: "CACHE_UPLOADING" }), "UPLOADING");
+  assert.deepEqual(cancelCloudBackupPayload("owner/model"), { model_id: "owner/model" });
 });
 
 test("dependency states remain explicit from download through failure", () => {
