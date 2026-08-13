@@ -109,6 +109,14 @@ if [[ -f "${ENV_FILE}" ]]; then
 fi
 VERSION=${REQUESTED_VERSION}
 export VIDIOAI_VERSION="${VERSION}"
+# Les releases actuelles utilisent ComfyUI comme moteur interne principal pour
+# les packs ComfyUI. Une ancienne .env sans profil ne doit pas le laisser éteint.
+if [[ -z "${COMPOSE_PROFILES:-}" ]]; then
+  COMPOSE_PROFILES=comfyui
+  export COMPOSE_PROFILES
+fi
+VIDIOAI_COMFYUI_RESERVE_VRAM_GB=${VIDIOAI_COMFYUI_RESERVE_VRAM_GB:-12}
+export VIDIOAI_COMFYUI_RESERVE_VRAM_GB
 COMFYUI_IMAGE=${VIDIOAI_COMFYUI_IMAGE:-ghcr.io/lecode-official/comfyui-docker@sha256:e27739fc19d577d694ea99846a6c602e06dac963bebb2f056e22d97d19c392dd}
 
 SOURCE_KIND=
@@ -234,6 +242,8 @@ if [[ ! -f "${ENV_FILE}" ]]; then
 fi
 upsert_env VIDIOAI_VERSION "${VERSION}"
 upsert_env VIDIOAI_REGISTRY "${REGISTRY}"
+upsert_env COMPOSE_PROFILES "${COMPOSE_PROFILES}"
+upsert_env VIDIOAI_COMFYUI_RESERVE_VRAM_GB "${VIDIOAI_COMFYUI_RESERVE_VRAM_GB}"
 
 if [[ "${VIDIOAI_RUN_BOOTSTRAP:-false}" == "true" ]]; then
   "${INSTALL_DIR}/deploy/scripts/bootstrap-server.sh"

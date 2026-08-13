@@ -43,12 +43,12 @@ jq -e '
   (.services.worker.environment.VIDIOAI_WORKFLOWS_DIR == "/opt/vidioai/workflows") and
   (.services.worker.environment.VIDIOAI_MODEL_PACK_REGISTRY_DIR == "/registry") and
   (.services.backend.environment.VIDIOAI_MODEL_PACK_REGISTRY_DIR == "/registry") and
-  (.services.backend.volumes | any(.source == "/var/lib/vidioai/state/model-pack-registry" and .target == "/registry" and .read_only == false)) and
+  (.services.backend.volumes | any(.source == "/var/lib/vidioai/state/model-pack-registry" and .target == "/registry" and ((.read_only // false) == false))) and
   (.services.worker.volumes | any(.source == "/var/lib/vidioai/state/model-pack-registry" and .target == "/registry" and .read_only == true)) and
   (.services.backend.healthcheck.test | index("http://127.0.0.1:8080/api/health") != null) and
   ([.services.backend, .services.worker, .services.frontend]
     | all(.environment.VIDIOAI_VERSION == "contract-test"))
-' <<<"${configured_with_comfy}" >/dev/null
+' <<<"${configured_with_comfy}" >/dev/null || { echo 'PRODUCTION_COMPOSE_CONTRACT_DEBUG: production+comfy failed' >&2; jq '.services | {backend,worker,comfyui}' <<<"${configured_with_comfy}" >&2; exit 1; }
 
 local_configured=$(COMPOSE_PROFILES=gpu VIDIOAI_VERSION=contract-test \
   docker compose -f "${PROJECT_DIR}/docker-compose.yml" config --format json)
@@ -61,11 +61,11 @@ jq -e --arg project_dir "${PROJECT_DIR}" '
   (.services.worker.environment.VIDIOAI_MODEL_PACK_REGISTRY_DIR == "/registry") and
   ((.services.backend.volumes | map(select(.target == "/registry"))[0].source)
     == (.services.worker.volumes | map(select(.target == "/registry"))[0].source)) and
-  ((.services.backend.volumes | map(select(.target == "/registry"))[0].read_only) == false) and
+  (((.services.backend.volumes | map(select(.target == "/registry"))[0].read_only) // false) == false) and
   ((.services.worker.volumes | map(select(.target == "/registry"))[0].read_only) == true) and
   ((.services.backend.volumes | map(select(.target == "/models"))[0].source)
     == (.services.worker.volumes | map(select(.target == "/models"))[0].source))
-' <<<"${local_configured}" >/dev/null
+' <<<"${local_configured}" >/dev/null || { echo 'PRODUCTION_COMPOSE_CONTRACT_DEBUG: local compose failed' >&2; jq '.services | {backend,worker}' <<<"${local_configured}" >&2; exit 1; }
 
 if VIDIOAI_PROJECT_DIR="${PROJECT_DIR}" \
     VIDIOAI_ENV_FILE="${ENV_FILE}" \

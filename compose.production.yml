@@ -137,7 +137,10 @@ services:
     restart: unless-stopped
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
-    command: ["--output-directory", "/work"]
+    # ComfyUI garde sa gestion mémoire dynamique native, mais une réserve
+    # VRAM réelle est imposée au moteur afin d'éviter qu'un chargement
+    # compatible remplisse 100 % de la carte avant l'inférence.
+    command: ["--output-directory", "/work", "--reserve-vram", "${VIDIOAI_COMFYUI_RESERVE_VRAM_GB:-12}"]
     volumes:
       - ${VIDIOAI_SCRATCH_DIR:?VIDIOAI_SCRATCH_DIR=/scratch/vidioai requis}/models:/models
       # Alias attendu par l'image ComfyUI; il pointe vers le même stockage hôte.

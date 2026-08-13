@@ -176,7 +176,14 @@ impl VersionedPackRegistry {
             return Err("MODEL_PACK_REGISTRY_INVALID: schema non supporté".into());
         }
         for pack in bundled {
-            let version = format!("{}.0.0", pack.schema_version);
+            // schema_version décrit le format du contrat, pas la version du pack.
+            // Le patch semver est dérivé du contenu canonique : modifier un pack
+            // crée donc automatiquement une nouvelle version visible/rollbackable
+            // sans casser la compatibilité du schema.
+            let fingerprint = pack_sha256(&pack)?;
+            let patch = u64::from_str_radix(&fingerprint[..8], 16)
+                .map_err(|error| format!("MODEL_PACK_VERSION_INVALID: {error}"))?;
+            let version = format!("{}.0.{patch}", pack.schema_version);
             if index
                 .packs
                 .iter()

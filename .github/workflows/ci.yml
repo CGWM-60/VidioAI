@@ -194,6 +194,7 @@ jobs:
           bash deploy/tests/test-s3-paths.sh
           bash deploy/tests/test-build-release-immutability.sh
           bash deploy/tests/test-production-compose-contract.sh
+          bash deploy/tests/test-release-install.sh
 
 
   containers:

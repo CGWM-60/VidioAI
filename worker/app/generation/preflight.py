@@ -151,6 +151,35 @@ class PreflightService:
                     component_values=component_values,
                 )
                 checks.append(PreflightCheck(name="workflow", ok=True, message="Workflow validé."))
+                available_node_types = health.get("available_node_types")
+                if pack.engine == "comfyui":
+                    if not isinstance(available_node_types, list):
+                        check(
+                            "comfyui_nodes",
+                            False,
+                            "NODE_MISSING",
+                            "Inventaire /object_info ComfyUI indisponible.",
+                            retryable=True,
+                        )
+                    else:
+                        required_node_types = {
+                            str(node.get("class_type"))
+                            for node in built.workflow.values()
+                            if isinstance(node, dict) and node.get("class_type")
+                        }
+                        missing_node_types = sorted(
+                            required_node_types - {str(value) for value in available_node_types}
+                        )
+                        check(
+                            "comfyui_nodes",
+                            not missing_node_types,
+                            "NODE_MISSING",
+                            (
+                                "Tous les nodes ComfyUI requis sont installés."
+                                if not missing_node_types
+                                else "Nodes ComfyUI absents: " + ", ".join(missing_node_types)
+                            ),
+                        )
             except WorkflowValidationError as error:
                 checks.append(PreflightCheck(name="workflow", ok=False, code=error.code, message=str(error)))
                 errors.append(PreflightError(code=error.code, message=str(error)))

@@ -363,7 +363,19 @@ class RuntimeManager:
                     "error": "VIDIOAI_COMFYUI_URL n'est pas configuré.",
                     "error_code": "COMFYUI_UNAVAILABLE",
                 }
-            return self._comfyui.health()
+            health = self._comfyui.health()
+            if not health.get("ready"):
+                return health
+            try:
+                health["available_node_types"] = sorted(self._comfyui.node_types())
+            except EngineError as error:
+                return {
+                    **health,
+                    "ready": False,
+                    "error": str(error),
+                    "error_code": error.code,
+                }
+            return health
         return {
             "ready": bool(loaded is not None and loaded.pipeline is not None),
             "engine": "diffusers",

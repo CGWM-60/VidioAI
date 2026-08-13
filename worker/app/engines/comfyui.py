@@ -78,6 +78,20 @@ class ComfyUIEngine(InferenceEngine):
         except EngineError as error:
             return {"ready": False, "engine": self.name, "error": str(error), "error_code": error.code}
 
+    def object_info(self) -> dict[str, Any]:
+        """Return the node definitions actually installed in this ComfyUI instance."""
+        value = self._request("GET", "/object_info")
+        if not isinstance(value, dict):
+            raise EngineError(
+                "ComfyUI /object_info a retourné une réponse invalide.",
+                code="COMFYUI_OBJECT_INFO_INVALID",
+                retryable=True,
+            )
+        return value
+
+    def node_types(self) -> set[str]:
+        return {str(name) for name in self.object_info().keys() if str(name).strip()}
+
     def queue(self) -> dict[str, Any]:
         value = self._request("GET", "/queue")
         return value if isinstance(value, dict) else {}
