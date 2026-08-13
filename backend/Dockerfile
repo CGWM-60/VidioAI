@@ -35,10 +35,29 @@ RUN useradd --system --uid 10001 --create-home vidioai
 WORKDIR /app
 # Les volumes Docker héritent des droits du point de montage lors de leur
 # première création. Le backend non-root peut ainsi initialiser son état local.
-RUN mkdir -p /opt/vidioai/model-packs /opt/vidioai/workflows \
-        /registry /state /models /outputs /cache /work \
+RUN mkdir -p \
+        /opt/vidioai/model-packs \
+        /opt/vidioai/workflows \
+        /registry \
+        /state \
+        /models \
+        /outputs \
+        /cache \
+        /work \
+        /data/state \
+        /data/outputs \
+        /data/cache \
+        /data/work \
+        /data/worker-work \
     && chown -R vidioai:vidioai \
-        /opt/vidioai /registry /state /models /outputs /cache /work
+        /opt/vidioai \
+        /registry \
+        /state \
+        /models \
+        /outputs \
+        /cache \
+        /work \
+        /data
 COPY --from=builder /tmp/vidioai-backend /usr/local/bin/vidioai-backend
 COPY --chown=vidioai:vidioai model-packs /opt/vidioai/model-packs
 COPY --chown=vidioai:vidioai workflows /opt/vidioai/workflows
