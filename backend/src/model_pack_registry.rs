@@ -1036,8 +1036,7 @@ mod tests {
                 .await
                 .contains_key("model-packs/registry.json")
         );
-        let workflow_key =
-            format!("model-packs/fixture-pack/{version}/workflows/fixture.json");
+        let workflow_key = format!("model-packs/fixture-pack/{version}/workflows/fixture.json");
         assert!(storage.objects.read().await.contains_key(&workflow_key));
 
         let consumer = VersionedPackRegistry::open(second.clone(), Vec::new(), None, 20)
