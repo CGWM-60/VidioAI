@@ -196,7 +196,7 @@ jobs:
           bash deploy/tests/test-build-release-immutability.sh
           bash deploy/tests/test-production-compose-contract.sh
           echo "Validation release-install..."
-          bash deploy/tests/test-release-install.sh
+          PS4='+ ${BASH_SOURCE}:${LINENO}: ' bash -x deploy/tests/test-release-install.sh
 
 
   containers:
